@@ -13,7 +13,7 @@ YTBot是一个Telegram机器人，可以帮助用户下载YouTube视频的音频
 
 ## 环境要求
 
-- Python 3.7+ 
+- Python 3.7+
 - FFmpeg（用于音频转换）
 
 ## 安装步骤
@@ -32,10 +32,12 @@ pip install -r requirements.txt
 
 ## 配置方法
 
-1. 复制并重命名`config.py`文件，填入您的实际配置：
+复制并重命名`config.py`文件，填入您的实际配置：
+
 ```python
 # Telegram Bot配置
 TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'  # 在@BotFather获取
+ADMIN_CHAT_ID = 'YOUR_TELEGRAM_USER_ID'  # 替换为您的Telegram用户ID
 
 # Nextcloud配置
 NEXTCLOUD_URL = 'https://your-nextcloud-instance.com'  # Nextcloud服务器地址

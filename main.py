@@ -1,13 +1,20 @@
 # 导入必要的模块
 import os
 import re
+import sys
+import socket
+import threading
 import tempfile
 import asyncio
 import logging
 import requests
+import inspect
 from telegram import Bot
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from webdav3.client import Client
 import yt_dlp
+import time
+from urllib.parse import urlparse
 
 # 从配置文件导入配置
 from config import (
@@ -21,20 +28,187 @@ from config import (
     ADMIN_CHAT_ID
 )
 
-# 创建Bot实例
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# 全局错误处理配置
+ERROR_CHANNEL_ID = ADMIN_CHAT_ID
 
+# 主事件循环引用
+main_event_loop = None
 
 # 配置日志
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=getattr(logging, LOG_LEVEL)
+    level=getattr(logging, LOG_LEVEL if 'LOG_LEVEL' in locals() else 'INFO')
 )
 logger = logging.getLogger(__name__)
 
 
+def global_exception_handler(exctype, value, traceback):
+    """
+    全局异常处理器，捕获所有未处理的异常并记录
+
+    Args:
+        exctype: 异常类型
+        value: 异常值
+        traceback: 堆栈跟踪
+    """
+    # 先使用默认的异常处理器记录异常
+    sys.__excepthook__(exctype, value, traceback)
+
+    # 记录到日志
+    error_msg = f"未处理的异常: {exctype.__name__}: {value}"
+    logger.critical(error_msg)
+
+    # 尝试向管理员发送错误通知
+    if ERROR_CHANNEL_ID:
+        try:
+            # 格式化错误消息
+            error_details = f"🚨 发生未处理的异常！\n\n" \
+                f"**类型**: {exctype.__name__}\n" \
+                f"**信息**: {str(value)}\n" \
+                f"**时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n" \
+                f"**主机**: {socket.gethostname() if hasattr(socket, 'gethostname') else '未知'}\n"
+
+            # 限制消息长度
+            if len(error_details) > 4096:
+                error_details = error_details[:4093] + "..."
+
+            # 在单独的线程中发送通知，避免阻塞
+            def send_admin_notification():
+                try:
+                    # 创建一个新的事件循环来发送通知，与主事件循环完全分离
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    # 创建一个新的Bot实例，避免使用全局的Bot实例
+                    thread_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+                    loop.run_until_complete(thread_bot.send_message(
+                        chat_id=ERROR_CHANNEL_ID,
+                        text=error_details,
+                        parse_mode='Markdown',
+                        disable_notification=False
+                    ))
+                    loop.close()
+                except Exception as e:
+                    # 如果发送通知失败，记录到日志
+                    logger.error(f"发送管理员错误通知失败: {str(e)}")
+
+            # 启动线程发送通知
+            notification_thread = threading.Thread(target=send_admin_notification)
+            notification_thread.daemon = True
+            notification_thread.start()
+        except Exception as e:
+            # 如果初始化通知发送失败，记录到日志
+            logger.error(f"准备管理员错误通知失败: {str(e)}")
+
+
+# 设置全局异常处理器
+sys.excepthook = global_exception_handler
+
+
+# 检查必需的配置是否存在
+def check_required_config():
+    required_configs = {
+        'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
+        'NEXTCLOUD_URL': NEXTCLOUD_URL,
+        'NEXTCLOUD_USERNAME': NEXTCLOUD_USERNAME,
+        'NEXTCLOUD_PASSWORD': NEXTCLOUD_PASSWORD,
+        'NEXTCLOUD_UPLOAD_DIR': NEXTCLOUD_UPLOAD_DIR
+    }
+
+    missing_configs = []
+    for key, value in required_configs.items():
+        if not value or value == f'YOUR_{key}':
+            missing_configs.append(key)
+
+    # 尝试获取ADMIN_CHAT_ID，如果不存在则设为None
+    ADMIN_CHAT_ID = None
+    try:
+        from config import ADMIN_CHAT_ID as CONFIG_ADMIN_CHAT_ID
+        if CONFIG_ADMIN_CHAT_ID and CONFIG_ADMIN_CHAT_ID != 'YOUR_TELEGRAM_USER_ID':
+            ADMIN_CHAT_ID = CONFIG_ADMIN_CHAT_ID
+    except ImportError:
+        pass
+
+    return missing_configs, ADMIN_CHAT_ID
+
+
+# 检查并创建Bot实例
+def create_bot(token):
+    """
+    创建并返回一个Bot实例，不执行异步验证以避免事件循环冲突
+
+    Args:
+        token: Telegram Bot token
+
+    Returns:
+        Bot实例或None（如果创建失败）
+    """
+    try:
+        # 简单地创建Bot实例，不执行异步验证
+        bot = Bot(token=token)
+        logger.info("成功创建Bot实例: 已初始化Bot对象")
+        return bot
+    except Exception as e:
+        logger.error(f"创建Bot实例失败: {str(e)}")
+        return None
+
+
+# 初始化全局Bot变量
+bot = None
+
 # 并发控制
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+semaphore = None
+
+# 主事件循环引用
+main_event_loop = None
+
+# 并发控制
+semaphore = asyncio.Semaphore(
+    MAX_CONCURRENT_DOWNLOADS if 'MAX_CONCURRENT_DOWNLOADS' in locals() else 5)
+
+
+# 重试装饰器
+def retry(max_retries=3, delay=2, exceptions=(Exception,)):
+    def decorator(func):
+        # 检查函数是否是异步函数
+        is_async = inspect.iscoroutinefunction(func)
+
+        if is_async:
+            # 异步函数的装饰器
+            async def async_wrapper(*args, **kwargs):
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        return await func(*args, **kwargs)
+                    except exceptions as e:
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(
+                                f"函数 {func.__name__} 在 {max_retries} 次重试后失败: {str(e)}")
+                            raise
+                        logger.warning(
+                            f"函数 {func.__name__} 重试 ({retries}/{max_retries})，错误: {str(e)}")
+                        await asyncio.sleep(delay * retries)  # 指数退避
+            return async_wrapper
+        else:
+            # 同步函数的装饰器
+            def sync_wrapper(*args, **kwargs):
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        return func(*args, **kwargs)
+                    except exceptions as e:
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(
+                                f"函数 {func.__name__} 在 {max_retries} 次重试后失败: {str(e)}")
+                            raise
+                        logger.warning(
+                            f"函数 {func.__name__} 重试 ({retries}/{max_retries})，错误: {str(e)}")
+                        time.sleep(delay * retries)  # 指数退避
+            return sync_wrapper
+    return decorator
 
 
 # 规范化版本号，去除前导零
@@ -46,14 +220,15 @@ def normalize_version(version):
 
 
 # 检查yt_dlp版本是否为最新
+@retry(max_retries=3, delay=2, exceptions=(requests.RequestException,))
 def check_yt_dlp_version():
     try:
         # 获取当前安装的yt_dlp版本
         current_version = yt_dlp.version.__version__
         logger.info(f"当前yt_dlp版本: {current_version}")
 
-        # 获取PyPI上的最新版本
-        response = requests.get('https://pypi.org/pypi/yt-dlp/json', timeout=5)
+        # 获取PyPI上的最新版本，添加超时设置
+        response = requests.get('https://pypi.org/pypi/yt-dlp/json', timeout=10)
         response.raise_for_status()
         latest_version = response.json()['info']['version']
         logger.info(f"最新yt_dlp版本: {latest_version}")
@@ -78,6 +253,13 @@ def check_yt_dlp_version():
 
 # 验证YouTube链接格式
 def is_youtube_url(url):
+    # 首先确保url不为空且为字符串类型
+    if not url or not isinstance(url, str):
+        return False
+
+    # 去除可能的前后空格
+    url = url.strip()
+
     youtube_regex = (
         r'(https?://)?(www\.)?'
         r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
@@ -87,48 +269,282 @@ def is_youtube_url(url):
     return re.match(youtube_regex, url) is not None
 
 
+# 全局Nextcloud客户端缓存
+_nextcloud_client_cache = {
+    'client': None,
+    'last_initialized': 0,
+    'cache_ttl': 3600  # 缓存1小时
+}
+
+
 # 初始化NextCloud客户端
 def get_nextcloud_client():
-    options = {
-        'webdav_hostname': f'{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USERNAME}/',
-        'webdav_login': NEXTCLOUD_USERNAME,
-        'webdav_password': NEXTCLOUD_PASSWORD
-    }
-    client = Client(options)
-    return client
+    """
+    初始化并返回NextCloud客户端，增强了容错性、缓存和错误处理
 
+    Returns:
+        Client: 配置好的NextCloud客户端实例
 
-# 检测Nextcloud连接和扫描目标目录（同步函数）
-def check_nextcloud_connection():
-    try:
-        client = get_nextcloud_client()
-        # 测试连接 - 列出根目录内容
-        root_items = client.list('/')
-        logger.info(f"Nextcloud连接成功，根目录包含 {len(root_items)} 个项目")
+    Raises:
+        ValueError: 如果配置不完整或无效
+        ConnectionError: 如果无法连接到NextCloud服务器
+        Exception: 如果初始化过程中发生其他错误
+    """
+    global _nextcloud_client_cache
+    current_time = time.time()
 
-        # 检查上传目录是否存在
+    # 检查缓存是否有效
+    cache_valid = (_nextcloud_client_cache['client'] and
+                   (current_time - _nextcloud_client_cache['last_initialized']) <
+                   _nextcloud_client_cache['cache_ttl'])
+    if cache_valid:
         try:
-            # 尝试列出上传目录内容
-            upload_dir_items = client.list(NEXTCLOUD_UPLOAD_DIR)
-            logger.info(f"Nextcloud上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 存在，包含 {len(upload_dir_items)} 个项目")
-            return True, f"Nextcloud连接成功，上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 存在"
-        except Exception:
-            logger.warning(f"Nextcloud上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 不存在，将在首次上传时自动创建")
-            return True, f"Nextcloud连接成功，但上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 不存在，将在首次上传时自动创建"
+            # 验证缓存的客户端是否仍然有效
+            if check_client_validity(_nextcloud_client_cache['client']):
+                logger.debug("使用缓存的Nextcloud客户端")
+                return _nextcloud_client_cache['client']
+        except Exception as e:
+            logger.warning(f"缓存的客户端验证失败: {str(e)}")
+            _nextcloud_client_cache['client'] = None
+
+    # 验证配置是否完整
+    if not NEXTCLOUD_URL or not NEXTCLOUD_USERNAME or not NEXTCLOUD_PASSWORD:
+        raise ValueError("Nextcloud配置不完整: URL、用户名或密码缺失")
+
+    # 验证URL格式
+    try:
+        # 确保URL格式正确
+        parsed_url = urlparse(NEXTCLOUD_URL)
+        if not parsed_url.scheme or parsed_url.scheme not in ['http', 'https']:
+            raise ValueError("Nextcloud URL格式无效，必须包含http或https协议")
     except Exception as e:
-        error_msg = f"Nextcloud连接失败: {str(e)}"
-        logger.error(error_msg)
-        return False, error_msg
+        raise ValueError(f"Nextcloud URL格式无效: {str(e)}")
+
+    max_retries = 3
+    retry_delay = 2  # 初始重试延迟为2秒
+
+    for attempt in range(max_retries):
+        try:
+            options = {
+                'webdav_hostname': f'{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USERNAME}/',
+                'webdav_login': NEXTCLOUD_USERNAME,
+                'webdav_password': NEXTCLOUD_PASSWORD,
+                'webdav_timeout': 30,  # 连接超时设置，单位秒
+                'webdav_verbose': False  # 禁用详细日志
+            }
+
+            # 添加更多健壮的选项
+            client = Client(options)
+
+            # 验证客户端连接
+            if check_client_validity(client):
+                # 更新缓存
+                _nextcloud_client_cache['client'] = client
+                _nextcloud_client_cache['last_initialized'] = current_time
+                logger.info("Nextcloud客户端初始化成功")
+                return client
+            else:
+                raise ConnectionError("Nextcloud客户端连接验证失败")
+        except Exception as e:
+            error_msg = f"初始化Nextcloud客户端失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}"
+            logger.error(error_msg)
+
+            # 如果是最后一次尝试，抛出异常
+            if attempt == max_retries - 1:
+                if isinstance(e, ConnectionError):
+                    raise
+                elif 'timeout' in str(e).lower() or 'connection' in str(e).lower():
+                    raise ConnectionError(f"无法连接到Nextcloud服务器: {str(e)}")
+                else:
+                    raise
+
+            # 指数退避重试
+            wait_time = retry_delay * (2 ** attempt)
+            logger.info(f"{wait_time}秒后重试...")
+            time.sleep(wait_time)
+
+    # 理论上不会到达这里，但为了安全起见
+    raise Exception("无法初始化Nextcloud客户端")
+
+
+def check_client_validity(client):
+    """
+    验证Nextcloud客户端是否有效
+
+    Args:
+        client: Nextcloud客户端实例
+
+    Returns:
+        bool: 客户端是否有效
+    """
+    if not client:
+        return False
+
+    try:
+        # 尝试列出根目录作为验证
+        # 使用较短的超时来快速验证
+        original_timeout = client.timeout
+        client.timeout = 10  # 临时设置较短的超时
+
+        # 尝试一个轻量级的操作来验证连接
+        response = client.list('/')
+
+        # 恢复原始超时
+        client.timeout = original_timeout
+
+        # 验证响应是否有效
+        return isinstance(response, list) and len(response) >= 0
+    except Exception as e:
+        logger.warning(f"Nextcloud客户端验证失败: {str(e)}")
+        return False
+
+
+def check_nextcloud_connection():
+    """
+    检查Nextcloud连接，增强了错误处理和重试机制
+
+    Returns:
+        tuple: (是否成功, 消息)
+    """
+    for attempt in range(3):  # 最多尝试3次
+        try:
+            # 创建Nextcloud客户端
+            nc_client = get_nextcloud_client()
+
+            # 验证连接是否成功
+            if nc_client:
+                # 尝试列出根目录，验证基本连接
+                root_items = nc_client.list('/')
+                logger.info(
+                    f"Nextcloud连接成功，根目录包含 {len(root_items)} 个项目"
+                )
+
+                # 检查上传目录是否存在，尝试创建测试目录验证权限
+                test_dir = "ytbot_test_connection"
+
+                # 检查上传目录是否可访问
+                try:
+                    # 尝试列出上传目录内容
+                    if NEXTCLOUD_UPLOAD_DIR:
+                        upload_dir_items = nc_client.list(NEXTCLOUD_UPLOAD_DIR)
+                        logger.info(
+                            f"Nextcloud上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 存在，包含 {
+                                len(upload_dir_items)} 个项目")
+                    else:
+                        raise Exception("上传目录未配置")
+                except Exception as e:
+                    error_msg = f"检查上传目录失败: {str(e)}"
+                    logger.warning(error_msg)
+                    if attempt >= 2:  # 最后一次尝试
+                        return False, f"Nextcloud连接失败: {error_msg}\n请检查NEXTCLOUD_UPLOAD_DIR路径和权限设置"
+                    continue
+
+                # 尝试创建测试目录
+                try:
+                    if not hasattr(nc_client, 'check') or not nc_client.check(test_dir):
+                        nc_client.mkdir(test_dir)
+                        logger.info(f"创建测试目录 {test_dir} 成功")
+                except Exception as e:
+                    error_msg = f"创建测试目录失败: {str(e)}"
+                    logger.warning(error_msg)
+                    if attempt >= 2:  # 最后一次尝试
+                        return False, f"Nextcloud连接失败: {error_msg}\n请检查写入权限"
+                    continue
+
+                # 写入测试文件
+                test_file = f"{test_dir}/test.txt"
+                try:
+                    # 由于webdavclient3的upload_sync和upload_from行为差异，使用upload_sync
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp:
+                        temp.write("test")
+                        temp_path = temp.name
+
+                    try:
+                        nc_client.upload_sync(remote_path=test_file, local_path=temp_path)
+                        logger.info(f"上传测试文件 {test_file} 成功")
+                    finally:
+                        # 清理临时文件
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                except Exception as e:
+                    error_msg = f"上传测试文件失败: {str(e)}"
+                    logger.warning(error_msg)
+                    if attempt >= 2:  # 最后一次尝试
+                        return False, f"Nextcloud连接失败: {error_msg}\n请检查上传权限"
+                    continue
+
+                # 清理测试文件和目录
+                try:
+                    if hasattr(nc_client, 'clean'):
+                        nc_client.clean(test_file)
+                        nc_client.clean(test_dir)
+                        logger.info("清理测试文件和目录成功")
+                except Exception as e:
+                    logger.warning(f"清理测试文件和目录失败: {str(e)}")
+
+                return True, f"✅ Nextcloud连接成功！\n上传目录 '{NEXTCLOUD_UPLOAD_DIR}' 可访问且权限正常"
+            else:
+                error_msg = "Nextcloud客户端初始化失败"
+                logger.warning(error_msg)
+                if attempt >= 2:
+                    return False,
+                    f"Nextcloud连接失败: {error_msg}\n请检查配置文件中的NEXTCLOUD相关设置"
+                continue
+        except ValueError as ve:
+            error_msg = f"配置值错误: {str(ve)}"
+            logger.warning(error_msg)
+            if attempt >= 2:
+                return False, (f"Nextcloud连接失败: {error_msg}\n"
+                               "请检查配置文件中的NEXTCLOUD_URL和NEXTCLOUD_USERNAME设置")
+            continue
+        except Exception as e:
+            error_msg = f"未知错误: {str(e)}"
+            logger.warning(error_msg)
+            if attempt >= 2:
+                return False, f"Nextcloud连接失败: {error_msg}\n请查看日志获取更多详情"
+            continue
+
+        # 如果不是最后一次尝试，等待一段时间后重试
+        if attempt < 2:
+            wait_time = 2 * (attempt + 1)  # 指数退避策略
+            logger.info(f"第 {attempt + 1} 次尝试失败，{wait_time} 秒后重试...")
+            time.sleep(wait_time)
+
+    # 所有尝试都失败
+    return False, "Nextcloud连接失败: 所有重试尝试都失败\n请检查配置和网络连接后重试"
 
 
 # 下载YouTube视频并转换为MP3
+@retry(max_retries=2, delay=5, exceptions=(Exception,))
 async def download_and_convert(url, chat_id):
+    """
+    下载YouTube视频并转换为MP3格式，然后上传到Nextcloud
+    增强了错误处理、超时控制和资源管理
+
+    Args:
+        url: YouTube视频链接
+        chat_id: Telegram聊天ID，用于发送状态更新
+
+    Raises:
+        Exception: 如果处理过程中发生错误
+    """
+    temp_dir = None
+    progress_task = None
+    sent_messages = set()  # 用于跟踪已发送的消息，避免重复
+
     try:
+        # 验证输入参数
+        if not url or not isinstance(url, str):
+            raise ValueError("无效的YouTube链接")
+
+        if not chat_id:
+            raise ValueError("无效的聊天ID")
+
         # 发送开始处理的通知
-        await bot.send_message(chat_id=chat_id, text="开始处理视频，请稍候...")
+        await send_message_safely(chat_id, "开始处理视频，请稍候...", sent_messages)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            # 配置yt-dlp
+            # 配置yt-dlp，增强稳定性和错误处理
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
@@ -140,10 +556,21 @@ async def download_and_convert(url, chat_id):
                     }
                 ],
                 'quiet': False,
+                'no_warnings': True,  # 减少警告输出
+                'retries': 5,  # yt-dlp内置重试次数
+                'fragment_retries': 10,  # 片段下载重试次数
+                'timeout': 600,  # 整体操作超时时间
+                'socket_timeout': 30,  # 网络套接字超时
+                'http_headers': {
+                    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                   'Chrome/91.0.4472.124 Safari/537.36')
+                },
+                'ignoreerrors': False,  # 出错时停止
             }
 
             # 发送下载开始的通知
-            await bot.send_message(chat_id=chat_id, text="开始下载视频...")
+            await send_message_safely(chat_id, "开始下载视频...", sent_messages)
 
             # 创建一个线程安全的队列来传递进度信息
             progress_queue = asyncio.Queue()
@@ -155,14 +582,71 @@ async def download_and_convert(url, chat_id):
 
             # 定义一个处理进度队列的协程
             async def process_progress_queue():
+                last_percent = -1  # 用于限制进度更新频率
+                last_status = None  # 用于跟踪状态变化
+
                 while True:
                     try:
                         # 非阻塞获取队列中的进度信息
-                        d, cid = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
-                        await update_progress(d, cid)
+                        d, cid = await asyncio.wait_for(progress_queue.get(), timeout=2.0)  # 增加超时时间
+
+                        # 增加进度信息处理的容错性
+                        if not isinstance(d, dict):
+                            logger.warning(f"process_progress_queue: 无效的进度数据类型: {type(d)}")
+                            continue
+
+                        # 检查状态是否有效
+                        status = d.get('status', '')
+                        if not status:
+                            continue
+
+                        # 只在状态变化或进度显著变化时更新
+                        if status == 'downloading':
+                            downloaded_bytes = d.get('downloaded_bytes', 0)
+                            total_bytes = d.get('total_bytes', d.get('total_bytes_estimate', 1))
+                            percent = downloaded_bytes / total_bytes * 100 if total_bytes else 0
+
+                            # 每增加10%进度或速度/ETA有显著变化时更新
+                            if percent - last_percent >= 10 or percent >= 95:
+                                last_percent = percent
+                                speed = d.get('speed', 0)
+                                eta = d.get('eta', 0)
+
+                                # 格式化速度显示
+                                if speed > 1024 * 1024:
+                                    speed_str = f"{speed / 1024 / 1024:.2f} MB/s"
+                                elif speed > 1024:
+                                    speed_str = f"{speed / 1024:.2f} KB/s"
+                                else:
+                                    speed_str = f"{speed:.2f} B/s"
+
+                                # 格式化剩余时间显示
+                                if eta > 3600:
+                                    eta_str = f"{eta / 3600:.1f} 小时"
+                                elif eta > 60:
+                                    eta_str = f"{eta / 60:.1f} 分钟"
+                                else:
+                                    eta_str = f"{eta} 秒"
+
+                                progress_msg = (
+                                    f"🎵 下载进度: {percent:.1f}%\n"  # 添加emoji增强可读性
+                                    f"⚡ 速度: {speed_str}\n"
+                                    f"⏱️ 预计剩余: {eta_str}"
+                                )
+                                logger.debug(progress_msg)
+                                # 不发送详细进度消息，只打印到日志
+
+                        elif status == 'finished' and status != last_status:
+                            last_status = status
+                            await send_message_safely(cid, "下载完成，正在转换音频...", sent_messages)
+
                         progress_queue.task_done()
                     except asyncio.TimeoutError:
                         # 超时说明队列为空，继续检查
+                        continue
+                    except Exception as e:
+                        logger.error(f"处理进度队列时出错: {str(e)}")
+                        # 出错时继续，不影响主流程
                         continue
 
             # 启动进度处理任务
@@ -171,60 +655,135 @@ async def download_and_convert(url, chat_id):
             # 在单独的线程中执行下载和转换操作
             async def download_in_thread():
                 def _sync_download():
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        return ydl.extract_info(url, download=True)
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            # 首先尝试提取信息而不下载，检查视频是否可访问
+                            info = ydl.extract_info(url, download=False)
+                            logger.info(f"成功获取视频信息: {info.get('title', 'unknown')}")
+
+                            # 然后下载视频
+                            return ydl.extract_info(url, download=True)
+                    except yt_dlp.utils.DownloadError as de:
+                        error_msg = f"下载错误: {str(de)}"
+                        logger.error(error_msg)
+                        # 根据错误类型提供更具体的提示
+                        if 'unavailable' in str(de).lower():
+                            raise Exception("视频不可用或已被删除")
+                        elif 'age' in str(de).lower():
+                            raise Exception("视频受年龄限制，无法下载")
+                        elif 'copyright' in str(de).lower():
+                            raise Exception("视频受版权保护，无法下载")
+                        else:
+                            raise Exception(error_msg)
+                    except yt_dlp.utils.ExtractorError as ee:
+                        error_msg = f"解析视频信息时出错: {str(ee)}"
+                        logger.error(error_msg)
+                        raise Exception("无法解析视频链接，请检查链接是否正确")
+                    except Exception as e:
+                        logger.error(f"下载过程中出错: {str(e)}")
+                        raise Exception(f"下载失败: {str(e)}")
 
                 # 使用to_thread在线程中执行同步下载操作
-                return await asyncio.to_thread(_sync_download)
+                # 添加超时控制
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(_sync_download),
+                        timeout=1200  # 20分钟超时
+                    )
+                except asyncio.TimeoutError:
+                    raise Exception("下载超时，请尝试较短的视频或稍后再试")
 
             # 执行下载并获取结果
             info = await download_in_thread()
 
             # 取消进度处理任务
-            progress_task.cancel()
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    logger.debug("进度任务已取消")
+                except Exception as e:
+                    logger.warning(f"取消进度任务时出错: {str(e)}")
+
+            # 确保info不为None
+            if not info:
+                raise Exception("未能获取视频信息")
+
+            title = info.get('title', 'unknown')
+            mp3_file = None
+
+            # 查找生成的MP3文件
+            mp3_files = []
             try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
-                title = info.get('title', 'unknown')
-                mp3_file = os.path.join(temp_dir, f"{title}.mp3")
+                # 增加查找MP3文件的容错性
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        if file.lower().endswith('.mp3'):
+                            mp3_files.append(os.path.join(root, file))
 
-                # 确保文件存在
-                if not os.path.exists(mp3_file):
-                    # 尝试查找可能的文件名变体
-                    for file in os.listdir(temp_dir):
-                        if file.endswith('.mp3'):
-                            mp3_file = os.path.join(temp_dir, file)
-                            break
-                        else:
-                            raise Exception("转换后的MP3文件未找到")
+                # 如果没找到，尝试查找任何音频文件
+                if not mp3_files:
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg')):
+                                mp3_files.append(os.path.join(root, file))
+            except Exception as e:
+                logger.error(f"列出临时目录文件时出错: {str(e)}")
+                raise Exception(f"访问临时文件失败: {str(e)}")
 
-                # 对文件名进行规范化处理，确保符合Nextcloud要求
-                original_filename = os.path.basename(mp3_file)
-                sanitized_filename = sanitize_filename(original_filename)
+            if not mp3_files:
+                raise Exception("转换后的音频文件未找到")
 
-                # 如果文件名发生了变化，重命名文件
-                if original_filename != sanitized_filename:
-                    sanitized_file_path = os.path.join(temp_dir, sanitized_filename)
+            # 选择第一个找到的音频文件
+            mp3_file = mp3_files[0]
+
+            # 对文件名进行规范化处理，确保符合Nextcloud要求
+            original_filename = os.path.basename(mp3_file)
+            sanitized_filename = sanitize_filename(original_filename)
+
+            # 如果文件名发生了变化，重命名文件
+            if original_filename != sanitized_filename:
+                sanitized_file_path = os.path.join(temp_dir, sanitized_filename)
+                try:
                     os.rename(mp3_file, sanitized_file_path)
                     mp3_file = sanitized_file_path
                     logger.info(f"文件名已规范化: {original_filename} -> {sanitized_filename}")
-                else:
-                    logger.info(f"文件名符合要求: {sanitized_filename}")
+                except Exception as e:
+                    logger.warning(f"重命名文件失败: {str(e)}")
+                    # 即使重命名失败，也继续使用原文件
+                    # 尝试创建一个新的副本，而不是重命名
+                    try:
+                        import shutil
+                        shutil.copy2(mp3_file, sanitized_file_path)
+                        mp3_file = sanitized_file_path
+                        logger.info(f"文件已复制并重命名: {original_filename} -> {sanitized_filename}")
+                    except Exception as copy_err:
+                        logger.warning(f"复制文件失败: {str(copy_err)}")
+                        # 继续使用原文件
+            else:
+                logger.info(f"文件名符合要求: {sanitized_filename}")
 
-                # 获取MP3文件大小
+            # 获取音频文件大小
+            try:
                 file_size = os.path.getsize(mp3_file) / (1000 * 1000)  # 转换为MB
+                file_size_str = f"{file_size:.2f} MB"
+            except Exception as e:
+                logger.error(f"获取文件大小失败: {str(e)}")
+                file_size_str = "未知大小"
 
             # 发送转换完成的通知
-            send_msg = f"视频 '{title}' 下载转换完成，开始上传到Nextcloud...\n文件大小: {file_size:.2f} MB"
-            print(send_msg)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=send_msg
-            )
+            send_msg = f"✅ 视频 '{title}' 下载转换完成，开始上传到Nextcloud...\n📁 文件大小: {file_size_str}"
+            logger.info(send_msg)
+            await send_message_safely(chat_id, send_msg, sent_messages)
 
             # 上传到Nextcloud
             try:
+                # 再次验证Nextcloud连接
+                nextcloud_ok, _ = check_nextcloud_connection()
+                if not nextcloud_ok:
+                    raise Exception("Nextcloud连接不可用，请稍后再试")
+
                 client = get_nextcloud_client()
 
                 # 上传文件
@@ -232,26 +791,120 @@ async def download_and_convert(url, chat_id):
 
                 # 由于webdavclient3的upload_sync方法会自动创建必要的目录结构
                 # 所以我们直接尝试上传文件
-                client.upload_sync(remote_path=remote_path, local_path=mp3_file)
+                # 添加上传超时控制
+                upload_success = False
+                max_upload_attempts = 2
+                for attempt in range(max_upload_attempts):
+                    try:
+                        # 创建一个函数来包装上传操作，以便添加超时
+                        def _sync_upload():
+                            client.upload_sync(remote_path=remote_path, local_path=mp3_file)
 
-                # 发送完成通知
-                send_msg = f"文件 '{mp3_file}' 已成功上传到Nextcloud！\n路径：{NEXTCLOUD_UPLOAD_DIR}"
-                print(send_msg)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=send_msg
-                )
-                logger.warning(f"用户 {chat_id} 上传了文件: {mp3_file}")
+                        # 使用asyncio.wait_for添加超时控制
+                        await asyncio.wait_for(
+                            asyncio.to_thread(_sync_upload),
+                            timeout=600  # 10分钟上传超时
+                        )
+                        upload_success = True
+                        break
+                    except asyncio.TimeoutError:
+                        if attempt == max_upload_attempts - 1:
+                            raise Exception("上传超时，请尝试较小的文件或稍后再试")
+                        logger.warning(f"上传超时，第{attempt + 2}次尝试...")
+                    except Exception as upload_err:
+                        if attempt == max_upload_attempts - 1:
+                            raise upload_err
+                        logger.warning(f"上传失败，第{attempt + 2}次尝试...")
+                        # 等待一段时间后重试
+                        await asyncio.sleep(5)
+
+                if not upload_success:
+                    raise Exception("上传失败，所有重试都已失败")
+
+                # 验证文件是否成功上传
+                if client.check(remote_path):
+                    # 发送完成通知
+                    send_msg = (f"🎉 文件 '{os.path.basename(mp3_file)}' "
+                                f"已成功上传到Nextcloud！\n"
+                                f"📌 路径：{NEXTCLOUD_UPLOAD_DIR}")
+                    logger.info(send_msg)
+                    await send_message_safely(chat_id, send_msg, sent_messages)
+                    logger.warning(f"用户 {chat_id} 上传了文件: {os.path.basename(mp3_file)}")
+                else:
+                    raise Exception("上传后的文件验证失败")
             except Exception as e:
                 error_msg = f"上传到Nextcloud失败: {str(e)}"
-                await bot.send_message(chat_id=chat_id, text=error_msg)
                 logger.error(error_msg)
+                # 检查是否是临时问题，可以重试
+                if 'timeout' in str(e).lower() or 'connection' in str(e).lower():
+                    error_msg += "\n\n这可能是临时网络问题，请稍后再试。"
+                await send_message_safely(chat_id, error_msg, sent_messages)
                 raise
     except Exception as e:
         error_msg = f"处理失败: {str(e)}"
-        await bot.send_message(chat_id=chat_id, text=error_msg)
+        # 避免重复发送错误消息
+        if 'already sent' not in str(e).lower():
+            try:
+                await send_message_safely(chat_id, error_msg, sent_messages)
+            except Exception as msg_err:
+                logger.error(f"发送错误消息失败: {str(msg_err)}")
         logger.error(error_msg)
+        # 重新抛出异常以便重试装饰器可以处理
         raise
+    finally:
+        # 确保进度任务被取消
+        if progress_task and not progress_task.done():
+            try:
+                progress_task.cancel()
+                # 等待任务取消完成
+                await asyncio.wait([progress_task], timeout=1.0)
+            except Exception:
+                pass
+
+
+async def send_message_safely(chat_id, text, sent_messages=None):
+    """
+    安全地发送消息，避免重复发送和处理常见错误
+
+    Args:
+        chat_id: Telegram聊天ID
+        text: 要发送的消息文本
+        sent_messages: 已发送消息的集合，用于避免重复
+    """
+    # 限制消息长度
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+
+    # 检查是否重复发送
+    if sent_messages and text in sent_messages:
+        logger.debug("避免重复发送消息")
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text
+        )
+
+        # 记录已发送的消息
+        if sent_messages:
+            sent_messages.add(text)
+    except BadRequest as e:
+        # 处理消息过长或其他格式错误
+        logger.error(f"发送消息格式错误: {str(e)}")
+        # 尝试发送更短的消息
+        if len(text) > 100:
+            short_text = "操作已尝试，但无法发送详细状态。"
+            if short_text not in sent_messages:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=short_text)
+                    if sent_messages:
+                        sent_messages.add(short_text)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"发送消息失败: {str(e)}")
+        # 不重新抛出异常，避免影响主流程
 
 
 # 更新进度
@@ -295,60 +948,245 @@ async def help_command(chat_id):
 
 # 处理消息更新
 async def process_update(update):
-    try:
-        message = update.get('message', {})
-        text = message.get('text', '')
-        chat = message.get('chat', {})
-        chat_id = chat.get('id')
+    """
+    处理来自Telegram的消息更新，增强了输入验证和错误处理
 
+    Args:
+        update: 来自Telegram的更新数据字典
+    """
+    try:
+        # 检查更新数据是否有效
+        if not isinstance(update, dict):
+            logger.warning(f"process_update: 无效的更新数据类型: {type(update)}")
+            return
+
+        # 提取消息和相关信息
+        message = update.get('message', {})
+
+        # 检查消息是否有效
+        if not isinstance(message, dict):
+            logger.warning(f"process_update: 无效的消息数据类型: {type(message)}")
+            return
+
+        # 提取文本内容（优先从reply_to_message中获取转发的链接）
+        text = message.get('text', '')
+
+        # 如果没有文本，检查是否有转发的消息
+        if not text:
+            reply_to_message = message.get('reply_to_message', {})
+            if reply_to_message:
+                text = reply_to_message.get('text', '')
+
+        # 提取聊天信息
+        chat = message.get('chat', {})
+        if not isinstance(chat, dict):
+            logger.warning(f"process_update: 无效的聊天数据类型: {type(chat)}")
+            return
+
+        # 获取聊天ID和用户信息
+        chat_id = chat.get('id')
+        chat_type = chat.get('type', '')
+        user = message.get('from', {})
+        user_id = user.get('id')
+        username = user.get('username', 'unknown')
+
+        # 验证必要的字段
         if not chat_id:
+            logger.warning("process_update: 无法获取聊天ID")
+            return
+
+        # 记录收到的消息（不记录文本内容以保护隐私）
+        logger.info(f"process_update: 收到来自用户 {username} (ID: {user_id}) 的消息，聊天类型: {chat_type}")
+
+        # 处理不同类型的聊天（可选：仅允许私聊）
+        if chat_type not in ['private', 'group', 'supergroup']:
+            logger.warning(f"process_update: 不支持的聊天类型: {chat_type}")
             return
 
         # 处理命令
-        if text.startswith('/start'):
-            await start(chat_id)
-        elif text.startswith('/help'):
-            await help_command(chat_id)
-        # 处理YouTube链接
-        elif is_youtube_url(text):
-            # 使用并发控制
-            async with semaphore:
+        if text.startswith('/'):
+            command = text.split()[0].lower()
+
+            if command == '/start':
+                await start(chat_id)
+            elif command == '/help':
+                await help_command(chat_id)
+            else:
+                # 未知命令处理
+                logger.info(f"process_update: 收到未知命令: {command}")
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="检测到YouTube链接，排队处理中..."
+                    text=f"未知命令: {command}\n请使用 /help 查看可用命令。"
                 )
-                await download_and_convert(text, chat_id)
+        # 处理YouTube链接
+        elif text and is_youtube_url(text):
+            try:
+                # 使用并发控制
+                async with semaphore:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="检测到YouTube链接，排队处理中...\n\n请耐心等待，处理时间取决于视频长度和网络状况。"
+                    )
+                    await download_and_convert(text, chat_id)
+            except Exception as e:
+                logger.error(f"process_update: 处理YouTube链接时出错: {str(e)}")
+                # 发送更友好的错误消息
+                error_msg = "处理视频时出错，请稍后再试。\n\n如果问题持续，请检查链接是否有效，或联系管理员。"
+                try:
+                    await bot.send_message(chat_id=chat_id, text=error_msg)
+                except Exception:
+                    pass  # 如果发送错误消息也失败，就忽略
+        # 处理空消息或非YouTube链接
         else:
-            await bot.send_message(chat_id=chat_id, text="请发送有效的YouTube链接。")
+            # 避免对每个非链接消息都回复，减少消息量
+            if text:
+                logger.info("process_update: 收到非YouTube链接消息")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="请发送有效的YouTube链接，或使用 /help 查看使用说明。"
+                )
+    except BadRequest as e:
+        # 处理Telegram API的BadRequest错误（例如消息过长）
+        logger.error(f"process_update: Telegram API错误: {str(e)}")
+        try:
+            if chat_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="处理您的消息时遇到问题，请尝试发送更短的内容或另一个链接。"
+                )
+        except Exception:
+            pass
     except Exception as e:
-        logger.error(f"处理更新时出错: {str(e)}")
+        # 捕获所有其他异常
+        logger.error(f"process_update: 处理更新时出错: {str(e)}")
+        # 记录详细的错误栈信息，便于调试
+        import traceback
+        logger.debug(traceback.format_exc())
+
+        # 尝试发送错误通知给用户（如果有chat_id）
+        if 'chat_id' in locals() and chat_id:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="抱歉，处理您的请求时发生了内部错误。\n\n我们已记录此问题，将尽快修复。"
+                )
+            except Exception:
+                pass  # 如果发送错误消息也失败，就忽略
 
 
 # 消息轮询器
 async def message_poller():
+    """
+    轮询新的Telegram消息并处理，增强了错误处理和稳定性
+    """
     last_update_id = None
+    # 失败计数器，用于实现指数退避策略
+    failure_count = 0
+    max_failures = 5
+    max_retry_delay = 60  # 最大重试延迟时间（秒）
+    # 跟踪正在处理的更新ID，防止重复处理
+    processing_updates = set()
 
     while True:
         try:
+            # 根据失败次数动态调整超时和重试延迟
+            timeout = 30  # 默认超时时间
+            retry_delay = min(2 ** failure_count, max_retry_delay)  # 指数退避
+
             # 获取更新
-            updates = await bot.get_updates(offset=last_update_id, timeout=30)
+            updates = await bot.get_updates(offset=last_update_id, timeout=timeout)
+
+            # 重置失败计数器
+            if updates or failure_count > 0:
+                failure_count = 0
+                logger.debug(f"成功获取更新，当前失败计数重置为 {failure_count}")
 
             for update in updates:
-                last_update_id = update.update_id + 1
-                # 异步处理每个更新
-                await process_update(update.to_dict())
+                try:
+                    # 检查更新ID是否已经在处理中，避免重复处理
+                    if update.update_id in processing_updates:
+                        continue
+
+                    # 添加到处理中的集合
+                    processing_updates.add(update.update_id)
+
+                    # 更新last_update_id，确保不重复处理
+                    last_update_id = update.update_id + 1
+
+                    # 异步处理每个更新
+                    await process_update(update.to_dict())
+
+                    # 短暂休眠，避免处理过于频繁
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    # 单独处理每个更新的错误，不影响其他更新
+                    logger.error(f"处理单个更新时出错: {str(e)}")
+                    # 记录详细的错误栈信息，便于调试
+                    import traceback
+                    logger.debug(traceback.format_exc())
+                finally:
+                    # 无论成功或失败，都从处理中集合移除
+                    if update.update_id in processing_updates:
+                        processing_updates.remove(update.update_id)
+
+            # 定期清理处理中集合，避免内存泄漏
+            if len(processing_updates) > 0 and int(time.time()) % 300 == 0:  # 每5分钟清理一次
+                logger.debug(f"清理处理中集合，当前大小: {len(processing_updates)}")
+                # 这里可以添加逻辑来处理长时间未完成的更新
 
             # 短暂休眠，避免请求过于频繁
             await asyncio.sleep(1)
+        except NetworkError as e:
+            # 网络错误处理
+            failure_count += 1
+            logger.error(f"网络错误: {str(e)}. 第{failure_count}次失败，{retry_delay}秒后重试...")
+            await asyncio.sleep(retry_delay)
+        except RetryAfter as e:
+            # 速率限制错误，需要等待指定时间
+            retry_after = int(e.retry_after) if hasattr(e, 'retry_after') else 30
+            logger.warning(f"请求过于频繁，需要等待 {retry_after} 秒后重试")
+            await asyncio.sleep(retry_after)
         except Exception as e:
-            logger.error(f"轮询消息时出错: {str(e)}")
-            # 发生错误时等待一段时间再重试
-            await asyncio.sleep(5)
+            # 其他错误处理
+            failure_count += 1
+            logger.error(f"轮询消息时出错: {str(e)}. 第{failure_count}次失败，{retry_delay}秒后重试...")
+            # 记录详细的错误栈信息，便于调试
+            import traceback
+            logger.debug(traceback.format_exc())
+
+            # 如果失败次数过多，发送通知给管理员
+            if failure_count >= max_failures and ADMIN_CHAT_ID:
+                try:
+                    await bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=f"⚠️ YTBot警告：\n\n连续{failure_count}次消息轮询失败\n\n最后错误: {str(e)}"
+                    )
+                except Exception:
+                    pass
+
+            await asyncio.sleep(retry_delay)
+        finally:
+            # 定期记录系统状态
+            if int(time.time()) % 3600 == 0:  # 每小时记录一次
+                logger.info(f"消息轮询器运行正常，处理中更新: {len(processing_updates)}, 最后处理ID: {last_update_id}")
 
 
 # 主函数 - 完全异步实现，使用低级API避免事件循环问题
 async def main_async():
+    global bot, semaphore, main_event_loop
+
     try:
+        # 保存主事件循环的引用
+        main_event_loop = asyncio.get_event_loop()
+
+        # 创建Bot实例
+        bot = create_bot(TELEGRAM_BOT_TOKEN)
+        if not bot:
+            raise Exception("无法创建Telegram Bot实例")
+
+        # 创建并发控制信号量
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
         logger.info("YTBot已启动，等待消息...")
         # 启动消息轮询器
         await message_poller()
@@ -358,111 +1196,218 @@ async def main_async():
 
 def main():
     print("YTBot正在启动...")
+
+    # 检查必需的配置
+    missing_configs, ADMIN_CHAT_ID = check_required_config()
+
+    if missing_configs:
+        print(f"错误: 缺少必需的配置项: {', '.join(missing_configs)}")
+        print("请编辑config.py文件，填写所有必需的配置项")
+        return
+
+    # 不再提前检查bot，而是在main_async中创建
+
     # 在异步事件循环外执行所有同步操作
-    # 检查yt_dlp版本
-    print("检查yt_dlp版本...")
-    yt_dlp_ok, yt_dlp_msg = check_yt_dlp_version()
-    print(f"yt_dlp检查结果: {yt_dlp_msg}")
-
-    # 检测Nextcloud连接
-    print("检测Nextcloud连接...")
-    nextcloud_ok, nextcloud_msg = check_nextcloud_connection()
-    print(f"Nextcloud连接检查结果: {nextcloud_msg}")
-
-    # 发送启动通知给管理员
-    if ADMIN_CHAT_ID and ADMIN_CHAT_ID != 'YOUR_TELEGRAM_USER_ID':
-        try:
-            # 使用一个完全独立的函数发送启动通知，避免事件循环冲突
-            send_start_notification(ADMIN_CHAT_ID, f"{yt_dlp_msg}\n{nextcloud_msg}")
-        except Exception as e:
-            logger.warning(f"发送启动通知失败: {str(e)}")
-    else:
-        logger.warning("未设置有效的ADMIN_CHAT_ID，无法发送启动通知")
-
-    print("YTBot已启动，等待telegram消息...")
-    # 启动异步事件循环运行机器人
     try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        logger.info("Bot已停止")
+        # 检查yt_dlp版本
+        print("检查yt_dlp版本...")
+        yt_dlp_ok, yt_dlp_msg = check_yt_dlp_version()
+        print(f"yt_dlp检查结果: {yt_dlp_msg}")
+
+        # 检测Nextcloud连接
+        print("检测Nextcloud连接...")
+        nextcloud_ok, nextcloud_msg = check_nextcloud_connection()
+        print(f"Nextcloud连接检查结果: {nextcloud_msg}")
+
+        # 发送启动通知给管理员
+        if ADMIN_CHAT_ID:
+            try:
+                # 使用一个完全独立的函数发送启动通知，避免事件循环冲突
+                send_start_notification(ADMIN_CHAT_ID, f"{yt_dlp_msg}\n{nextcloud_msg}")
+            except Exception as e:
+                logger.warning(f"发送启动通知失败: {str(e)}")
+        else:
+            logger.warning("未设置有效的ADMIN_CHAT_ID，无法发送启动通知")
+
+        print("YTBot已启动，等待telegram消息...")
+        # 启动异步事件循环运行机器人
+        try:
+            asyncio.run(main_async())
+        except KeyboardInterrupt:
+            logger.info("Bot已停止")
+        except Exception as e:
+            logger.error(f"Bot运行出错: {str(e)}")
+            print(f"错误: Bot运行出错: {str(e)}")
+    except Exception as e:
+        logger.critical(f"Bot初始化失败: {str(e)}")
+        print(f"严重错误: Bot初始化失败: {str(e)}")
 
 
 def send_start_notification(chat_id, message):
-    """使用独立的线程发送启动通知，完全避免事件循环冲突"""
+    """使用独立的线程发送启动通知，完全避免事件循环冲突，增强错误处理和日志记录"""
     import threading
+    import traceback
 
     def _send_in_thread():
         try:
+            # 验证chat_id格式
+            chat_id_int = int(chat_id)
+
             # 创建一个全新的Bot实例和事件循环
             from telegram import Bot
             thread_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-            # 创建并运行一个独立的事件循环
+            # 创建一个单一的事件循环来处理所有异步操作
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                thread_bot.send_message(
-                    chat_id=chat_id,
-                    text=f"YTBot已成功启动！\n{message}"
+
+            bot_info = None
+            try:
+                # 在同一个事件循环中获取Bot信息
+                bot_info = loop.run_until_complete(thread_bot.get_me())
+            except Exception as e:
+                logger.warning(f"获取Bot信息失败: {str(e)}")
+
+            # 构建通知消息
+            base_message = "🚀 YTBot已成功启动！\n\n"
+            if bot_info:
+                base_message += f"🤖 机器人名称: {bot_info.first_name}\n"
+                base_message += f"🔍 用户名: @{bot_info.username}\n"
+                base_message += f"🆔 Bot ID: {bot_info.id}\n\n"
+            base_message += f"📊 系统状态:\n{message}\n\n"
+            base_message += "💡 提示: 发送YouTube链接开始下载音乐"
+
+            # 在同一个事件循环中发送消息
+            try:
+                loop.run_until_complete(
+                    thread_bot.send_message(
+                        chat_id=chat_id_int,
+                        text=base_message
+                    )
                 )
-            )
-            loop.close()
+            except Exception as e:
+                logger.error(f"发送启动通知消息失败: {str(e)}")
+                # 重新抛出异常以便外部捕获
+                raise
+            finally:
+                # 确保事件循环被关闭
+                loop.close()
+            logger.info(f"启动通知已成功发送到管理员 {chat_id_int}")
+        except ValueError:
+            logger.error(f"无效的ADMIN_CHAT_ID格式: {chat_id}，必须是整数")
         except Exception as e:
-            logger.warning(f"在线程中发送启动通知失败: {str(e)}")
+            logger.error(f"在线程中发送启动通知失败: {str(e)}")
+            logger.debug(traceback.format_exc())
 
     # 创建并启动线程
     thread = threading.Thread(target=_send_in_thread)
     thread.daemon = True  # 设置为守护线程，主程序结束时自动终止
     thread.start()
 
+    # 等待一小段时间确保线程启动
+    time.sleep(0.1)
+
 
 # 规范化文件名，确保符合Nextcloud要求
 def sanitize_filename(filename):
-    # Nextcloud支持的文件名规则（基于常见文件系统限制）
-    # 1. 去除或替换不支持的字符
-    # 2. 限制文件名长度
-    # 3. 避免使用保留文件名
+    """
+    安全地清理文件名，增强了对各种边缘情况的处理
+
+    Args:
+        filename: 原始文件名
+
+    Returns:
+        str: 清理后的安全文件名
+    """
+    # 处理None或空输入
+    if filename is None:
+        logger.debug("sanitize_filename: 输入为None，使用默认名称")
+        return "unknown_file.mp3"
+
+    # 转换为字符串
+    filename_str = str(filename)
+
+    # 处理空字符串情况
+    if not filename_str.strip():
+        logger.debug("sanitize_filename: 输入为空字符串，使用默认名称")
+        return "unknown_file.mp3"
+
+    # 移除前后空格
+    filename_str = filename_str.strip()
 
     # 不支持的字符列表（常见于Windows和Linux文件系统）
-    # 使用原始字符串避免转义问题
     invalid_chars = r'<>"/\|?*'
 
     # 替换不支持的字符为下划线
     for char in invalid_chars:
-        filename = filename.replace(char, '_')
+        filename_str = filename_str.replace(char, '_')
 
-    # 去除连续的下划线
-    while '__' in filename:
-        filename = filename.replace('__', '_')
+    # 使用正则表达式去除连续的下划线，更高效
+    import re
+    filename_str = re.sub(r'_+', '_', filename_str)
 
     # 去除控制字符
-    filename = ''.join(char for char in filename if ord(char) >= 32)
+    filename_str = ''.join(char for char in filename_str if ord(char) >= 32)
 
     # 限制文件名长度（Nextcloud推荐不超过255个字符）
     max_length = 150  # 进一步减少长度限制，确保即使URL编码后也不会超过Nextcloud限制
-    name, ext = os.path.splitext(filename)
-    if len(name) > max_length:
-        name = name[:max_length]
-        filename = f"{name}{ext}"
+    name, ext = os.path.splitext(filename_str)
+
+    # 计算扩展名长度（包括点号）
+    ext_length = len(ext)
+
+    # 为文件名主体计算最大允许长度
+    max_name_length = max_length - ext_length
+
+    # 如果扩展名太长，保留基础文件名
+    if ext_length > max_length:
+        logger.warning(f"sanitize_filename: 扩展名过长: {ext}")
+        return "file.mp3"
+
+    # 如果文件名主体太长，截断它
+    if len(name) > max_name_length:
+        # 保留前一部分和后一部分，中间用...连接
+        if max_name_length > 10:  # 确保有足够空间保留有意义的部分
+            name = name[:max_name_length - 3] + "..."
+        else:
+            name = name[:max_name_length]
+        filename_str = f"{name}{ext}"
+        logger.debug(f"sanitize_filename: 文件名过长，已截断: {filename_str}")
 
     # 避免使用操作系统保留文件名
     reserved_names = [
-        'CON', 'PRN', 'AUX', 'NUL', 
-        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
         'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
     ]
+
     # 不区分大小写地检查保留文件名
-    name_without_ext = os.path.splitext(os.path.basename(filename))[0].upper()
-    if name_without_ext in reserved_names:
-        # 保持原文件名的大小写，但添加后缀
-        name, ext = os.path.splitext(filename)
-        filename = f"{name}_1{ext}"
+    name_without_ext = os.path.splitext(os.path.basename(filename_str))[0].upper()
+    counter = 1
+    while name_without_ext in reserved_names:
+        # 保持原文件名的大小写，但添加数字后缀
+        name, ext = os.path.splitext(filename_str)
+        filename_str = f"{name}_{counter}{ext}"
+        name_without_ext = os.path.splitext(os.path.basename(filename_str))[0].upper()
+        counter += 1
+        # 避免无限循环
+        if counter > 100:
+            break
 
-    # 确保文件名不为空
-    if not filename or filename == '.mp3':
-        filename = 'unnamed_file.mp3'
+    # 确保文件名不为空且有效
+    if not filename_str or filename_str == '.mp3' or filename_str == '_':
+        filename_str = 'unnamed_file.mp3'
+        logger.debug("sanitize_filename: 文件名无效，使用默认名称")
 
-    return filename
+    # 去除开头和结尾的下划线
+    filename_str = filename_str.strip('_')
+
+    # 再次检查文件名是否有效
+    if not filename_str or filename_str == '.mp3':
+        filename_str = 'unnamed_file.mp3'
+
+    logger.debug(f"sanitize_filename: 原始文件名 '{filename}' 已清理为 '{filename_str}'")
+    return filename_str
 
 
 if __name__ == '__main__':
