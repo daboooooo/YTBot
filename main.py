@@ -34,6 +34,10 @@ ERROR_CHANNEL_ID = ADMIN_CHAT_ID
 # 主事件循环引用
 main_event_loop = None
 
+# 用户状态管理字典，用于存储用户的选择状态
+# 格式: {user_id: {'state': 'waiting_for_download_type', 'url': 'youtube_url'}}
+user_states = {}
+
 # 配置日志
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -514,16 +518,17 @@ def check_nextcloud_connection():
     return False, "Nextcloud连接失败: 所有重试尝试都失败\n请检查配置和网络连接后重试"
 
 
-# 下载YouTube视频并转换为MP3
+# 下载YouTube视频并根据选择转换为音频或视频
 @retry(max_retries=2, delay=5, exceptions=(Exception,))
-async def download_and_convert(url, chat_id):
+async def download_and_convert(url, chat_id, download_type='audio'):
     """
-    下载YouTube视频并转换为MP3格式，然后上传到Nextcloud
+    下载YouTube视频并转换为指定格式（MP3音频或MP4视频），然后上传到Nextcloud
     增强了错误处理、超时控制和资源管理
 
     Args:
         url: YouTube视频链接
         chat_id: Telegram聊天ID，用于发送状态更新
+        download_type: 下载类型，'audio'（默认）或 'video'
 
     Raises:
         Exception: 如果处理过程中发生错误
@@ -540,34 +545,68 @@ async def download_and_convert(url, chat_id):
         if not chat_id:
             raise ValueError("无效的聊天ID")
 
-        # 发送开始处理的通知
-        await send_message_safely(chat_id, "开始处理视频，请稍候...", sent_messages)
+        # 验证下载类型
+        if download_type not in ['audio', 'video']:
+            download_type = 'audio'  # 默认使用音频下载
+
+        # 根据下载类型发送开始处理的通知
+        if download_type == 'audio':
+            process_msg = "开始处理视频并提取音频，请稍候..."
+        else:
+            process_msg = "开始处理并下载视频，请稍候..."
+        await send_message_safely(chat_id, process_msg, sent_messages)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            # 配置yt-dlp，增强稳定性和错误处理
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-                'postprocessors': [
-                    {
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }
-                ],
-                'quiet': False,
-                'no_warnings': True,  # 减少警告输出
-                'retries': 5,  # yt-dlp内置重试次数
-                'fragment_retries': 10,  # 片段下载重试次数
-                'timeout': 600,  # 整体操作超时时间
-                'socket_timeout': 30,  # 网络套接字超时
-                'http_headers': {
-                    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                                   'AppleWebKit/537.36 (KHTML, like Gecko) '
-                                   'Chrome/91.0.4472.124 Safari/537.36')
-                },
-                'ignoreerrors': False,  # 出错时停止
-            }
+            # 根据下载类型配置yt-dlp
+            if download_type == 'audio':
+                # 音频下载配置
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+                    'postprocessors': [
+                        {
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }
+                    ],
+                    'quiet': False,
+                    'no_warnings': True,
+                    'retries': 5,
+                    'fragment_retries': 10,
+                    'timeout': 600,
+                    'socket_timeout': 30,
+                    'http_headers': {
+                        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                       'Chrome/91.0.4472.124 Safari/537.36')
+                    },
+                    'ignoreerrors': False,
+                }
+            else:
+                # 视频下载配置
+                ydl_opts = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+                    'postprocessors': [
+                        {
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',  # 将视频转换为mp4
+                        }
+                    ],
+                    'quiet': False,
+                    'no_warnings': True,
+                    'retries': 5,
+                    'fragment_retries': 10,
+                    'timeout': 600,
+                    'socket_timeout': 30,
+                    'http_headers': {
+                        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                       'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                       'Chrome/91.0.4472.124 Safari/537.36')
+                    },
+                    'ignoreerrors': False,
+                }
 
             # 发送下载开始的通知
             await send_message_safely(chat_id, "开始下载视频...", sent_messages)
@@ -711,43 +750,60 @@ async def download_and_convert(url, chat_id):
                 raise Exception("未能获取视频信息")
 
             title = info.get('title', 'unknown')
-            mp3_file = None
+            target_file = None
+            target_files = []
 
-            # 查找生成的MP3文件
-            mp3_files = []
             try:
-                # 增加查找MP3文件的容错性
-                for root, _, files in os.walk(temp_dir):
-                    for file in files:
-                        if file.lower().endswith('.mp3'):
-                            mp3_files.append(os.path.join(root, file))
-
-                # 如果没找到，尝试查找任何音频文件
-                if not mp3_files:
+                # 根据下载类型查找对应的文件
+                if download_type == 'audio':
+                    # 查找MP3文件
                     for root, _, files in os.walk(temp_dir):
                         for file in files:
-                            if file.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg')):
-                                mp3_files.append(os.path.join(root, file))
+                            if file.lower().endswith('.mp3'):
+                                target_files.append(os.path.join(root, file))
+
+                    # 如果没找到MP3，尝试查找其他音频文件
+                    if not target_files:
+                        for root, _, files in os.walk(temp_dir):
+                            for file in files:
+                                if file.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg')):
+                                    target_files.append(os.path.join(root, file))
+                else:
+                    # 查找视频文件
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith('.mp4'):
+                                target_files.append(os.path.join(root, file))
+
+                    # 如果没找到MP4，尝试查找其他视频文件
+                    if not target_files:
+                        for root, _, files in os.walk(temp_dir):
+                            for file in files:
+                                if file.lower().endswith(('.mp4', '.mkv', '.webm')):
+                                    target_files.append(os.path.join(root, file))
             except Exception as e:
                 logger.error(f"列出临时目录文件时出错: {str(e)}")
                 raise Exception(f"访问临时文件失败: {str(e)}")
 
-            if not mp3_files:
-                raise Exception("转换后的音频文件未找到")
+            if not target_files:
+                if download_type == 'audio':
+                    raise Exception("转换后的音频文件未找到")
+                else:
+                    raise Exception("下载的视频文件未找到")
 
-            # 选择第一个找到的音频文件
-            mp3_file = mp3_files[0]
+            # 选择第一个找到的文件
+            target_file = target_files[0]
 
             # 对文件名进行规范化处理，确保符合Nextcloud要求
-            original_filename = os.path.basename(mp3_file)
+            original_filename = os.path.basename(target_file)
             sanitized_filename = sanitize_filename(original_filename)
 
             # 如果文件名发生了变化，重命名文件
             if original_filename != sanitized_filename:
                 sanitized_file_path = os.path.join(temp_dir, sanitized_filename)
                 try:
-                    os.rename(mp3_file, sanitized_file_path)
-                    mp3_file = sanitized_file_path
+                    os.rename(target_file, sanitized_file_path)
+                    target_file = sanitized_file_path
                     logger.info(f"文件名已规范化: {original_filename} -> {sanitized_filename}")
                 except Exception as e:
                     logger.warning(f"重命名文件失败: {str(e)}")
@@ -755,8 +811,8 @@ async def download_and_convert(url, chat_id):
                     # 尝试创建一个新的副本，而不是重命名
                     try:
                         import shutil
-                        shutil.copy2(mp3_file, sanitized_file_path)
-                        mp3_file = sanitized_file_path
+                        shutil.copy2(target_file, sanitized_file_path)
+                        target_file = sanitized_file_path
                         logger.info(f"文件已复制并重命名: {original_filename} -> {sanitized_filename}")
                     except Exception as copy_err:
                         logger.warning(f"复制文件失败: {str(copy_err)}")
@@ -764,18 +820,21 @@ async def download_and_convert(url, chat_id):
             else:
                 logger.info(f"文件名符合要求: {sanitized_filename}")
 
-            # 获取音频文件大小
+            # 获取文件大小
             try:
-                file_size = os.path.getsize(mp3_file) / (1000 * 1000)  # 转换为MB
+                file_size = os.path.getsize(target_file) / (1000 * 1000)  # 转换为MB
                 file_size_str = f"{file_size:.2f} MB"
             except Exception as e:
                 logger.error(f"获取文件大小失败: {str(e)}")
                 file_size_str = "未知大小"
 
-            # 发送转换完成的通知
-            send_msg = f"✅ 视频 '{title}' 下载转换完成，开始上传到Nextcloud...\n📁 文件大小: {file_size_str}"
-            logger.info(send_msg)
-            await send_message_safely(chat_id, send_msg, sent_messages)
+            # 根据下载类型发送完成通知
+            if download_type == 'audio':
+                completion_msg = f"✅ 音频 '{title}' 下载转换完成，开始上传到Nextcloud...\n📁 文件大小: {file_size_str}"
+            else:
+                completion_msg = f"✅ 视频 '{title}' 下载完成，开始上传到Nextcloud...\n📁 文件大小: {file_size_str}"
+            logger.info(completion_msg)
+            await send_message_safely(chat_id, completion_msg, sent_messages)
 
             # 上传到Nextcloud
             try:
@@ -787,7 +846,7 @@ async def download_and_convert(url, chat_id):
                 client = get_nextcloud_client()
 
                 # 上传文件
-                remote_path = os.path.join(NEXTCLOUD_UPLOAD_DIR, os.path.basename(mp3_file))
+                remote_path = os.path.join(NEXTCLOUD_UPLOAD_DIR, os.path.basename(target_file))
 
                 # 由于webdavclient3的upload_sync方法会自动创建必要的目录结构
                 # 所以我们直接尝试上传文件
@@ -798,7 +857,7 @@ async def download_and_convert(url, chat_id):
                     try:
                         # 创建一个函数来包装上传操作，以便添加超时
                         def _sync_upload():
-                            client.upload_sync(remote_path=remote_path, local_path=mp3_file)
+                            client.upload_sync(remote_path=remote_path, local_path=target_file)
 
                         # 使用asyncio.wait_for添加超时控制
                         await asyncio.wait_for(
@@ -823,13 +882,19 @@ async def download_and_convert(url, chat_id):
 
                 # 验证文件是否成功上传
                 if client.check(remote_path):
+                    # 根据下载类型设置不同的通知消息
+                    if download_type == 'audio':
+                        file_type_text = '音乐文件'
+                    else:
+                        file_type_text = '视频文件'
+                        
                     # 发送完成通知
-                    send_msg = (f"🎉 文件 '{os.path.basename(mp3_file)}' "
+                    send_msg = (f"🎉 {file_type_text} '{os.path.basename(target_file)}' "
                                 f"已成功上传到Nextcloud！\n"
                                 f"📌 路径：{NEXTCLOUD_UPLOAD_DIR}")
                     logger.info(send_msg)
                     await send_message_safely(chat_id, send_msg, sent_messages)
-                    logger.warning(f"用户 {chat_id} 上传了文件: {os.path.basename(mp3_file)}")
+                    logger.warning(f"用户 {chat_id} 上传了文件: {os.path.basename(target_file)}")
                 else:
                     raise Exception("上传后的文件验证失败")
             except Exception as e:
@@ -1018,16 +1083,61 @@ async def process_update(update):
                     chat_id=chat_id,
                     text=f"未知命令: {command}\n请使用 /help 查看可用命令。"
                 )
+        # 处理用户状态
+        if user_id in user_states:
+            user_state = user_states[user_id]
+            # 处理用户选择下载类型的回复
+            if user_state.get('state') == 'waiting_for_download_type':
+                try:
+                    # 使用并发控制
+                    async with semaphore:
+                        # 获取用户选择和保存的URL
+                        choice = text.strip().lower()
+                        url = user_state.get('url')
+                        
+                        # 清除用户状态
+                        del user_states[user_id]
+                        
+                        # 根据用户选择调用不同的下载逻辑
+                        if choice == '1' or choice == '音频' or choice == 'mp3':
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text="您选择了音频MP3格式，开始处理...\n\n请耐心等待，处理时间取决于视频长度和网络状况。"
+                            )
+                            await download_and_convert(url, chat_id, download_type='audio')
+                        elif choice == '2' or choice == '视频' or choice == 'mp4':
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text="您选择了视频MP4格式，开始处理...\n\n请耐心等待，处理时间取决于视频长度和网络状况。"
+                            )
+                            await download_and_convert(url, chat_id, download_type='video')
+                        else:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text="无效的选择。请重新发送YouTube链接，然后回复1(音频MP3)或2(视频MP4)。"
+                            )
+                except Exception as e:
+                    logger.error(f"process_update: 处理用户选择时出错: {str(e)}")
+                    # 发送更友好的错误消息
+                    error_msg = "处理您的选择时出错，请稍后再试。"
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=error_msg)
+                    except Exception:
+                        pass  # 如果发送错误消息也失败，就忽略
         # 处理YouTube链接
         elif text and is_youtube_url(text):
             try:
-                # 使用并发控制
-                async with semaphore:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="检测到YouTube链接，排队处理中...\n\n请耐心等待，处理时间取决于视频长度和网络状况。"
-                    )
-                    await download_and_convert(text, chat_id)
+                # 保存用户状态，等待用户选择下载类型
+                user_states[user_id] = {
+                    'state': 'waiting_for_download_type',
+                    'url': text
+                }
+                # 发送选择消息
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="检测到YouTube链接！请选择下载类型：\n1. 音频MP3\n2. 视频MP4\n\n请回复1或2，或者直接回复'音频'/'视频'。"
+                )
+                    
             except Exception as e:
                 logger.error(f"process_update: 处理YouTube链接时出错: {str(e)}")
                 # 发送更友好的错误消息
