@@ -126,15 +126,15 @@ def check_required_config():
             missing_configs.append(key)
 
     # 尝试获取ADMIN_CHAT_ID，如果不存在则设为None
-    ADMIN_CHAT_ID = None
+    admin_chat_id = None
     try:
         from config import ADMIN_CHAT_ID as CONFIG_ADMIN_CHAT_ID
         if CONFIG_ADMIN_CHAT_ID and CONFIG_ADMIN_CHAT_ID != 'YOUR_TELEGRAM_USER_ID':
-            ADMIN_CHAT_ID = CONFIG_ADMIN_CHAT_ID
+            admin_chat_id = CONFIG_ADMIN_CHAT_ID
     except ImportError:
         pass
 
-    return missing_configs, ADMIN_CHAT_ID
+    return missing_configs, admin_chat_id
 
 
 # 检查并创建Bot实例
@@ -887,7 +887,7 @@ async def download_and_convert(url, chat_id, download_type='audio'):
                         file_type_text = '音乐文件'
                     else:
                         file_type_text = '视频文件'
-                        
+
                     # 发送完成通知
                     send_msg = (f"🎉 {file_type_text} '{os.path.basename(target_file)}' "
                                 f"已成功上传到Nextcloud！\n"
@@ -1094,10 +1094,10 @@ async def process_update(update):
                         # 获取用户选择和保存的URL
                         choice = text.strip().lower()
                         url = user_state.get('url')
-                        
+
                         # 清除用户状态
                         del user_states[user_id]
-                        
+
                         # 根据用户选择调用不同的下载逻辑
                         if choice == '1' or choice == '音频' or choice == 'mp3':
                             await bot.send_message(
@@ -1137,7 +1137,7 @@ async def process_update(update):
                     chat_id=chat_id,
                     text="检测到YouTube链接！请选择下载类型：\n1. 音频MP3\n2. 视频MP4\n\n请回复1或2，或者直接回复'音频'/'视频'。"
                 )
-                    
+
             except Exception as e:
                 logger.error(f"process_update: 处理YouTube链接时出错: {str(e)}")
                 # 发送更友好的错误消息
@@ -1308,7 +1308,7 @@ def main():
     print("YTBot正在启动...")
 
     # 检查必需的配置
-    missing_configs, ADMIN_CHAT_ID = check_required_config()
+    missing_configs, admin_chat_id = check_required_config()
 
     if missing_configs:
         print(f"错误: 缺少必需的配置项: {', '.join(missing_configs)}")
@@ -1330,10 +1330,10 @@ def main():
         print(f"Nextcloud连接检查结果: {nextcloud_msg}")
 
         # 发送启动通知给管理员
-        if ADMIN_CHAT_ID:
+        if admin_chat_id:
             try:
                 # 使用一个完全独立的函数发送启动通知，避免事件循环冲突
-                send_start_notification(ADMIN_CHAT_ID, f"{yt_dlp_msg}\n{nextcloud_msg}")
+                send_start_notification(admin_chat_id, f"{yt_dlp_msg}\n{nextcloud_msg}")
             except Exception as e:
                 logger.warning(f"发送启动通知失败: {str(e)}")
         else:
@@ -1403,8 +1403,8 @@ def send_start_notification(chat_id, message):
                 # 确保事件循环被关闭
                 loop.close()
             logger.info(f"启动通知已成功发送到管理员 {chat_id_int}")
-        except ValueError:
-            logger.error(f"无效的ADMIN_CHAT_ID格式: {chat_id}，必须是整数")
+        except ValueError as e:
+            logger.error(f"值错误: {str(e)}")
         except Exception as e:
             logger.error(f"在线程中发送启动通知失败: {str(e)}")
             logger.debug(traceback.format_exc())
