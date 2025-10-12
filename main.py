@@ -968,7 +968,7 @@ async def send_message_safely(chat_id, text, sent_messages=None):
                 except Exception:
                     pass
     except Exception as e:
-        logger.error(f"发送消息失败: {str(e)}")
+        logger.error(f"发送消息失败: {str(e)}, 消息: {text}")
         # 不重新抛出异常，避免影响主流程
 
 
