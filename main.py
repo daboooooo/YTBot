@@ -7,14 +7,17 @@ import threading
 import tempfile
 import asyncio
 import logging
+import logging.handlers
 import requests
 import inspect
+import psutil
 from telegram import Bot
 from telegram.error import BadRequest, NetworkError, RetryAfter
 from webdav3.client import Client
 import yt_dlp
 import time
 from urllib.parse import urlparse
+import signal
 
 # 从配置文件导入配置
 from config import (
@@ -35,15 +38,32 @@ ERROR_CHANNEL_ID = ADMIN_CHAT_ID
 main_event_loop = None
 
 # 用户状态管理字典，用于存储用户的选择状态
-# 格式: {user_id: {'state': 'waiting_for_download_type', 'url': 'youtube_url'}}
+# 格式: {user_id: {'state': 'waiting_for_download_type', 'url': 'youtube_url',
+#        'timestamp': timestamp}}
 user_states = {}
 
+
 # 配置日志
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=getattr(logging, LOG_LEVEL if 'LOG_LEVEL' in locals() else 'INFO')
-)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(getattr(logging, LOG_LEVEL if 'LOG_LEVEL' in locals() else 'INFO'))
+
+# 创建格式化器
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# 创建按大小和时间轮换的文件处理器
+file_handler = logging.handlers.RotatingFileHandler(
+    'ytbot.log', 
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5  # 保留5个备份
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 
 def global_exception_handler(exctype, value, traceback):
@@ -140,7 +160,7 @@ def check_required_config():
 # 检查并创建Bot实例
 def create_bot(token):
     """
-    创建并返回一个Bot实例，不执行异步验证以避免事件循环冲突
+    创建并返回一个Bot实例，支持代理配置，不执行异步验证以避免事件循环冲突
 
     Args:
         token: Telegram Bot token
@@ -149,12 +169,59 @@ def create_bot(token):
         Bot实例或None（如果创建失败）
     """
     try:
-        # 简单地创建Bot实例，不执行异步验证
-        bot = Bot(token=token)
-        logger.info("成功创建Bot实例: 已初始化Bot对象")
+        # 尝试从配置文件获取代理设置
+        proxy_url = None
+        try:
+            from config import PROXY_URL
+            if PROXY_URL and PROXY_URL != 'YOUR_PROXY_URL':
+                proxy_url = PROXY_URL
+                logger.info(f"从配置文件获取代理设置: {proxy_url}")
+        except (ImportError, AttributeError):
+            # 如果配置文件中没有代理设置，尝试从环境变量获取
+            for env_var in ['PROXY_URL', 'ALL_PROXY', 'all_proxy']:
+                if env_var in os.environ:
+                    proxy_url = os.environ[env_var]
+                    logger.info(f"从环境变量 {env_var} 获取代理设置: {proxy_url}")
+                    break
+        
+        # 验证和修正代理URL格式
+        if proxy_url:
+            try:
+                parsed = urlparse(proxy_url)
+                # 确保SOCKS代理使用正确的格式
+                if parsed.scheme == 'socks' and not parsed.scheme.startswith('socks5'):
+                    # 修正socks为socks5
+                    proxy_url = proxy_url.replace('socks://', 'socks5://')
+                    logger.warning(f"修正代理URL格式: {proxy_url}")
+                
+                # 检查是否有有效的scheme
+                if not parsed.scheme:
+                    # 如果没有scheme，默认添加http
+                    proxy_url = f'http://{proxy_url}'
+                    logger.warning("添加代理URL scheme: %s", proxy_url)
+                    
+            except Exception as e:
+                logger.error("解析代理URL失败: %s", str(e))
+                proxy_url = None
+        
+        # 创建Bot实例，使用代理设置（如果有）
+        if proxy_url:
+            # 使用代理设置
+            bot = Bot(token=token, 
+                      base_url='https://api.telegram.org/bot{}/', 
+                      request_kwargs={'proxy_url': proxy_url})
+            logger.info("成功创建带代理的Bot实例")
+        else:
+            # 不使用代理
+            bot = Bot(token=token)
+            logger.info("成功创建Bot实例（无代理）")
+            
         return bot
     except Exception as e:
         logger.error(f"创建Bot实例失败: {str(e)}")
+        # 记录详细错误信息
+        import traceback
+        logger.debug(traceback.format_exc())
         return None
 
 
@@ -1022,7 +1089,7 @@ async def process_update(update):
     try:
         # 检查更新数据是否有效
         if not isinstance(update, dict):
-            logger.warning(f"process_update: 无效的更新数据类型: {type(update)}")
+            logger.warning("process_update: 无效的更新数据类型: %s", type(update))
             return
 
         # 提取消息和相关信息
@@ -1030,7 +1097,7 @@ async def process_update(update):
 
         # 检查消息是否有效
         if not isinstance(message, dict):
-            logger.warning(f"process_update: 无效的消息数据类型: {type(message)}")
+            logger.warning("process_update: 无效的消息数据类型: %s", type(message))
             return
 
         # 提取文本内容（优先从reply_to_message中获取转发的链接）
@@ -1045,7 +1112,7 @@ async def process_update(update):
         # 提取聊天信息
         chat = message.get('chat', {})
         if not isinstance(chat, dict):
-            logger.warning(f"process_update: 无效的聊天数据类型: {type(chat)}")
+            logger.warning("process_update: 无效的聊天数据类型: %s", type(chat))
             return
 
         # 获取聊天ID和用户信息
@@ -1054,14 +1121,14 @@ async def process_update(update):
         user = message.get('from', {})
         user_id = user.get('id')
         username = user.get('username', 'unknown')
-
+        
         # 验证必要的字段
         if not chat_id:
             logger.warning("process_update: 无法获取聊天ID")
             return
 
         # 记录收到的消息（不记录文本内容以保护隐私）
-        logger.info(f"process_update: 收到来自用户 {username} (ID: {user_id}) 的消息，聊天类型: {chat_type}")
+        logger.info("process_update: 收到来自用户 %s (ID: %s) 的消息，聊天类型: %s", username, user_id, chat_type)
 
         # 处理不同类型的聊天（可选：仅允许私聊）
         if chat_type not in ['private', 'group', 'supergroup']:
@@ -1130,7 +1197,8 @@ async def process_update(update):
                 # 保存用户状态，等待用户选择下载类型
                 user_states[user_id] = {
                     'state': 'waiting_for_download_type',
-                    'url': text
+                    'url': text,
+                    'timestamp': time.time()  # 添加时间戳用于过期清理
                 }
                 # 发送选择消息
                 await bot.send_message(
@@ -1194,8 +1262,26 @@ async def message_poller():
     failure_count = 0
     max_failures = 5
     max_retry_delay = 60  # 最大重试延迟时间（秒）
-    # 跟踪正在处理的更新ID，防止重复处理
+    # 跟踪正在处理的更新ID及其开始处理时间，防止重复处理和清理超时更新
     processing_updates = set()
+    processing_updates_with_time = {}
+    
+    # 定义清理僵尸更新的协程
+    async def cleanup_stale_updates():
+        """清理长时间未完成处理的更新"""
+        current_time = time.time()
+        timeout = 300  # 5分钟超时
+        stale_updates = [
+            uid for uid, start_time in processing_updates_with_time.items() 
+            if current_time - start_time > timeout
+        ]
+        
+        for uid in stale_updates:
+            logger.warning(f"清理超时更新: {uid}")
+            if uid in processing_updates:
+                processing_updates.remove(uid)
+            if uid in processing_updates_with_time:
+                del processing_updates_with_time[uid]
 
     while True:
         try:
@@ -1217,8 +1303,9 @@ async def message_poller():
                     if update.update_id in processing_updates:
                         continue
 
-                    # 添加到处理中的集合
+                    # 添加到处理中的集合并记录开始时间
                     processing_updates.add(update.update_id)
+                    processing_updates_with_time[update.update_id] = time.time()
 
                     # 更新last_update_id，确保不重复处理
                     last_update_id = update.update_id + 1
@@ -1238,11 +1325,14 @@ async def message_poller():
                     # 无论成功或失败，都从处理中集合移除
                     if update.update_id in processing_updates:
                         processing_updates.remove(update.update_id)
+                    if update.update_id in processing_updates_with_time:
+                        del processing_updates_with_time[update.update_id]
 
             # 定期清理处理中集合，避免内存泄漏
             if len(processing_updates) > 0 and int(time.time()) % 300 == 0:  # 每5分钟清理一次
-                logger.debug(f"清理处理中集合，当前大小: {len(processing_updates)}")
-                # 这里可以添加逻辑来处理长时间未完成的更新
+                logger.debug(f"开始清理长时间未处理的更新，当前处理中: {len(processing_updates)}")
+                await cleanup_stale_updates()
+                logger.debug(f"清理完成，剩余处理中: {len(processing_updates)}")
 
             # 短暂休眠，避免请求过于频繁
             await asyncio.sleep(1)
@@ -1278,7 +1368,8 @@ async def message_poller():
         finally:
             # 定期记录系统状态
             if int(time.time()) % 3600 == 0:  # 每小时记录一次
-                logger.info(f"消息轮询器运行正常，处理中更新: {len(processing_updates)}, 最后处理ID: {last_update_id}")
+                logger.info("消息轮询器运行正常，处理中更新: %d, 最后处理ID: %s", 
+                           len(processing_updates), last_update_id)
 
 
 # 主函数 - 完全异步实现，使用低级API避免事件循环问题
@@ -1297,15 +1388,47 @@ async def main_async():
         # 创建并发控制信号量
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
+        # 启动资源监控任务
+        logger.info("启动资源监控任务...")
+        monitor_task = asyncio.create_task(resource_monitor())
+        
+        # 启动网络监控任务
+        logger.info("启动网络监控任务...")
+        network_task = asyncio.create_task(network_monitor())
+
         logger.info("YTBot已启动，等待消息...")
         # 启动消息轮询器
-        await message_poller()
+        try:
+            await message_poller()
+        except Exception as e:
+            logger.error(f"消息轮询器异常: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        finally:
+            # 确保资源监控任务被取消
+            if monitor_task:
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    logger.info("资源监控任务已关闭")
+            
+            # 确保网络监控任务被取消
+            if network_task:
+                network_task.cancel()
+                try:
+                    await network_task
+                except asyncio.CancelledError:
+                    logger.info("网络监控任务已关闭")
     except Exception as e:
         logger.error(f"Bot启动失败: {str(e)}")
 
 
 def main():
     print("YTBot正在启动...")
+
+    # 设置信号处理
+    setup_signal_handlers()
 
     # 检查必需的配置
     missing_configs, admin_chat_id = check_required_config()
@@ -1329,6 +1452,15 @@ def main():
         nextcloud_ok, nextcloud_msg = check_nextcloud_connection()
         print(f"Nextcloud连接检查结果: {nextcloud_msg}")
 
+        # 检查系统资源
+        try:
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_used_mb = memory_info.rss / 1024 / 1024
+            logger.info(f"启动时内存使用: {memory_used_mb:.2f} MB")
+        except Exception as e:
+            logger.warning(f"无法获取初始内存使用情况: {str(e)}")
+
         # 发送启动通知给管理员
         if admin_chat_id:
             try:
@@ -1345,64 +1477,349 @@ def main():
             asyncio.run(main_async())
         except KeyboardInterrupt:
             logger.info("Bot已停止")
+        except asyncio.CancelledError:
+            logger.info("任务被取消，正在停止...")
         except Exception as e:
             logger.error(f"Bot运行出错: {str(e)}")
             print(f"错误: Bot运行出错: {str(e)}")
+            
+            # 发送错误通知给管理员
+            if admin_chat_id:
+                try:
+                    send_start_notification(admin_chat_id, f"❌ YTBot运行错误: {str(e)}")
+                except Exception:
+                    pass
+        finally:
+            # 清理资源
+            if 'user_states' in globals():
+                user_states.clear()
+                logger.info("用户状态已清理")
     except Exception as e:
         logger.critical(f"Bot初始化失败: {str(e)}")
         print(f"严重错误: Bot初始化失败: {str(e)}")
+        
+        # 发送初始化失败通知给管理员
+        if admin_chat_id:
+            try:
+                send_start_notification(admin_chat_id, f"❌ YTBot初始化失败: {str(e)}")
+            except Exception:
+                pass
 
+
+# 网络连接检查函数
+def check_network_connection(timeout=5):
+    """
+    检查网络连接状态
+    
+    Args:
+        timeout: 连接超时时间（秒）
+    
+    Returns:
+        bool: True表示网络连接正常，False表示网络连接异常
+    """
+    try:
+        # 尝试连接几个常用的外部服务，提高可靠性
+        services = [
+            ('8.8.8.8', 53),  # Google DNS
+            ('1.1.1.1', 53),  # Cloudflare DNS
+            ('9.9.9.9', 53)   # Quad9 DNS
+        ]
+        
+        for host, port in services:
+            try:
+                socket.create_connection((host, port), timeout=timeout)
+                logger.debug(f"网络连接检查成功: {host}:{port}")
+                return True
+            except (socket.timeout, socket.error):
+                continue
+        
+        # 所有服务都连接失败
+        logger.warning("所有网络连接检查点都失败")
+        return False
+    except Exception as e:
+        logger.error(f"执行网络连接检查时出错: {str(e)}")
+        return False
+
+
+# 周期性网络状态检查和恢复协程
+async def network_monitor():
+    """
+    定期检查网络连接状态，如果发现异常则尝试恢复
+    """
+    logger.info("网络监控任务已启动")
+    
+    # 记录连续失败次数
+    failure_count = 0
+    
+    while True:
+        try:
+            # 检查网络连接
+            if check_network_connection():
+                # 连接恢复
+                if failure_count > 0:
+                    logger.info(f"网络连接已恢复，之前失败了 {failure_count} 次")
+                    failure_count = 0
+                    
+                    # 如果设置了管理员聊天ID，发送恢复通知
+                    if ADMIN_CHAT_ID and bot is not None:
+                        try:
+                            await bot.send_message(
+                                chat_id=ADMIN_CHAT_ID,
+                                text="✅ YTBot网络连接已恢复"
+                            )
+                        except Exception as e:
+                            logger.error(f"发送网络恢复通知失败: {str(e)}")
+            else:
+                # 连接失败
+                failure_count += 1
+                logger.warning(f"网络连接检查失败，连续失败 {failure_count} 次")
+                
+                # 如果连续失败超过阈值，发送警告
+                if failure_count >= 3 and ADMIN_CHAT_ID and bot is not None:
+                    try:
+                        await bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=f"⚠️ YTBot网络连接警告：\n连续 {failure_count} 次检查失败\n请检查服务器网络连接"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送网络警告失败: {str(e)}")
+                
+                # 尝试执行一些恢复操作
+                if failure_count >= 5:
+                    logger.info("尝试执行网络恢复操作...")
+                    # 重置DNS缓存（在不同系统上可能需要不同的命令）
+                    try:
+                        if sys.platform.startswith('linux'):
+                            os.system('systemd-resolve --flush-caches')
+                        elif sys.platform.startswith('darwin'):
+                            os.system('dscacheutil -flushcache')
+                        elif sys.platform.startswith('win'):
+                            os.system('ipconfig /flushdns')
+                        logger.info("已尝试刷新DNS缓存")
+                    except Exception as e:
+                        logger.error(f"执行DNS缓存刷新失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"网络监控过程中出错: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        
+        # 每30秒检查一次网络连接
+        await asyncio.sleep(30)
+
+
+# 资源监控协程
+async def resource_monitor():
+    """
+    定期监控系统资源使用情况，清理过期的用户状态
+    防止内存泄漏和资源耗尽
+    """
+    global user_states
+    
+    # 设置内存使用阈值（MB）
+    MEMORY_THRESHOLD = 512  # 512MB
+    # 设置用户状态超时时间（秒）
+    USER_STATE_TIMEOUT = 300  # 5分钟
+    
+    logger.info("资源监控任务已启动")
+    
+    while True:
+        try:
+            # 获取当前进程内存使用情况
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_used_mb = memory_info.rss / 1024 / 1024  # 转换为MB
+            
+            # 记录内存使用情况
+            logger.debug("当前内存使用: %.2f MB", memory_used_mb)
+            
+            # 检查用户状态是否过期
+            current_time = time.time()
+            expired_users = [user_id for user_id, state_info in user_states.items()
+                           if (current_time - state_info.get('timestamp', current_time)) >
+                           USER_STATE_TIMEOUT]
+            
+            # 清理过期用户状态
+            for user_id in expired_users:
+                logger.debug("清理过期用户状态: %s", user_id)
+                del user_states[user_id]
+            
+            # 如果清理后仍有较多过期状态，记录警告
+            if len(expired_users) > 10:
+                logger.warning("清理了 %d 个过期用户状态", len(expired_users))
+            
+            # 检查内存使用是否超过阈值
+            if memory_used_mb > MEMORY_THRESHOLD:
+                logger.warning("内存使用警告: %.2f MB 超过阈值 %d MB", 
+                             memory_used_mb, MEMORY_THRESHOLD)
+                
+                # 执行更激进的清理
+                # 1. 清理所有用户状态
+                if user_states:
+                    logger.info("内存压力大，清理所有 %d 个用户状态", len(user_states))
+                    user_states.clear()
+                
+                # 2. 尝试清理其他缓存（如果有）
+                # 例如: _nextcloud_client_cache 等
+                if '_nextcloud_client_cache' in globals() and globals()['_nextcloud_client_cache'].get('client'):
+                    logger.info("内存压力大，清理Nextcloud客户端缓存")
+                    globals()['_nextcloud_client_cache']['client'] = None
+                    
+                # 3. 发送警告给管理员
+                if ADMIN_CHAT_ID:
+                    try:
+                        await bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=f"⚠️ YTBot内存警告：\n当前内存使用: {memory_used_mb:.2f} MB\n已执行自动清理以释放内存"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送内存警告失败: {str(e)}")
+        
+        except psutil.Error as e:
+            logger.error(f"获取系统资源信息失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"资源监控过程中出错: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        
+        # 每5分钟执行一次监控
+        await asyncio.sleep(300)
+
+
+# 全局标志，用于防止重复执行关闭流程
+_is_shutting_down = False
+
+
+# 优雅关闭处理函数
+def setup_signal_handlers():
+    """
+    设置信号处理，确保程序可以优雅地关闭
+    清理资源并保存状态
+    """
+    global _is_shutting_down
+    
+    def signal_handler(sig, frame):
+        global _is_shutting_down
+        
+        # 防止重复执行关闭流程
+        if _is_shutting_down:
+            logger.warning("关闭流程已在进行中，忽略重复的信号 %s", sig)
+            return
+        
+        _is_shutting_down = True
+        logger.info("收到信号 %s，准备优雅关闭", sig)
+        
+        # 记录关闭前的状态
+        logger.info(
+            "关闭前 - 处理中更新数: %d", 
+            len(globals().get('processing_updates', []))
+        )
+        logger.info(
+            "关闭前 - 活跃用户状态数: %d", 
+            len(globals().get('user_states', {}))
+        )
+        
+        # 发送关闭通知给管理员（如果有）
+        if 'ADMIN_CHAT_ID' in globals() and ADMIN_CHAT_ID and 'bot' in globals() and bot is not None:
+            try:
+                # 简化实现，使用同步方式发送消息
+                # 避免复杂的线程和事件循环操作
+                try:
+                    # 尝试直接发送消息
+                    bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text="🛑 YTBot正在关闭，可能是由于系统重启或更新。\n将在完成当前任务后停止。"
+                    )
+                    logger.info("关闭通知已发送")
+                except Exception as msg_e:
+                    logger.warning("无法发送关闭通知: %s", 
+                             str(msg_e))
+            except Exception as e:
+                logger.error("处理关闭通知时出错: %s", str(e))
+        
+        logger.info("YTBot已开始关闭流程")
+        
+        # 设置全局变量，通知主循环退出
+        if 'should_continue' in globals():
+            globals()['should_continue'] = False
+        
+        # 给当前任务一些时间完成
+        import time
+        time.sleep(1)
+        
+        # 强制退出
+        logger.info("强制退出程序")
+        import sys
+        sys.exit(0)
+    
+    # 设置信号处理
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
+
+
+# 异步版本的启动通知函数
+async def send_start_notification_async(chat_id, message):
+    """使用主事件循环发送启动通知，避免创建独立的事件循环"""
+    try:
+        # 验证chat_id格式
+        chat_id_int = int(chat_id)
+
+        # 使用现有的bot实例（如果已创建），否则创建一个新实例
+        if 'bot' in globals() and bot is not None:
+            notification_bot = bot
+            logger.debug("使用现有的Bot实例发送启动通知")
+        else:
+            # 如果主Bot实例尚未创建，创建一个新的实例
+            notification_bot = create_bot(TELEGRAM_BOT_TOKEN)
+            if not notification_bot:
+                raise Exception("无法创建Bot实例发送通知")
+            logger.debug("创建新的Bot实例发送启动通知")
+
+        bot_info = None
+        try:
+            # 获取Bot信息
+            bot_info = await notification_bot.get_me()
+        except Exception as e:
+            logger.warning("获取Bot信息失败: %s", str(e))
+
+        # 构建通知消息
+        base_message = "🚀 YTBot已成功启动！\n\n"
+        if bot_info:
+            base_message += "🤖 机器人名称: %s\n" % bot_info.first_name
+            base_message += "🔍 用户名: @%s\n" % bot_info.username
+            base_message += "🆔 Bot ID: %s\n\n" % bot_info.id
+        base_message += "📊 系统状态:\n%s\n\n" % message
+        base_message += "💡 提示: 发送YouTube链接开始下载音乐"
+
+        # 发送消息
+        await notification_bot.send_message(
+            chat_id=chat_id_int,
+            text=base_message
+        )
+        logger.info("启动通知已成功发送到用户 %s", chat_id_int)
+    except Exception as e:
+        logger.error("发送启动通知失败: %s", str(e))
+        import traceback
+        logger.debug(traceback.format_exc())
+        raise
+
+# 兼容旧版本的同步函数，用于在同步上下文中调用
 
 def send_start_notification(chat_id, message):
-    """使用独立的线程发送启动通知，完全避免事件循环冲突，增强错误处理和日志记录"""
+    """同步包装函数，在新线程中运行异步通知函数"""
     import threading
     import traceback
-
+    
     def _send_in_thread():
         try:
-            # 验证chat_id格式
-            chat_id_int = int(chat_id)
-
-            # 创建一个全新的Bot实例和事件循环
-            from telegram import Bot
-            thread_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-            # 创建一个单一的事件循环来处理所有异步操作
+            # 创建新的事件循环（在新线程中）
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
-            bot_info = None
             try:
-                # 在同一个事件循环中获取Bot信息
-                bot_info = loop.run_until_complete(thread_bot.get_me())
-            except Exception as e:
-                logger.warning(f"获取Bot信息失败: {str(e)}")
-
-            # 构建通知消息
-            base_message = "🚀 YTBot已成功启动！\n\n"
-            if bot_info:
-                base_message += f"🤖 机器人名称: {bot_info.first_name}\n"
-                base_message += f"🔍 用户名: @{bot_info.username}\n"
-                base_message += f"🆔 Bot ID: {bot_info.id}\n\n"
-            base_message += f"📊 系统状态:\n{message}\n\n"
-            base_message += "💡 提示: 发送YouTube链接开始下载音乐"
-
-            # 在同一个事件循环中发送消息
-            try:
-                loop.run_until_complete(
-                    thread_bot.send_message(
-                        chat_id=chat_id_int,
-                        text=base_message
-                    )
-                )
-            except Exception as e:
-                logger.error(f"发送启动通知消息失败: {str(e)}")
-                # 重新抛出异常以便外部捕获
-                raise
+                # 运行异步通知函数
+                loop.run_until_complete(send_start_notification_async(chat_id, message))
             finally:
-                # 确保事件循环被关闭
+                # 确保关闭事件循环
                 loop.close()
-            logger.info(f"启动通知已成功发送到管理员 {chat_id_int}")
         except ValueError as e:
             logger.error(f"值错误: {str(e)}")
         except Exception as e:
