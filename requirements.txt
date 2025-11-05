@@ -3,3 +3,4 @@ yt-dlp==2025.9.26
 webdavclient3==3.14.6
 requests==2.31.0
 httpx[socks]==0.27.0
+psutil==7.1.1

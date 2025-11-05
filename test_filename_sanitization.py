@@ -41,27 +41,27 @@ def test_sanitize_filename():
             # 验证文件名长度不超过限制
             name, ext = os.path.splitext(result)
             is_valid = len(name) <= 200
-            
+
             # 验证文件名不包含不支持的字符
-            for char in '<>"/\|?*':
+            for char in '<>"/|?*':
                 if char in result:
                     is_valid = False
                     break
-            
+
             # 验证没有连续的下划线
             if '__' in result:
                 is_valid = False
-                
+
             # 验证没有操作系统保留文件名
             name_without_ext = os.path.splitext(os.path.basename(result))[0].upper()
             reserved_names = [
                 'CON', 'PRN', 'AUX', 'NUL',
-                'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 
+                'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
                 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
             ]
             if name_without_ext in reserved_names:
                 is_valid = False
-                
+
             if is_valid:
                 success_count += 1
                 print(f"✅ 通过: '{input_name}' -> '{result}' (动态验证通过)")
@@ -74,13 +74,13 @@ def test_sanitize_filename():
         else:
             fail_count += 1
             print(f"❌ 失败: '{input_name}' -> '{result}' (期望: '{expected_output}')")
-    
+
     # 显示测试结果摘要
     print("\n测试结果摘要:")
     print(f"总测试用例: {len(test_cases)}")
     print(f"通过: {success_count}")
     print(f"失败: {fail_count}")
-    
+
     # 返回测试结果
     return fail_count == 0
 
