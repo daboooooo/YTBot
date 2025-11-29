@@ -109,15 +109,18 @@ async def download_video(url, download_type='audio', progress_callback=None):
             }
         else:
             # 视频下载配置
+            # 优先选择包含音频的mp4格式视频，避免使用ffmpeg转换，提高下载速度
+            video_format = CONFIG['download']['video_format']
+            if video_format == "bestvideo+bestaudio/best":
+                # 修改为优先选择包含音频的mp4格式
+                video_format = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+            
+            # 根据是否使用已经包含音频的mp4格式决定是否需要后处理
+            needs_postprocessing = "bestvideo" in video_format  # 如果包含bestvideo，可能需要合并
+            
             ydl_opts = {
-                'format': CONFIG['download']['video_format'],
+                'format': video_format,
                 'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-                'postprocessors': [
-                    {
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': CONFIG['download']['video_output_format'],  # 将视频转换为配置的格式
-                    }
-                ],
                 'quiet': CONFIG['download']['quiet'],
                 'no_warnings': CONFIG['download']['no_warnings'],
                 'retries': CONFIG['download']['retries'],
@@ -129,6 +132,18 @@ async def download_video(url, download_type='audio', progress_callback=None):
                 },
                 'ignoreerrors': CONFIG['download']['ignore_errors'],
             }
+            
+            # 只在需要时添加后处理配置
+            if needs_postprocessing:
+                ydl_opts['postprocessors'] = [
+                    {
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': CONFIG['download']['video_output_format'],
+                    }
+                ]
+                logger.info("使用视频+音频合并模式，可能需要较长处理时间")
+            else:
+                logger.info("使用包含音频的mp4格式，无需额外转换处理")
 
         # 如果提供了进度回调，设置进度钩子
         progress_queue = None
