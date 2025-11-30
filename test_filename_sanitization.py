@@ -1,6 +1,6 @@
 import os
 import sys
-from main import sanitize_filename
+from downloader import sanitize_filename
 
 # 添加当前目录到Python路径
 sys.path.append('/Users/horsenli/Works/ytbot')

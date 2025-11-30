@@ -11,35 +11,50 @@ from config import CONFIG
 logger = get_logger(__name__)
 
 
-# 全局下载取消标志
-_download_cancelled = False
+class DownloadContext:
+    """
+    下载上下文类，用于管理单个下载任务的状态
+    替代全局变量，支持每个下载任务独立控制
+    """
+    def __init__(self):
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        """取消当前下载任务"""
+        with self._lock:
+            self._cancelled = True
+            logger.info("已设置下载取消标志，当前下载任务将在适当时机停止")
+
+    def reset(self):
+        """重置下载取消标志"""
+        with self._lock:
+            self._cancelled = False
+
+    def is_cancelled(self):
+        """检查当前下载任务是否已取消"""
+        with self._lock:
+            return self._cancelled
 
 
-# 全局下载取消标志的锁
-_download_cancelled_lock = threading.Lock()
+# 全局下载上下文，用于兼容旧的全局取消机制
+_global_download_context = DownloadContext()
 
 
-# 下载控制函数
+# 下载控制函数，兼容旧的全局取消机制
 def cancel_all_downloads():
     """取消所有正在进行的下载"""
-    global _download_cancelled
-    with _download_cancelled_lock:
-        _download_cancelled = True
-        logger.info("已设置下载取消标志，所有下载任务将在适当时机停止")
+    _global_download_context.cancel()
 
 
 def reset_download_cancelled():
     """重置下载取消标志"""
-    global _download_cancelled
-    with _download_cancelled_lock:
-        _download_cancelled = False
+    _global_download_context.reset()
 
 
 def is_download_cancelled():
     """检查是否已取消下载"""
-    global _download_cancelled
-    with _download_cancelled_lock:
-        return _download_cancelled
+    return _global_download_context.is_cancelled()
 
 
 # 验证YouTube链接格式
@@ -138,8 +153,177 @@ def sanitize_filename(filename):
     return sanitized
 
 
+def _setup_download_options(temp_dir, download_type):
+    """
+    设置yt-dlp下载选项
+
+    Args:
+        temp_dir: 临时目录路径
+        download_type: 下载类型，'audio'或'video'
+
+    Returns:
+        dict: 配置好的yt-dlp选项
+    """
+    # 创建基础配置
+    ydl_opts = {
+        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+        'quiet': CONFIG['download']['quiet'],
+        'no_warnings': False,  # 设为False以查看更多警告信息
+        'retries': CONFIG['download']['retries'],
+        'fragment_retries': CONFIG['download']['fragment_retries'],
+        'timeout': CONFIG['download']['timeout'],
+        'socket_timeout': CONFIG['download']['socket_timeout'],
+        'http_headers': CONFIG['download']['http_headers'],
+        'ignoreerrors': CONFIG['download']['ignore_errors'],
+        'ignore_no_formats_error': CONFIG['download'].get('ignore_no_formats_error', True),
+        'allow_playlist_files': CONFIG['download'].get('allow_playlist_files', True),
+        'sleep_interval_requests': CONFIG['download'].get('sleep_interval_requests', 2),
+        'sleep_interval': CONFIG['download'].get('sleep_interval', 5),
+        'max_sleep_interval': CONFIG['download'].get('max_sleep_interval', 30),
+        'prefer_ffmpeg': CONFIG['download'].get('prefer_ffmpeg', True),
+        # 添加格式选择参数，避免SABR streaming格式问题
+        'format': 'bestvideo[ext!=webm][height<=1080]+bestaudio[ext!=webm]/best[ext!=webm]',
+        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
+    }
+
+    # 根据下载类型添加特定配置
+    if download_type == 'audio':
+        # 音频下载配置
+        ydl_opts.update({
+            'format': CONFIG['download']['audio_format'],
+            'postprocessors': [
+                {
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': CONFIG['download']['audio_codec'],
+                    'preferredquality': CONFIG['download']['audio_quality'],
+                }
+            ],
+        })
+    else:
+        # 视频下载配置
+        # 使用配置中的视频格式，默认优化为优先选择mp4格式
+        video_format = CONFIG['download']['video_format']
+
+        ydl_opts.update({
+            'format': video_format,
+            'merge_output_format': CONFIG['download'].get('merge_output_format', 'mp4'),
+        })
+
+        # 添加后处理配置以确保格式正确
+        ydl_opts['postprocessors'] = [
+            {
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': CONFIG['download']['video_output_format'],
+            }
+        ]
+        logger.info("使用视频+音频合并模式，可能需要较长处理时间")
+
+    return ydl_opts
+
+
+async def _process_progress_queue(progress_queue, progress_callback, check_cancel,
+                                  download_context=None):
+    """
+    处理进度队列，向用户报告下载进度
+
+    Args:
+        progress_queue: 进度信息队列
+        progress_callback: 进度回调函数
+        check_cancel: 是否检查取消标志
+        download_context: 下载上下文对象，用于检查取消状态
+    """
+    last_percent = -1  # 用于限制进度更新频率
+    last_status = None  # 用于跟踪状态变化
+
+    # 如果没有提供下载上下文，使用全局上下文
+    if download_context is None:
+        download_context = _global_download_context
+
+    # 辅助函数，检查是否取消下载
+    def _is_cancelled():
+        return download_context.is_cancelled()
+
+    while True:
+        # 检查是否取消下载
+        if check_cancel and _is_cancelled():
+            logger.info("下载已取消，停止进度处理")
+            break
+
+        try:
+            # 非阻塞获取队列中的进度信息
+            d = await asyncio.wait_for(progress_queue.get(), timeout=2.0)
+
+            # 增加进度信息处理的容错性
+            if not isinstance(d, dict):
+                logger.warning(f"process_progress_queue: 无效的进度数据类型: {type(d)}")
+                continue
+
+            # 检查状态是否有效
+            status = d.get('status', '')
+            if not status:
+                continue
+
+            # 只在状态变化或进度显著变化时更新
+            if status == 'downloading':
+                downloaded_bytes = d.get('downloaded_bytes', 0)
+                total_bytes = d.get('total_bytes', d.get('total_bytes_estimate', 1))
+                percent = downloaded_bytes / total_bytes * 100 if total_bytes else 0
+
+                # 根据配置的进度更新频率更新
+                update_interval = CONFIG['download']['progress_update_interval']
+                if (percent - last_percent >= update_interval or percent >= 95):
+                    last_percent = percent
+                    speed = d.get('speed', 0)
+                    eta = d.get('eta', 0)
+
+                    # 格式化速度显示
+                    if speed > 1024 * 1024:
+                        speed_str = f"{speed / 1024 / 1024:.2f} MB/s"
+                    elif speed > 1024:
+                        speed_str = f"{speed / 1024:.2f} KB/s"
+                    else:
+                        speed_str = f"{speed:.2f} B/s"
+
+                    # 格式化剩余时间显示
+                    if eta > 3600:
+                        eta_str = f"{eta / 3600:.1f} 小时"
+                    elif eta > 60:
+                        eta_str = f"{eta / 60:.1f} 分钟"
+                    else:
+                        eta_str = f"{eta} 秒"
+
+                    progress_info = {
+                        'status': 'downloading',
+                        'percent': percent,
+                        'speed': speed_str,
+                        'eta': eta_str
+                    }
+                    # 调用进度回调
+                    try:
+                        await progress_callback(progress_info)
+                    except Exception as e:
+                        logger.error(f"进度回调执行失败: {str(e)}")
+
+            elif status == 'finished' and status != last_status:
+                last_status = status
+                progress_info = {'status': 'finished'}
+                try:
+                    await progress_callback(progress_info)
+                except Exception as e:
+                    logger.error(f"进度回调执行失败: {str(e)}")
+
+            progress_queue.task_done()
+        except asyncio.TimeoutError:
+            # 超时说明队列为空，继续检查
+            continue
+        except Exception as e:
+            logger.error(f"处理进度队列时出错: {str(e)}")
+            # 出错时继续，不影响主流程
+            continue
+
+
 async def download_video(url, download_type='audio', progress_callback=None,
-                         video_info=None, check_cancel=False):
+                         video_info=None, check_cancel=False, download_context=None):
     """
     下载YouTube视频并转换为指定格式
     修复了上传失败后重复下载的问题，返回本地文件路径以便后续上传
@@ -150,6 +334,7 @@ async def download_video(url, download_type='audio', progress_callback=None,
         progress_callback: 可选的进度回调函数
         video_info: 可选的已提取的视频信息，如果提供则避免重复提取
         check_cancel: 是否检查取消标志
+        download_context: 可选的下载上下文对象，用于管理下载状态
 
     Returns:
         tuple: (文件路径, 视频信息)
@@ -157,6 +342,13 @@ async def download_video(url, download_type='audio', progress_callback=None,
     Raises:
         Exception: 如果下载过程中发生错误
     """
+    # 如果没有提供下载上下文，使用全局上下文
+    if download_context is None:
+        download_context = _global_download_context
+
+    # 辅助函数，检查是否取消下载
+    def _is_cancelled():
+        return download_context.is_cancelled()
     temp_dir = None
 
     try:
@@ -165,7 +357,7 @@ async def download_video(url, download_type='audio', progress_callback=None,
             raise ValueError("无效的YouTube链接")
 
         # 检查是否取消下载
-        if check_cancel and is_download_cancelled():
+        if check_cancel and _is_cancelled():
             logger.info(f"下载已取消，停止下载视频: {url}")
             if progress_callback:
                 await progress_callback({'status': 'cancelled', 'error': '下载已取消'})
@@ -179,59 +371,8 @@ async def download_video(url, download_type='audio', progress_callback=None,
         temp_dir = tempfile.mkdtemp()
         logger.info(f"创建临时目录: {temp_dir}")
 
-        # 创建基础配置
-        ydl_opts = {
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'quiet': CONFIG['download']['quiet'],
-            'no_warnings': False,  # 设为False以查看更多警告信息
-            'retries': CONFIG['download']['retries'],
-            'fragment_retries': CONFIG['download']['fragment_retries'],
-            'timeout': CONFIG['download']['timeout'],
-            'socket_timeout': CONFIG['download']['socket_timeout'],
-            'http_headers': CONFIG['download']['http_headers'],
-            'ignoreerrors': CONFIG['download']['ignore_errors'],
-            'ignore_no_formats_error': CONFIG['download'].get('ignore_no_formats_error', True),
-            'allow_playlist_files': CONFIG['download'].get('allow_playlist_files', True),
-            'sleep_interval_requests': CONFIG['download'].get('sleep_interval_requests', 2),
-            'sleep_interval': CONFIG['download'].get('sleep_interval', 5),
-            'max_sleep_interval': CONFIG['download'].get('max_sleep_interval', 30),
-            'prefer_ffmpeg': CONFIG['download'].get('prefer_ffmpeg', True),
-            # 添加格式选择参数，避免SABR streaming格式问题
-            'format': 'bestvideo[ext!=webm][height<=1080]+bestaudio[ext!=webm]/best[ext!=webm]',
-            'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
-        }
-
-        # 根据下载类型添加特定配置
-        if download_type == 'audio':
-            # 音频下载配置
-            ydl_opts.update({
-                'format': CONFIG['download']['audio_format'],
-                'postprocessors': [
-                    {
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': CONFIG['download']['audio_codec'],
-                        'preferredquality': CONFIG['download']['audio_quality'],
-                    }
-                ],
-            })
-        else:
-            # 视频下载配置
-            # 使用配置中的视频格式，默认优化为优先选择mp4格式
-            video_format = CONFIG['download']['video_format']
-
-            ydl_opts.update({
-                'format': video_format,
-                'merge_output_format': CONFIG['download'].get('merge_output_format', 'mp4'),
-            })
-
-            # 添加后处理配置以确保格式正确
-            ydl_opts['postprocessors'] = [
-                {
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': CONFIG['download']['video_output_format'],
-                }
-            ]
-            logger.info("使用视频+音频合并模式，可能需要较长处理时间")
+        # 设置下载选项
+        ydl_opts = _setup_download_options(temp_dir, download_type)
 
         # 如果提供了进度回调，设置进度钩子
         progress_queue = None
@@ -241,170 +382,103 @@ async def download_video(url, download_type='audio', progress_callback=None,
                 lambda d: progress_queue.put_nowait(d)
             ]
 
-        # 定义一个处理进度队列的协程
-        async def process_progress_queue():
-            last_percent = -1  # 用于限制进度更新频率
-            last_status = None  # 用于跟踪状态变化
-
-            while True:
-                # 检查是否取消下载
-                if check_cancel and is_download_cancelled():
-                    logger.info("下载已取消，停止进度处理")
-                    break
-
-                try:
-                    # 非阻塞获取队列中的进度信息
-                    d = await asyncio.wait_for(progress_queue.get(), timeout=2.0)
-
-                    # 增加进度信息处理的容错性
-                    if not isinstance(d, dict):
-                        logger.warning(f"process_progress_queue: 无效的进度数据类型: {type(d)}")
-                        continue
-
-                    # 检查状态是否有效
-                    status = d.get('status', '')
-                    if not status:
-                        continue
-
-                    # 只在状态变化或进度显著变化时更新
-                    if status == 'downloading':
-                        downloaded_bytes = d.get('downloaded_bytes', 0)
-                        total_bytes = d.get('total_bytes', d.get('total_bytes_estimate', 1))
-                        percent = downloaded_bytes / total_bytes * 100 if total_bytes else 0
-
-                        # 根据配置的进度更新频率更新
-                        update_interval = CONFIG['download']['progress_update_interval']
-                        if (percent - last_percent >= update_interval or percent >= 95):
-                            last_percent = percent
-                            speed = d.get('speed', 0)
-                            eta = d.get('eta', 0)
-
-                            # 格式化速度显示
-                            if speed > 1024 * 1024:
-                                speed_str = f"{speed / 1024 / 1024:.2f} MB/s"
-                            elif speed > 1024:
-                                speed_str = f"{speed / 1024:.2f} KB/s"
-                            else:
-                                speed_str = f"{speed:.2f} B/s"
-
-                            # 格式化剩余时间显示
-                            if eta > 3600:
-                                eta_str = f"{eta / 3600:.1f} 小时"
-                            elif eta > 60:
-                                eta_str = f"{eta / 60:.1f} 分钟"
-                            else:
-                                eta_str = f"{eta} 秒"
-
-                            progress_info = {
-                                'status': 'downloading',
-                                'percent': percent,
-                                'speed': speed_str,
-                                'eta': eta_str
-                            }
-                            # 调用进度回调
-                            try:
-                                await progress_callback(progress_info)
-                            except Exception as e:
-                                logger.error(f"进度回调执行失败: {str(e)}")
-
-                    elif status == 'finished' and status != last_status:
-                        last_status = status
-                        progress_info = {'status': 'finished'}
-                        try:
-                            await progress_callback(progress_info)
-                        except Exception as e:
-                            logger.error(f"进度回调执行失败: {str(e)}")
-
-                    progress_queue.task_done()
-                except asyncio.TimeoutError:
-                    # 超时说明队列为空，继续检查
-                    continue
-                except Exception as e:
-                    logger.error(f"处理进度队列时出错: {str(e)}")
-                    # 出错时继续，不影响主流程
-                    continue
-
         # 启动进度处理任务
-        progress_task = asyncio.create_task(process_progress_queue()) if progress_queue else None
+        progress_task = (
+            asyncio.create_task(_process_progress_queue(progress_queue, progress_callback,
+                                                        check_cancel, download_context))
+            if progress_queue else None
+        )
+
+        def _sync_download():
+            """
+            同步下载视频，包含取消检查和错误处理
+
+            Returns:
+                tuple: (文件路径, 视频信息)
+            """
+            try:
+                # 添加取消检查钩子
+                def cancel_check_hook(d):
+                    # 检查取消标志
+                    if _is_cancelled():
+                        logger.info("检测到取消标志，停止下载")
+                        # 引发异常来停止下载
+                        raise yt_dlp.utils.DownloadError("下载已取消")
+
+                # 保存原始的progress_hooks
+                original_hooks = ydl_opts.get('progress_hooks', [])
+                # 添加取消检查钩子
+                ydl_opts['progress_hooks'] = original_hooks + [cancel_check_hook]
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # 如果已经提供了视频信息，直接使用，避免重复提取
+                    if video_info:
+                        info = video_info
+                        logger.info(f"使用已提供的视频信息: {info.get('title', 'unknown')}")
+                        # 直接下载视频
+                        info = ydl.extract_info(url, download=True)
+                        logger.info(f"视频下载完成: {info.get('title', 'unknown')}")
+                    else:
+                        # 首先尝试提取信息而不下载，检查视频是否可访问
+                        info = ydl.extract_info(url, download=False)
+                        logger.info(f"成功获取视频信息: {info.get('title', 'unknown')}")
+
+                        # 然后下载视频
+                        info = ydl.extract_info(url, download=True)
+                        logger.info(f"视频下载完成: {info.get('title', 'unknown')}")
+                        # 返回文件路径和视频信息
+                        if 'entries' in info:
+                            # 处理播放列表（通常不应该到达这里，但为了健壮性保留）
+                            files = []
+                            for entry in info['entries']:
+                                if entry:
+                                    files.append(ydl.prepare_filename(entry))
+                            file_path = files[0] if files else None
+                        else:
+                            # 单个视频
+                            file_path = ydl.prepare_filename(info)
+                        return file_path, info
+            except yt_dlp.utils.DownloadError as de:
+                error_msg = f"下载错误: {str(de)}"
+                logger.error(f"[下载错误] URL: {url}, 错误详情: {str(de)}")
+                # 检查是否是因为取消而失败
+                if '下载已取消' in str(de):
+                    raise Exception("下载已取消")
+                # 根据错误类型提供更具体的提示
+                error_lower = str(de).lower()
+                if 'unavailable' in error_lower or 'not found' in error_lower:
+                    raise Exception("视频不可用或已被删除")
+                elif 'age' in error_lower:
+                    raise Exception("视频受年龄限制，无法下载")
+                elif 'copyright' in error_lower:
+                    raise Exception("视频受版权保护，无法下载")
+                elif 'format' in error_lower or 'no formats' in error_lower:
+                    raise Exception("无法找到可用的视频格式，请尝试不同的视频")
+                elif 'network' in error_lower or 'connection' in error_lower:
+                    raise Exception("网络连接错误，请检查您的网络设置")
+                elif 'sabr' in error_lower:
+                    raise Exception("视频使用了不支持的SABR流媒体格式，请尝试其他视频")
+                else:
+                    raise Exception(f"下载失败: {error_msg}")
+            except yt_dlp.utils.ExtractorError as ee:
+                error_msg = f"解析视频信息时出错: {str(ee)}"
+                logger.error(f"[解析错误] URL: {url}, 错误详情: {str(ee)}")
+                if 'invalid url' in str(ee).lower():
+                    raise Exception("无效的视频链接格式，请检查链接是否正确")
+                else:
+                    raise Exception("无法解析视频链接，请检查链接是否正确")
+            except Exception as e:
+                logger.error(f"[未知错误] URL: {url}, 错误类型: {type(e).__name__}, 详情: {str(e)}")
+                raise Exception(f"下载过程中发生未知错误: {str(e)}")
 
         # 在单独的线程中执行下载和转换操作
         async def download_in_thread():
-            def _sync_download():
-                try:
-                    # 添加取消检查钩子
-                    def cancel_check_hook(d):
-                        # 检查取消标志
-                        if is_download_cancelled():
-                            logger.info("检测到取消标志，停止下载")
-                            # 引发异常来停止下载
-                            raise yt_dlp.utils.DownloadError("下载已取消")
+            """
+            在单独的线程中执行下载操作，添加超时控制
 
-                    # 保存原始的progress_hooks
-                    original_hooks = ydl_opts.get('progress_hooks', [])
-                    # 添加取消检查钩子
-                    ydl_opts['progress_hooks'] = original_hooks + [cancel_check_hook]
-
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        # 如果已经提供了视频信息，直接使用，避免重复提取
-                        if video_info:
-                            info = video_info
-                            logger.info(f"使用已提供的视频信息: {info.get('title', 'unknown')}")
-                            # 直接下载视频
-                            info = ydl.extract_info(url, download=True)
-                            logger.info(f"视频下载完成: {info.get('title', 'unknown')}")
-                        else:
-                            # 首先尝试提取信息而不下载，检查视频是否可访问
-                            info = ydl.extract_info(url, download=False)
-                            logger.info(f"成功获取视频信息: {info.get('title', 'unknown')}")
-
-                            # 然后下载视频
-                            info = ydl.extract_info(url, download=True)
-                            logger.info(f"视频下载完成: {info.get('title', 'unknown')}")
-                            # 返回文件路径和视频信息
-                            if 'entries' in info:
-                                # 处理播放列表（通常不应该到达这里，但为了健壮性保留）
-                                files = []
-                                for entry in info['entries']:
-                                    if entry:
-                                        files.append(ydl.prepare_filename(entry))
-                                file_path = files[0] if files else None
-                            else:
-                                # 单个视频
-                                file_path = ydl.prepare_filename(info)
-                            return file_path, info
-                except yt_dlp.utils.DownloadError as de:
-                    error_msg = f"下载错误: {str(de)}"
-                    logger.error(f"[下载错误] URL: {url}, 错误详情: {str(de)}")
-                    # 检查是否是因为取消而失败
-                    if '下载已取消' in str(de):
-                        raise Exception("下载已取消")
-                    # 根据错误类型提供更具体的提示
-                    error_lower = str(de).lower()
-                    if 'unavailable' in error_lower or 'not found' in error_lower:
-                        raise Exception("视频不可用或已被删除")
-                    elif 'age' in error_lower:
-                        raise Exception("视频受年龄限制，无法下载")
-                    elif 'copyright' in error_lower:
-                        raise Exception("视频受版权保护，无法下载")
-                    elif 'format' in error_lower or 'no formats' in error_lower:
-                        raise Exception("无法找到可用的视频格式，请尝试不同的视频")
-                    elif 'network' in error_lower or 'connection' in error_lower:
-                        raise Exception("网络连接错误，请检查您的网络设置")
-                    elif 'sabr' in error_lower:
-                        raise Exception("视频使用了不支持的SABR流媒体格式，请尝试其他视频")
-                    else:
-                        raise Exception(f"下载失败: {error_msg}")
-                except yt_dlp.utils.ExtractorError as ee:
-                    error_msg = f"解析视频信息时出错: {str(ee)}"
-                    logger.error(f"[解析错误] URL: {url}, 错误详情: {str(ee)}")
-                    if 'invalid url' in str(ee).lower():
-                        raise Exception("无效的视频链接格式，请检查链接是否正确")
-                    else:
-                        raise Exception("无法解析视频链接，请检查链接是否正确")
-                except Exception as e:
-                    logger.error(f"[未知错误] URL: {url}, 错误类型: {type(e).__name__}, 详情: {str(e)}")
-                    raise Exception(f"下载过程中发生未知错误: {str(e)}")
-
+            Returns:
+                tuple: (文件路径, 视频信息)
+            """
             # 使用to_thread在线程中执行同步下载操作
             # 添加超时控制
             try:
@@ -415,11 +489,95 @@ async def download_video(url, download_type='audio', progress_callback=None,
             except asyncio.TimeoutError:
                 raise Exception(f"下载超时，已超过配置的{CONFIG['download']['timeout']}秒限制")
 
+        def _find_target_files(temp_dir, download_type):
+            """
+            根据下载类型查找对应的目标文件
+
+            Args:
+                temp_dir: 临时目录路径
+                download_type: 下载类型，'audio'或'video'
+
+            Returns:
+                list: 找到的目标文件路径列表
+            """
+            target_files = []
+            try:
+                if download_type == 'audio':
+                    # 查找MP3文件
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith('.mp3'):
+                                target_files.append(os.path.join(root, file))
+
+                    # 如果没找到MP3，尝试查找其他音频文件
+                    if not target_files:
+                        for root, _, files in os.walk(temp_dir):
+                            for file in files:
+                                if file.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg')):
+                                    target_files.append(os.path.join(root, file))
+                else:
+                    # 查找视频文件
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith('.mp4'):
+                                target_files.append(os.path.join(root, file))
+
+                    # 如果没找到MP4，尝试查找其他视频文件
+                    if not target_files:
+                        for root, _, files in os.walk(temp_dir):
+                            for file in files:
+                                if file.lower().endswith(('.mp4', '.mkv', '.webm')):
+                                    target_files.append(os.path.join(root, file))
+            except Exception as e:
+                logger.error(f"列出临时目录文件时出错: {str(e)}")
+                raise Exception(f"访问临时文件失败: {str(e)}")
+
+            return target_files
+
+        def _sanitize_target_file(target_file, temp_dir):
+            """
+            对目标文件进行规范化处理，确保文件名符合要求
+
+            Args:
+                target_file: 原始文件路径
+                temp_dir: 临时目录路径
+
+            Returns:
+                str: 规范化后的文件路径
+            """
+            # 对文件名进行规范化处理，确保符合Nextcloud要求
+            original_filename = os.path.basename(target_file)
+            sanitized_filename = sanitize_filename(original_filename)
+
+            # 如果文件名发生了变化，重命名文件
+            if original_filename != sanitized_filename:
+                sanitized_file_path = os.path.join(temp_dir, sanitized_filename)
+                try:
+                    os.rename(target_file, sanitized_file_path)
+                    target_file = sanitized_file_path
+                    logger.info(f"文件名已规范化: {original_filename} -> {sanitized_filename}")
+                except Exception as e:
+                    logger.warning(f"重命名文件失败: {str(e)}")
+                    # 即使重命名失败，也继续使用原文件
+                    # 尝试创建一个新的副本，而不是重命名
+                    try:
+                        import shutil
+                        shutil.copy2(target_file, sanitized_file_path)
+                        target_file = sanitized_file_path
+                        logger.info(f"文件已复制并重命名: {original_filename} -> {sanitized_filename}")
+                    except Exception as copy_err:
+                        logger.warning(f"复制文件失败: {str(copy_err)}")
+                        # 继续使用原文件
+            else:
+                logger.info(f"文件名符合要求: {sanitized_filename}")
+
+            return target_file
+
         # 执行下载并获取结果
         result = await download_in_thread()
 
         # 检查是否取消下载
-        if check_cancel and is_download_cancelled():
+        if check_cancel and _is_cancelled():
             logger.info("下载已取消，处理结果")
             if progress_callback:
                 await progress_callback({'status': 'cancelled', 'error': '下载已取消'})
@@ -448,37 +606,7 @@ async def download_video(url, download_type='audio', progress_callback=None,
             info = result
 
         # 根据下载类型查找对应的文件
-        target_files = []
-        try:
-            if download_type == 'audio':
-                # 查找MP3文件
-                for root, _, files in os.walk(temp_dir):
-                    for file in files:
-                        if file.lower().endswith('.mp3'):
-                            target_files.append(os.path.join(root, file))
-
-                # 如果没找到MP3，尝试查找其他音频文件
-                if not target_files:
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            if file.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg')):
-                                target_files.append(os.path.join(root, file))
-            else:
-                # 查找视频文件
-                for root, _, files in os.walk(temp_dir):
-                    for file in files:
-                        if file.lower().endswith('.mp4'):
-                            target_files.append(os.path.join(root, file))
-
-                # 如果没找到MP4，尝试查找其他视频文件
-                if not target_files:
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            if file.lower().endswith(('.mp4', '.mkv', '.webm')):
-                                target_files.append(os.path.join(root, file))
-        except Exception as e:
-            logger.error(f"列出临时目录文件时出错: {str(e)}")
-            raise Exception(f"访问临时文件失败: {str(e)}")
+        target_files = _find_target_files(temp_dir, download_type)
 
         if not target_files:
             if download_type == 'audio':
@@ -489,31 +617,8 @@ async def download_video(url, download_type='audio', progress_callback=None,
         # 选择第一个找到的文件
         target_file = target_files[0]
 
-        # 对文件名进行规范化处理，确保符合Nextcloud要求
-        original_filename = os.path.basename(target_file)
-        sanitized_filename = sanitize_filename(original_filename)
-
-        # 如果文件名发生了变化，重命名文件
-        if original_filename != sanitized_filename:
-            sanitized_file_path = os.path.join(temp_dir, sanitized_filename)
-            try:
-                os.rename(target_file, sanitized_file_path)
-                target_file = sanitized_file_path
-                logger.info(f"文件名已规范化: {original_filename} -> {sanitized_filename}")
-            except Exception as e:
-                logger.warning(f"重命名文件失败: {str(e)}")
-                # 即使重命名失败，也继续使用原文件
-                # 尝试创建一个新的副本，而不是重命名
-                try:
-                    import shutil
-                    shutil.copy2(target_file, sanitized_file_path)
-                    target_file = sanitized_file_path
-                    logger.info(f"文件已复制并重命名: {original_filename} -> {sanitized_filename}")
-                except Exception as copy_err:
-                    logger.warning(f"复制文件失败: {str(copy_err)}")
-                    # 继续使用原文件
-        else:
-            logger.info(f"文件名符合要求: {sanitized_filename}")
+        # 对文件名进行规范化处理
+        target_file = _sanitize_target_file(target_file, temp_dir)
 
         # 返回文件路径和视频信息，使用字典格式以便调用方通过.get()方法访问
         return {'file_path': target_file, 'info': info, 'cancelled': False}
@@ -544,7 +649,10 @@ async def download_playlist(url, download_type='audio', progress_callback=None,
     Returns:
         dict: 包含播放列表信息和视频下载结果的字典
     """
-    # 重置取消标志
+    # 创建播放列表专用的下载上下文
+    playlist_download_context = DownloadContext()
+
+    # 重置全局取消标志（兼容旧代码）
     reset_download_cancelled()
 
     if not is_youtube_playlist(url):
@@ -596,7 +704,7 @@ async def download_playlist(url, download_type='audio', progress_callback=None,
                 raise Exception(f"获取播放列表信息失败: {error_message}")
 
         # 检查是否取消下载
-        if is_download_cancelled():
+        if playlist_download_context.is_cancelled():
             logger.info("下载已取消，退出下载播放列表")
             if progress_callback:
                 await progress_callback({'status': 'cancelled', 'error': '下载已取消'})
@@ -626,7 +734,7 @@ async def download_playlist(url, download_type='audio', progress_callback=None,
         # 逐个下载视频
         for index, entry in enumerate(entries[:actual_max_videos]):
             # 检查是否取消下载
-            if is_download_cancelled():
+            if playlist_download_context.is_cancelled():
                 logger.info(f"下载已取消，停止在视频 {index + 1}/{actual_max_videos}")
                 if progress_callback:
                     await progress_callback({'status': 'cancelled', 'error': '下载已取消'})
@@ -655,7 +763,7 @@ async def download_playlist(url, download_type='audio', progress_callback=None,
 
             while retry_count <= max_retries and not success:
                 # 检查是否取消下载
-                if is_download_cancelled():
+                if playlist_download_context.is_cancelled():
                     logger.info(f"下载已取消，停止在视频 {index + 1}/{actual_max_videos}")
                     if progress_callback:
                         await progress_callback({
@@ -677,17 +785,18 @@ async def download_playlist(url, download_type='audio', progress_callback=None,
                             wrapped_info['retry_count'] = retry_count
                         return progress_callback(wrapped_info)
 
-                    # 下载单个视频，传入已提取的视频信息避免重复提取
+                    # 下载单个视频，传入已提取的视频信息避免重复提取和播放列表专用的下载上下文
                     result = await download_video(
                         video_url,
                         download_type=download_type,
                         progress_callback=video_progress_wrapper if progress_callback else None,
                         video_info=entry,  # 将从播放列表中提取的视频信息直接传入
-                        check_cancel=True  # 添加取消检查标志
+                        check_cancel=True,  # 添加取消检查标志
+                        download_context=playlist_download_context  # 传入播放列表专用的下载上下文
                     )
 
                     # 检查是否取消下载
-                    if is_download_cancelled():
+                    if playlist_download_context.is_cancelled():
                         logger.info(f"下载已取消，处理视频 {index + 1}/{actual_max_videos}")
                         if progress_callback:
                             await progress_callback({

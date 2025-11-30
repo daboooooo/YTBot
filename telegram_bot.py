@@ -451,11 +451,11 @@ class TelegramHandler:
                                 pass
                 elif progress_info['status'] == 'finished':
                     await self.bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=progress_message.message_id,
-                                    text=f"✅ 下载完成！正在准备上传到Nextcloud...\n\n"
-                                    f"🔗 链接: {video_url}"
-                                )
+                        chat_id=chat_id,
+                        message_id=progress_message.message_id,
+                        text=f"✅ 下载完成！正在准备上传到Nextcloud...\n\n"
+                        f"🔗 链接: {video_url}"
+                    )
             except Exception as e:
                 logger.error(f"处理进度回调时出错: {str(e)}")
 
@@ -489,12 +489,12 @@ class TelegramHandler:
 
             # 更新进度消息
             await self.bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=progress_message.message_id,
-                                    text=f"📤 正在上传到Nextcloud...\n\n"
-                                    f"📁 文件: {file_name}\n"
-                                    f"📊 大小: {format_file_size(file_size)}"
-                                )
+                chat_id=chat_id,
+                message_id=progress_message.message_id,
+                text=f"📤 正在上传到Nextcloud...\n\n"
+                f"📁 文件: {file_name}\n"
+                f"📊 大小: {format_file_size(file_size)}"
+            )
 
             # 构建Nextcloud上传路径
             remote_dir = CONFIG['nextcloud']['upload_dir']
@@ -515,13 +515,13 @@ class TelegramHandler:
 
             # 更新进度消息为完成状态
             await self.bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=progress_message.message_id,
-                                    text=f"✅ 下载和上传完成！\n\n"
-                                    f"📁 文件: {file_name}\n"
-                                    f"📊 大小: {format_file_size(file_size)}\n"
-                                    f"🔗 访问链接: {file_url}"
-                                )
+                chat_id=chat_id,
+                message_id=progress_message.message_id,
+                text=f"✅ 下载和上传完成！\n\n"
+                f"📁 文件: {file_name}\n"
+                f"📊 大小: {format_file_size(file_size)}\n"
+                f"🔗 访问链接: {file_url}"
+            )
 
             logger.info(f"成功为用户 {user_id} 下载并上传文件: {file_name}")
 
@@ -674,9 +674,9 @@ class TelegramHandler:
             finally:
                 try:
                     # 确保正确关闭应用
-                    if (self.application and
-                            hasattr(self.application, 'is_running') and
-                            self.application.is_running):
+                    if (self.application and (
+                            hasattr(self.application, 'is_running') and (
+                            self.application.is_running))):
                         logger.info("停止轮询并关闭应用...")
                         # 先停止updater（如果存在）
                         if hasattr(self.application, 'updater') and self.application.updater:

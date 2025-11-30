@@ -44,8 +44,9 @@ def get_nextcloud_client():
     current_time = time.time()
 
     # 检查缓存是否有效
-    if (_nextcloud_client_cache['client'] is not None and
-            (current_time - _nextcloud_client_cache['timestamp']) < _nextcloud_client_cache['ttl']):
+    if ((_nextcloud_client_cache['client'] is not None) and (
+            (current_time - _nextcloud_client_cache['timestamp']) < (
+                _nextcloud_client_cache['ttl']))):
         logger.debug("使用缓存的Nextcloud客户端")
         return _nextcloud_client_cache['client']
 

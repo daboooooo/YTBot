@@ -277,7 +277,8 @@ class TelegramHandler:
         max_message_length = CONFIG['TELEGRAM_MAX_MESSAGE_LENGTH']
         if len(text) > max_message_length:
             # 消息过长，分段发送
-            chunks = [text[i:i+max_message_length] for i in range(0, len(text), max_message_length)]
+            chunks = [text[i:i + max_message_length] for i in range(0, len(text),
+                                                                    max_message_length)]
             for chunk in chunks:
                 await self.application.bot.send_message(chat_id, chunk, **kwargs)
                 await asyncio.sleep(CONFIG['TELEGRAM_MESSAGE_DELAY'])  # 避免发送过快
@@ -358,9 +359,9 @@ class TelegramHandler:
                                     break
                                 except Exception as e:
                                     logger.warning(
-                                            f"编辑完成消息失败 (尝试 {edit_attempt + 1}/"
-                                            f"{CONFIG['TELEGRAM_EDIT_MESSAGE_RETRIES']}): {str(e)}"
-                                        )
+                                        f"编辑完成消息失败 (尝试 {edit_attempt + 1}/"
+                                        f"{CONFIG['TELEGRAM_EDIT_MESSAGE_RETRIES']}): {str(e)}"
+                                    )
                                     await asyncio.sleep(0.5)
 
                             if not edit_success:
@@ -408,9 +409,9 @@ class TelegramHandler:
                         break
                     except Exception as e:
                         logger.warning(
-                                            f"编辑文件信息失败 (尝试 {edit_attempt + 1}/"
-                                            f"{CONFIG['TELEGRAM_EDIT_MESSAGE_RETRIES']}): {str(e)}"
-                                        )
+                            f"编辑文件信息失败 (尝试 {edit_attempt + 1}/"
+                            f"{CONFIG['TELEGRAM_EDIT_MESSAGE_RETRIES']}): {str(e)}"
+                        )
                         await asyncio.sleep(0.5)
 
                 if not edit_success:

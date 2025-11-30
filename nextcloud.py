@@ -35,18 +35,17 @@ def get_nextcloud_client(nextcloud_url=None, nextcloud_username=None, nextcloud_
     """
     # 如果没有提供参数，从配置中获取
     if nextcloud_url is None:
-        nextcloud_url = CONFIG['NEXTCLOUD_URL']
+        nextcloud_url = CONFIG['nextcloud']['url']
     if nextcloud_username is None:
-        nextcloud_username = CONFIG['NEXTCLOUD_USERNAME']
+        nextcloud_username = CONFIG['nextcloud']['username']
     if nextcloud_password is None:
-        nextcloud_password = CONFIG['NEXTCLOUD_PASSWORD']
-    global _nextcloud_client_cache
+        nextcloud_password = CONFIG['nextcloud']['password']
     current_time = time.time()
 
     # 检查缓存是否有效
-    cache_valid = (_nextcloud_client_cache['client'] and
-                   (current_time - _nextcloud_client_cache['last_initialized']) <
-                   _nextcloud_client_cache['cache_ttl'])
+    cache_valid = (_nextcloud_client_cache['client'] and (
+                   (current_time - _nextcloud_client_cache['last_initialized']) < (
+                       _nextcloud_client_cache['cache_ttl'])))
     if cache_valid:
         try:
             # 验证缓存的客户端是否仍然有效
@@ -70,8 +69,8 @@ def get_nextcloud_client(nextcloud_url=None, nextcloud_username=None, nextcloud_
     except Exception as e:
         raise ValueError(f"Nextcloud URL格式无效: {str(e)}")
 
-    max_retries = CONFIG['NEXTCLOUD_CONNECTION_RETRIES']
-    retry_delay = CONFIG['NEXTCLOUD_CONNECTION_RETRY_DELAY']  # 初始重试延迟
+    max_retries = CONFIG['nextcloud']['connection_retries']
+    retry_delay = CONFIG['nextcloud']['connection_retry_delay']  # 初始重试延迟
 
     for attempt in range(max_retries):
         try:
@@ -79,13 +78,13 @@ def get_nextcloud_client(nextcloud_url=None, nextcloud_username=None, nextcloud_
                 'webdav_hostname': f'{nextcloud_url}/remote.php/dav/files/{nextcloud_username}/',
                 'webdav_login': nextcloud_username,
                 'webdav_password': nextcloud_password,
-                'webdav_timeout': CONFIG['NEXTCLOUD_TIMEOUT'],  # 从配置中获取超时设置
+                'webdav_timeout': CONFIG['nextcloud']['timeout'],  # 从配置中获取超时设置
                 'webdav_verbose': False  # 禁用详细日志
             }
 
             # 设置分块大小
-            if CONFIG['NEXTCLOUD_CHUNK_SIZE'] > 0:
-                options['chunk_size'] = CONFIG['NEXTCLOUD_CHUNK_SIZE']
+            if CONFIG['nextcloud']['chunk_size'] > 0:
+                options['chunk_size'] = CONFIG['nextcloud']['chunk_size']
 
             # 添加更多健壮的选项
             client = Client(options)
@@ -171,14 +170,14 @@ def check_nextcloud_connection(nextcloud_url=None, nextcloud_username=None,
     """
     # 如果没有提供参数，从配置中获取
     if nextcloud_url is None:
-        nextcloud_url = CONFIG['NEXTCLOUD_URL']
+        nextcloud_url = CONFIG['nextcloud']['url']
     if nextcloud_username is None:
-        nextcloud_username = CONFIG['NEXTCLOUD_USERNAME']
+        nextcloud_username = CONFIG['nextcloud']['username']
     if nextcloud_password is None:
-        nextcloud_password = CONFIG['NEXTCLOUD_PASSWORD']
+        nextcloud_password = CONFIG['nextcloud']['password']
     if nextcloud_upload_dir is None:
-        nextcloud_upload_dir = CONFIG['NEXTCLOUD_UPLOAD_DIR']
-    max_retries = CONFIG['NEXTCLOUD_CONNECTION_RETRIES']
+        nextcloud_upload_dir = CONFIG['nextcloud']['upload_dir']
+    max_retries = CONFIG['nextcloud']['connection_retries']
     for attempt in range(max_retries):
         try:
             # 创建Nextcloud客户端
@@ -285,7 +284,7 @@ def check_nextcloud_connection(nextcloud_url=None, nextcloud_username=None,
 
         # 如果不是最后一次尝试，等待一段时间后重试
         if attempt < max_retries - 1:
-            wait_time = CONFIG['NEXTCLOUD_CONNECTION_RETRY_DELAY'] * (2 ** attempt)  # 指数退避策略
+            wait_time = CONFIG['nextcloud']['connection_retry_delay'] * (2 ** attempt)  # 指数退避策略
             logger.info(f"第 {attempt + 1} 次尝试失败，{wait_time} 秒后重试...")
             time.sleep(wait_time)
 
@@ -313,10 +312,10 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
 
     # 如果没有提供重试次数，从配置中获取
     if max_retries is None:
-        max_retries = CONFIG['NEXTCLOUD_UPLOAD_RETRIES']
+        max_retries = CONFIG['nextcloud']['upload_retries']
 
     upload_success = False
-    
+
     # 第一次使用提供的客户端或获取新客户端
     if nextcloud_client is None:
         nextcloud_client = get_nextcloud_client()
@@ -327,7 +326,7 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
             if not check_client_validity(nextcloud_client):
                 logger.warning("Nextcloud客户端连接无效，重新获取客户端实例")
                 nextcloud_client = get_nextcloud_client()
-                
+
             # 创建一个函数来包装上传操作，以便添加超时
             def _sync_upload():
                 nextcloud_client.upload_sync(remote_path=remote_path, local_path=file_path)
@@ -335,7 +334,7 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
             # 使用asyncio.wait_for添加超时控制
             await asyncio.wait_for(
                 asyncio.to_thread(_sync_upload),
-                timeout=CONFIG['NEXTCLOUD_UPLOAD_TIMEOUT']  # 从配置中获取上传超时
+                timeout=CONFIG['nextcloud']['upload_timeout']  # 从配置中获取上传超时
             )
             upload_success = True
             break
@@ -350,7 +349,7 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
                 raise upload_err
             logger.warning(f"上传失败，第{attempt + 2}次尝试...")
             # 等待一段时间后重试，使用指数退避
-            wait_time = CONFIG['NEXTCLOUD_UPLOAD_RETRY_DELAY'] * (2 ** attempt)
+            wait_time = CONFIG['nextcloud']['upload_retry_delay'] * (2 ** attempt)
             await asyncio.sleep(min(wait_time, 30))  # 最大等待30秒
             # 上传失败时重新获取客户端实例，确保连接恢复
             nextcloud_client = get_nextcloud_client()
@@ -371,7 +370,7 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
 
         if file_exists:
             # 可选：验证文件大小
-            if CONFIG['NEXTCLOUD_VERIFY_FILE_SIZE']:
+            if CONFIG['nextcloud']['verify_file_size']:
                 # 尝试获取远程文件大小（取决于WebDAV实现）
                 try:
                     # webdav3可能没有info方法，我们可以尝试使用其他方式或跳过大小验证

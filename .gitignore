@@ -10,7 +10,6 @@ backtest*.json
 *.sqlite-shm
 *.sqlite-wal
 logfile.txt
-config.py
 
 # Macos related
 .DS_Store
