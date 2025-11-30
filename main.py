@@ -1,5 +1,4 @@
 # 导入必要的模块
-import os
 import sys
 import asyncio
 
@@ -198,13 +197,6 @@ def main():
     # 设置信号处理
     setup_signal_handlers()
 
-    # 构建启动通知消息
-    start_message = (
-        f"- 系统: {os.name}\n"
-        f"- Python版本: {sys.version.split()[0]}\n"
-        f"- 并发下载限制: {CONFIG['app']['max_concurrent_downloads']}"
-    )
-
     # 如果配置了管理员，发送启动通知
     if admin_chat_id:
         logger.info(f"向管理员 {admin_chat_id} 发送启动通知")
@@ -218,9 +210,8 @@ def main():
                     loop.run_until_complete(
                         bot.send_message(
                             chat_id=admin_chat_id,
-                            text=(f"🚀 YTBot已成功启动！\n\n"
-                                  f"📊 系统状态:\n{start_message}\n\n"
-                                  f"💡 提示: 发送YouTube链接开始下载音乐或视频")
+                            text=("🚀 YTBot已成功启动！\n\n"
+                                  "💡 提示: 发送YouTube链接开始下载音乐或视频")
                         )
                     )
             finally:
