@@ -220,7 +220,7 @@ def main():
                             chat_id=admin_chat_id,
                             text=(f"🚀 YTBot已成功启动！\n\n"
                                   f"📊 系统状态:\n{start_message}\n\n"
-                                  f"💡 提示: 发送YouTube链接开始下载音乐")
+                                  f"💡 提示: 发送YouTube链接开始下载音乐或视频")
                         )
                     )
             finally:

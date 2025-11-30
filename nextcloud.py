@@ -295,7 +295,7 @@ def check_nextcloud_connection(nextcloud_url=None, nextcloud_username=None,
 
 async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None, max_retries=None):
     """
-    将文件上传到Nextcloud，支持重试和超时控制
+    将文件上传到Nextcloud，支持重试和超时控制，添加了连接恢复机制
 
     Args:
         file_path: 本地文件路径
@@ -311,18 +311,23 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
     """
     import asyncio
 
-    # 如果没有提供客户端，使用get_nextcloud_client获取
-    if nextcloud_client is None:
-        nextcloud_client = get_nextcloud_client()
-
     # 如果没有提供重试次数，从配置中获取
     if max_retries is None:
         max_retries = CONFIG['NEXTCLOUD_UPLOAD_RETRIES']
 
     upload_success = False
+    
+    # 第一次使用提供的客户端或获取新客户端
+    if nextcloud_client is None:
+        nextcloud_client = get_nextcloud_client()
 
     for attempt in range(max_retries):
         try:
+            # 每次上传前验证客户端连接是否有效
+            if not check_client_validity(nextcloud_client):
+                logger.warning("Nextcloud客户端连接无效，重新获取客户端实例")
+                nextcloud_client = get_nextcloud_client()
+                
             # 创建一个函数来包装上传操作，以便添加超时
             def _sync_upload():
                 nextcloud_client.upload_sync(remote_path=remote_path, local_path=file_path)
@@ -338,6 +343,8 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
             if attempt == max_retries - 1:
                 raise Exception("上传超时，请尝试较小的文件或稍后再试")
             logger.warning(f"上传超时，第{attempt + 2}次尝试...")
+            # 上传超时时重新获取客户端实例
+            nextcloud_client = get_nextcloud_client()
         except Exception as upload_err:
             if attempt == max_retries - 1:
                 raise upload_err
@@ -345,6 +352,8 @@ async def upload_file_to_nextcloud(file_path, remote_path, nextcloud_client=None
             # 等待一段时间后重试，使用指数退避
             wait_time = CONFIG['NEXTCLOUD_UPLOAD_RETRY_DELAY'] * (2 ** attempt)
             await asyncio.sleep(min(wait_time, 30))  # 最大等待30秒
+            # 上传失败时重新获取客户端实例，确保连接恢复
+            nextcloud_client = get_nextcloud_client()
 
     if not upload_success:
         raise Exception("上传失败，所有重试都已失败")

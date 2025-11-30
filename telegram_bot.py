@@ -5,7 +5,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram.ext.filters import Text, Command
 from config import CONFIG
 from logger import get_logger
-from downloader import download_video, is_youtube_url
+from downloader import (
+    download_video, is_youtube_url,
+    cancel_all_downloads, reset_download_cancelled
+)
 from nextcloud_client import upload_to_nextcloud, check_nextcloud_connection
 from utils import retry, format_file_size
 
@@ -118,6 +121,7 @@ class TelegramHandler:
         # 命令处理器
         self.application.add_handler(CommandHandler('start', self.start_command))
         self.application.add_handler(CommandHandler('help', self.help_command))
+        self.application.add_handler(CommandHandler('cancel', self.cancel_command))
         logger.debug("消息处理器设置完成")
 
         # 消息处理器 - 使用正确的filters导入
@@ -184,7 +188,8 @@ class TelegramHandler:
             "• 视频文件保持原始质量\n\n"
             "🔹 支持的命令：\n"
             "• /start - 开始使用机器人\n"
-            "• /help - 显示此帮助信息\n\n"
+            "• /help - 显示此帮助信息\n"
+            "• /cancel - 取消当前正在进行的所有下载任务\n\n"
             "🔹 注意事项：\n"
             "• 大文件下载可能需要较长时间\n"
             "• 受版权保护的视频可能无法下载\n"
@@ -254,6 +259,29 @@ class TelegramHandler:
                 text="这不是有效的YouTube链接，请发送正确的YouTube视频链接。",
                 reply_to_message_id=message_id
             )
+
+    async def cancel_command(self, update, context):
+        """处理/cancel命令，取消所有正在进行的下载"""
+        chat_id = update.effective_chat.id
+
+        logger.info(f"收到来自用户 {chat_id} 的 /cancel 命令")
+
+        # 检查用户权限
+        if not self._check_user_permission(chat_id):
+            await self.send_message_safely(
+                chat_id=chat_id,
+                text="您没有权限使用此机器人。"
+            )
+            return
+
+        # 执行取消操作
+        cancel_all_downloads()
+
+        # 发送取消确认消息
+        await self.send_message_safely(
+            chat_id=chat_id,
+            text="🛑 已发出取消命令\n\n所有正在进行的下载任务将在适当时机停止。\n下载停止后已下载的文件将被保留。"
+        )
 
     async def _handle_download_choice(self, update, context):
         """处理下载类型选择回调"""
@@ -433,11 +461,26 @@ class TelegramHandler:
 
         try:
             # 下载视频
-            file_path, info = await download_video(
+            # 修改调用方式，接收包含取消状态的完整结果
+            download_result = await download_video(
                 url=video_url,
                 download_type=download_type,
                 progress_callback=progress_callback
             )
+
+            # 检查是否被取消
+            if download_result.get('cancelled', False):
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message.message_id,
+                    text="🛑 下载已取消\n\n您的下载任务已成功取消。\n已下载的文件将被保留。"
+                )
+                reset_download_cancelled()
+                return
+
+            # 提取文件路径和信息
+            file_path = download_result['file_path']
+            info = download_result['info']
 
             # 获取文件信息
             file_size = os.path.getsize(file_path)
@@ -552,87 +595,100 @@ class TelegramHandler:
 
     async def start_polling(self):
         """
-        开始轮询更新
+        开始轮询更新，支持自动重连
         """
-        print("=== 进入start_polling函数 ===")
         logger.info("=== 进入start_polling函数 ===")
 
-        if not self.application:
-            print("无法启动轮询，Application未初始化")
-            logger.error("无法启动轮询，Application未初始化")
-            return
+        # 主循环，支持断开重连
+        while True:
+            if not self.application:
+                logger.error("无法启动轮询，Application未初始化")
+                # 等待10秒后重试
+                logger.info("等待10秒后重试...")
+                await asyncio.sleep(10)
+                continue
 
-        try:
-            # 检查Nextcloud连接
-            print("检查Nextcloud连接...")
-            logger.info("检查Nextcloud连接...")
-            if not check_nextcloud_connection():
-                print("Nextcloud连接失败，无法启动机器人")
-                logger.error("Nextcloud连接失败，无法启动机器人")
-                return
-
-            print("开始轮询更新...")
-            logger.info("开始轮询更新...")
-
-            # 初始化Application - 注意：处理器已在initialize_bot中设置
-            print("初始化Application...")
-            logger.info("初始化Application...")
-            await self.application.initialize()
-            print("Application初始化完成")
-            logger.info("Application初始化完成")
-
-            # 启动Application
-            print("启动Application...")
-            logger.info("启动Application...")
-            await self.application.start()
-            print("Application启动完成")
-            logger.info("Application启动完成")
-
-            # 获取updater并启动轮询
-            # 这是兼容旧版python-telegram-bot的方式
-            if hasattr(self.application, 'updater') and self.application.updater:
-                logger.info("启动updater轮询...")
-                await self.application.updater.start_polling(
-                    poll_interval=1.0,
-                    timeout=10,
-                    drop_pending_updates=True
-                )
-            else:
-                # 如果没有updater，使用Application的轮询方法
-                # 尝试使用不同版本的API兼容方式
-                logger.info("使用Application直接轮询...")
-                # 尝试直接启动轮询
-                await self.application.run_polling(
-                    poll_interval=1.0,
-                    timeout=10,
-                    drop_pending_updates=True
-                )
-
-            logger.info("✅ 轮询已成功启动！机器人现在应该能接收消息了")
-            logger.info("💡 提示: 尝试发送 /start 命令或YouTube链接测试")
-
-            # 保持运行直到收到停止信号
-            while True:
-                await asyncio.sleep(1)
-
-        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-            logger.info("收到停止信号，正在关闭...")
-        except Exception as e:
-            logger.error(f"轮询过程中发生错误: {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
-        finally:
             try:
-                # 确保正确关闭应用
-                if hasattr(self.application, 'is_running') and self.application.is_running:
-                    logger.info("停止轮询并关闭应用...")
-                    # 先停止updater（如果存在）
-                    if hasattr(self.application, 'updater') and self.application.updater:
-                        await self.application.updater.stop()
-                    # 再停止应用
-                    await self.application.stop()
-                    await self.application.shutdown()
-            except Exception as e:
-                logger.warning(f"关闭Application时发生错误: {str(e)}")
+                # 检查Nextcloud连接
+                logger.info("检查Nextcloud连接...")
+                if not check_nextcloud_connection():
+                    logger.error("Nextcloud连接失败，无法启动机器人")
+                    # 等待10秒后重试
+                    logger.info("等待10秒后重试...")
+                    await asyncio.sleep(10)
+                    continue
 
-            logger.info("机器人已关闭")
+                logger.info("开始轮询更新...")
+
+                # 初始化Application - 注意：处理器已在initialize_bot中设置
+                logger.info("初始化Application...")
+                await self.application.initialize()
+                logger.info("Application初始化完成")
+
+                # 启动Application
+                logger.info("启动Application...")
+                await self.application.start()
+                logger.info("Application启动完成")
+
+                # 获取updater并启动轮询
+                # 这是兼容旧版python-telegram-bot的方式
+                if hasattr(self.application, 'updater') and self.application.updater:
+                    logger.info("启动updater轮询...")
+                    await self.application.updater.start_polling(
+                        poll_interval=1.0,
+                        timeout=10,
+                        drop_pending_updates=True
+                    )
+                else:
+                    # 如果没有updater，使用Application的轮询方法
+                    # 尝试使用不同版本的API兼容方式
+                    logger.info("使用Application直接轮询...")
+                    # 尝试直接启动轮询
+                    await self.application.run_polling(
+                        poll_interval=1.0,
+                        timeout=10,
+                        drop_pending_updates=True
+                    )
+
+                logger.info("✅ 轮询已成功启动！机器人现在应该能接收消息了")
+                logger.info("💡 提示: 尝试发送 /start 命令或YouTube链接测试")
+
+                # 保持运行直到收到停止信号或连接断开
+                while True:
+                    await asyncio.sleep(1)
+
+            except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+                logger.info("收到停止信号，正在关闭...")
+                return  # 退出轮询函数
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"轮询过程中发生错误: {error_msg}")
+                import traceback
+                logger.debug(traceback.format_exc())
+
+                # 检查是否是服务器断开连接错误
+                if "disconnected" in error_msg.lower() or "connection" in error_msg.lower():
+                    logger.info("检测到服务器断开连接，将在10秒后重新连接...")
+                else:
+                    logger.info("发生错误，将在10秒后重新尝试...")
+            finally:
+                try:
+                    # 确保正确关闭应用
+                    if (self.application and
+                            hasattr(self.application, 'is_running') and
+                            self.application.is_running):
+                        logger.info("停止轮询并关闭应用...")
+                        # 先停止updater（如果存在）
+                        if hasattr(self.application, 'updater') and self.application.updater:
+                            await self.application.updater.stop()
+                        # 再停止应用
+                        await self.application.stop()
+                        await self.application.shutdown()
+                except Exception as e:
+                    logger.warning(f"关闭Application时发生错误: {str(e)}")
+
+                logger.info("机器人已关闭，准备重新连接")
+
+                # 等待10秒后重新连接
+                logger.info("等待10秒后重新连接...")
+                await asyncio.sleep(10)
