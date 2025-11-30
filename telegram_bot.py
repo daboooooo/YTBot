@@ -31,74 +31,50 @@ def create_bot(token=None):
         token = CONFIG['telegram']['token']
 
     try:
-        # 在python-telegram-bot 22.5版本中，使用httpx设置代理
-        if os.environ.get('PROXY_URL'):
-            proxy_url = os.environ.get('PROXY_URL')
-            proxy_username = os.environ.get('PROXY_USERNAME', '')
-            proxy_password = os.environ.get('PROXY_PASSWORD', '')
-
-            # 构建带认证的代理URL
-            if proxy_username and proxy_password:
-                # 从URL中提取协议和主机信息
-                from urllib.parse import urlparse
-                parsed = urlparse(proxy_url)
-                # 完全拆分长行
-                scheme = parsed.scheme
-                netloc = parsed.netloc
-                path = parsed.path
-                auth_proxy_url = f"{scheme}://"
-                auth_part = f"{proxy_username}:{proxy_password}@"
-                auth_proxy_url += auth_part
-                auth_proxy_url += f"{netloc}{path}"
-            else:
-                auth_proxy_url = proxy_url
-
-            # 创建带代理的HTTPX客户端
-            import httpx
-
+        # 获取代理配置
+        proxy_url = os.environ.get('PROXY_URL')
+        
+        if proxy_url:
+            # 对于python-telegram-bot 22.5版本，使用正确的代理设置方式
+            from telegram.request import HTTPXRequest
+            
             # 确保socks代理依赖已安装
             try:
                 import socksio
             except ImportError:
                 logger.error("缺少socks代理依赖，请安装：pip install httpx[socks]")
                 raise
-
-            # 处理socks代理，确保使用正确的格式
-            try:
-                # 直接使用auth_proxy_url作为代理，httpx会自动处理
-                http_client = httpx.Client(
-                    proxies={"all://": auth_proxy_url},
-                    verify=False  # 对于自签名证书可能需要
-                )
-            except ValueError as e:
-                if "Unknown scheme" in str(e):
-                    # 尝试使用不同的代理格式
-                    logger.warning(f"代理URL格式可能有问题，尝试使用不同格式: {auth_proxy_url}")
-                    # 对于socks代理，尝试使用另一种格式
-                    parsed = urlparse(auth_proxy_url)
-                    if parsed.scheme in ['socks', 'socks5', 'socks4']:
-                        # 尝试使用完整的socks5格式
-                        new_proxy_url = f"{parsed.scheme}://{parsed.netloc}"
-                        logger.info(f"尝试使用新的代理格式: {new_proxy_url}")
-                        http_client = httpx.Client(
-                            proxies={"all://": new_proxy_url},
-                            verify=False
-                        )
-                    else:
-                        raise
-                else:
-                    raise
-
-            proxy_info = auth_proxy_url
-            logger.info(f"使用代理: {proxy_info}")
-            bot = Bot(token=token, http_client=http_client)
+            
+            # 处理代理URL，确保格式正确
+            from urllib.parse import urlparse
+            parsed = urlparse(proxy_url)
+            
+            # 确保代理URL没有路径部分
+            clean_proxy_url = f"{parsed.scheme}://{parsed.netloc}"
+            
+            logger.info(f"使用代理: {clean_proxy_url}")
+            
+            # 创建HTTPXRequest对象，使用正确的代理格式
+            request = HTTPXRequest(
+                proxy_url=clean_proxy_url,
+                proxy_kwargs={
+                    'verify': False  # 对于自签名证书可能需要
+                }
+            )
+            
+            # 创建Bot实例，传递request对象
+            bot = Bot(token=token, request=request)
         else:
             # 不使用代理
             bot = Bot(token=token)
+        
         logger.info("Bot实例创建成功")
         return bot
     except Exception as e:
         logger.error(f"创建Bot实例失败: {str(e)}")
+        # 打印详细错误信息，便于调试
+        import traceback
+        logger.debug(traceback.format_exc())
         return None
 
 # TelegramHandler类，封装所有Telegram相关功能
