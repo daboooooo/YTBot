@@ -55,10 +55,39 @@ def create_bot(token=None):
 
             # 创建带代理的HTTPX客户端
             import httpx
-            http_client = httpx.Client(
-                proxies={"all://": auth_proxy_url},
-                verify=False  # 对于自签名证书可能需要
-            )
+
+            # 确保socks代理依赖已安装
+            try:
+                import socksio
+            except ImportError:
+                logger.error("缺少socks代理依赖，请安装：pip install httpx[socks]")
+                raise
+
+            # 处理socks代理，确保使用正确的格式
+            try:
+                # 直接使用auth_proxy_url作为代理，httpx会自动处理
+                http_client = httpx.Client(
+                    proxies={"all://": auth_proxy_url},
+                    verify=False  # 对于自签名证书可能需要
+                )
+            except ValueError as e:
+                if "Unknown scheme" in str(e):
+                    # 尝试使用不同的代理格式
+                    logger.warning(f"代理URL格式可能有问题，尝试使用不同格式: {auth_proxy_url}")
+                    # 对于socks代理，尝试使用另一种格式
+                    parsed = urlparse(auth_proxy_url)
+                    if parsed.scheme in ['socks', 'socks5', 'socks4']:
+                        # 尝试使用完整的socks5格式
+                        new_proxy_url = f"{parsed.scheme}://{parsed.netloc}"
+                        logger.info(f"尝试使用新的代理格式: {new_proxy_url}")
+                        http_client = httpx.Client(
+                            proxies={"all://": new_proxy_url},
+                            verify=False
+                        )
+                    else:
+                        raise
+                else:
+                    raise
 
             proxy_info = auth_proxy_url
             logger.info(f"使用代理: {proxy_info}")
