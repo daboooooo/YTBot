@@ -7,9 +7,11 @@ from config import CONFIG, validate_config
 from logger import logger, setup_exception_handler
 from downloader import check_yt_dlp_version
 from monitoring import check_network_connection
-from telegram_bot import TelegramHandler, create_bot
+from telegram_bot import TelegramHandler
 from nextcloud_client import get_nextcloud_client
-from monitoring import network_monitor, resource_monitor, setup_signal_handlers
+from monitoring import (network_monitor, resource_monitor,
+                        setup_signal_handlers, telegram_connection_monitor)
+from typing import Dict, Any
 
 # 主事件循环引用
 main_event_loop = None
@@ -17,7 +19,7 @@ main_event_loop = None
 # 用户状态管理字典，用于存储用户的选择状态
 # 格式: {user_id: {'state': 'waiting_for_download_type', 'url': 'youtube_url',
 #        'timestamp': timestamp}}
-user_states = {}
+user_states: Dict[int, Dict[str, Any]] = {}
 
 # 设置全局异常处理器
 setup_exception_handler()
@@ -57,15 +59,8 @@ async def main_async():
     processing_updates = set()
 
     try:
-        # 创建Bot实例
-        bot = create_bot(CONFIG['telegram']['token'])
-        if not bot:
-            logger.error("无法创建Bot实例，程序将退出")
-            return False
-
         # 初始化TelegramHandler
         handler = TelegramHandler(
-            bot=bot,
             user_states=user_states,
             semaphore=semaphore,
             processing_updates=processing_updates
@@ -80,7 +75,8 @@ async def main_async():
         logger.info("启动监控任务...")
         network_task = asyncio.create_task(network_monitor())
         resource_task = asyncio.create_task(resource_monitor(user_states))
-        tasks.extend([network_task, resource_task])
+        telegram_task = asyncio.create_task(telegram_connection_monitor())
+        tasks.extend([network_task, resource_task, telegram_task])
 
         logger.info("YTBot已成功启动，开始执行轮询...")
 
@@ -204,16 +200,20 @@ def main():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            try:
-                bot = create_bot(CONFIG['telegram']['token'])
-                if bot:
-                    loop.run_until_complete(
-                        bot.send_message(
-                            chat_id=admin_chat_id,
-                            text=("🚀 YTBot已成功启动！\n\n"
-                                  "💡 提示: 发送YouTube链接开始下载音乐或视频")
-                        )
+
+            async def send_start_notification():
+                from telegram_communicator import TelegramCommunicator
+                communicator = TelegramCommunicator()
+                if await communicator.connect():
+                    await communicator.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=("🚀 YTBot已成功启动！\n\n"
+                              "💡 提示: 发送YouTube链接开始下载音乐或视频")
                     )
+                    await communicator.disconnect()
+
+            try:
+                loop.run_until_complete(send_start_notification())
             finally:
                 loop.close()
         except Exception as e:

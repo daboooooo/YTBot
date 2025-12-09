@@ -167,10 +167,10 @@ CONFIG = {
         "ignore_no_formats_error": True,
         "allow_playlist_files": True,
         "merge_output_format": "mp4",
-        "sleep_interval_requests": 2,
-        "sleep_interval": 5,
-        "max_sleep_interval": 30,
-        "socket_timeout": get_env_int_or_default("DOWNLOAD_SOCKET_TIMEOUT", 30),
+        "sleep_interval_requests": 0.5,
+        "sleep_interval": 2,
+        "max_sleep_interval": 10,
+        "socket_timeout": get_env_int_or_default("DOWNLOAD_SOCKET_TIMEOUT", 20),
         "progress_update_interval": PROGRESS_UPDATE_INTERVAL
     },
     "log": {

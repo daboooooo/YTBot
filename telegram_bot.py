@@ -1,7 +1,7 @@
 import asyncio
 import os
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler
 from telegram.ext.filters import Text, Command
 from config import CONFIG
 from logger import get_logger
@@ -9,81 +9,20 @@ from downloader import (
     download_video, is_youtube_url,
     cancel_all_downloads, reset_download_cancelled
 )
-from nextcloud_client import upload_to_nextcloud, check_nextcloud_connection
+from nextcloud_client import upload_to_nextcloud
 from utils import retry, format_file_size
+from telegram_communicator import TelegramCommunicator
 
 
 logger = get_logger(__name__)
 
 
-# 创建Bot实例
-def create_bot(token=None):
-    """
-    创建Telegram Bot实例
-
-    Args:
-        token: Telegram Bot Token
-
-    Returns:
-        Bot: 配置好的Bot实例
-    """
-    if token is None:
-        token = CONFIG['telegram']['token']
-
-    try:
-        # 获取代理配置
-        proxy_url = os.environ.get('PROXY_URL')
-        
-        if proxy_url:
-            # 对于python-telegram-bot 22.5版本，使用正确的代理设置方式
-            from telegram.request import HTTPXRequest
-            
-            # 确保socks代理依赖已安装
-            try:
-                import socksio
-            except ImportError:
-                logger.error("缺少socks代理依赖，请安装：pip install httpx[socks]")
-                raise
-            
-            # 处理代理URL，确保格式正确
-            from urllib.parse import urlparse
-            parsed = urlparse(proxy_url)
-            
-            # 确保代理URL没有路径部分
-            clean_proxy_url = f"{parsed.scheme}://{parsed.netloc}"
-            
-            logger.info(f"使用代理: {clean_proxy_url}")
-            
-            # 创建HTTPXRequest对象，使用正确的代理格式
-            request = HTTPXRequest(
-                proxy_url=clean_proxy_url,
-                proxy_kwargs={
-                    'verify': False  # 对于自签名证书可能需要
-                }
-            )
-            
-            # 创建Bot实例，传递request对象
-            bot = Bot(token=token, request=request)
-        else:
-            # 不使用代理
-            bot = Bot(token=token)
-        
-        logger.info("Bot实例创建成功")
-        return bot
-    except Exception as e:
-        logger.error(f"创建Bot实例失败: {str(e)}")
-        # 打印详细错误信息，便于调试
-        import traceback
-        logger.debug(traceback.format_exc())
-        return None
-
 # TelegramHandler类，封装所有Telegram相关功能
 
 
 class TelegramHandler:
-    def __init__(self, bot=None, user_states=None, semaphore=None, processing_updates=None):
-        self.bot = bot or create_bot()
-        self.application = None
+    def __init__(self, user_states=None, semaphore=None, processing_updates=None):
+        self.communicator = TelegramCommunicator()
         self.user_states = user_states if user_states is not None else {}
         self.processing_updates = processing_updates if processing_updates is not None else set()
         self.download_semaphore = semaphore or asyncio.Semaphore(
@@ -93,24 +32,15 @@ class TelegramHandler:
         """
         初始化Bot和Application
         """
-        if not self.bot:
-            logger.error("Bot实例未初始化")
-            return False
-
         try:
-            # 获取Bot信息
-            bot_info = await self.bot.get_me()
-            username = f"@{bot_info.username}"
-            bot_id = bot_info.id
-            logger.info(f"Bot初始化成功: {username}, ID: {bot_id}")
-
-            # 创建Application
-            self.application = Application.builder().bot(self.bot).build()
-
-            # 设置处理器
-            await self._setup_handlers()
-
-            return True
+            # 使用communicator连接
+            if await self.communicator.connect():
+                # 设置处理器
+                await self._setup_handlers()
+                return True
+            else:
+                logger.error("Bot连接失败")
+                return False
         except Exception as e:
             logger.error(f"初始化Bot失败: {str(e)}")
             return False
@@ -119,26 +49,27 @@ class TelegramHandler:
         """
         设置各种命令和消息处理器
         """
-        if not self.application:
+        if not self.communicator.application:
             return
 
         logger.debug("正在设置消息处理器")
         # 命令处理器
-        self.application.add_handler(CommandHandler('start', self.start_command))
-        self.application.add_handler(CommandHandler('help', self.help_command))
-        self.application.add_handler(CommandHandler('cancel', self.cancel_command))
+        self.communicator.application.add_handler(CommandHandler('start', self.start_command))
+        self.communicator.application.add_handler(CommandHandler('help', self.help_command))
+        self.communicator.application.add_handler(CommandHandler('cancel', self.cancel_command))
         logger.debug("消息处理器设置完成")
 
         # 消息处理器 - 使用正确的filters导入
-        self.application.add_handler(
+        self.communicator.application.add_handler(
             MessageHandler(
                 Text() & ~Command(), self.handle_message))
 
         # 回调处理器
-        self.application.add_handler(CallbackQueryHandler(self._handle_download_choice))
+        self.communicator.application.add_handler(
+            CallbackQueryHandler(self._handle_download_choice))
 
         # 错误处理器
-        self.application.add_error_handler(self.error_handler)
+        self.communicator.application.add_error_handler(self.error_handler)
 
     async def start_command(self, update, context):
         """处理/start命令"""
@@ -387,7 +318,7 @@ class TelegramHandler:
                 if i < len(parts) - 1:
                     part = f"{part}\n(待续)"
 
-                last_message = await self.bot.send_message(
+                last_message = await self.communicator.bot.send_message(
                     chat_id=chat_id,
                     text=part,
                     **kwargs
@@ -396,7 +327,7 @@ class TelegramHandler:
             return last_message
         else:
             # 消息长度正常，直接发送
-            return await self.bot.send_message(
+            return await self.communicator.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 **kwargs
@@ -439,7 +370,7 @@ class TelegramHandler:
                         )
                         # 使用编辑消息功能，避免发送多条消息
                         try:
-                            await self.bot.edit_message_text(
+                            await self.communicator.bot.edit_message_text(
                                 chat_id=chat_id,
                                 message_id=progress_message.message_id,
                                 text=update_text
@@ -448,14 +379,14 @@ class TelegramHandler:
                             logger.warning(f"更新进度消息失败: {str(e)}")
                             # 如果编辑失败，尝试重新发送
                             try:
-                                await self.bot.send_message(
+                                await self.communicator.bot.send_message(
                                     chat_id=chat_id,
                                     text=update_text
                                 )
                             except Exception:
                                 pass
                 elif progress_info['status'] == 'finished':
-                    await self.bot.edit_message_text(
+                    await self.communicator.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=progress_message.message_id,
                         text=f"✅ 下载完成！正在准备上传到Nextcloud...\n\n"
@@ -475,7 +406,7 @@ class TelegramHandler:
 
             # 检查是否被取消
             if download_result.get('cancelled', False):
-                await self.bot.edit_message_text(
+                await self.communicator.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_message.message_id,
                     text="🛑 下载已取消\n\n您的下载任务已成功取消。\n已下载的文件将被保留。"
@@ -493,7 +424,7 @@ class TelegramHandler:
             video_title = info.get('title', 'Unknown Video')
 
             # 更新进度消息
-            await self.bot.edit_message_text(
+            await self.communicator.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=progress_message.message_id,
                 text=f"📤 正在上传到Nextcloud...\n\n"
@@ -519,7 +450,7 @@ class TelegramHandler:
             )
 
             # 更新进度消息为完成状态
-            await self.bot.edit_message_text(
+            await self.communicator.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=progress_message.message_id,
                 text=f"✅ 下载和上传完成！\n\n"
@@ -536,14 +467,14 @@ class TelegramHandler:
 
             # 尝试编辑消息，失败则发送新消息
             try:
-                await self.bot.edit_message_text(
+                await self.communicator.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_message.message_id,
                     text=error_message
                 )
             except Exception as e:
                 logger.warning(f"编辑错误消息失败: {str(e)}")
-                await self.bot.send_message(
+                await self.communicator.bot.send_message(
                     chat_id=chat_id,
                     text=error_message
                 )
@@ -604,96 +535,16 @@ class TelegramHandler:
         """
         logger.info("=== 进入start_polling函数 ===")
 
-        # 主循环，支持断开重连
-        while True:
-            if not self.application:
-                logger.error("无法启动轮询，Application未初始化")
-                # 等待10秒后重试
-                logger.info("等待10秒后重试...")
-                await asyncio.sleep(10)
-                continue
-
-            try:
-                # 检查Nextcloud连接
-                logger.info("检查Nextcloud连接...")
-                if not check_nextcloud_connection():
-                    logger.error("Nextcloud连接失败，无法启动机器人")
-                    # 等待10秒后重试
-                    logger.info("等待10秒后重试...")
-                    await asyncio.sleep(10)
-                    continue
-
-                logger.info("开始轮询更新...")
-
-                # 初始化Application - 注意：处理器已在initialize_bot中设置
-                logger.info("初始化Application...")
-                await self.application.initialize()
-                logger.info("Application初始化完成")
-
-                # 启动Application
-                logger.info("启动Application...")
-                await self.application.start()
-                logger.info("Application启动完成")
-
-                # 获取updater并启动轮询
-                # 这是兼容旧版python-telegram-bot的方式
-                if hasattr(self.application, 'updater') and self.application.updater:
-                    logger.info("启动updater轮询...")
-                    await self.application.updater.start_polling(
-                        poll_interval=1.0,
-                        timeout=10,
-                        drop_pending_updates=True
-                    )
-                else:
-                    # 如果没有updater，使用Application的轮询方法
-                    # 尝试使用不同版本的API兼容方式
-                    logger.info("使用Application直接轮询...")
-                    # 尝试直接启动轮询
-                    await self.application.run_polling(
-                        poll_interval=1.0,
-                        timeout=10,
-                        drop_pending_updates=True
-                    )
-
-                logger.info("✅ 轮询已成功启动！机器人现在应该能接收消息了")
-                logger.info("💡 提示: 尝试发送 /start 命令或YouTube链接测试")
-
-                # 保持运行直到收到停止信号或连接断开
-                while True:
-                    await asyncio.sleep(1)
-
-            except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-                logger.info("收到停止信号，正在关闭...")
-                return  # 退出轮询函数
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"轮询过程中发生错误: {error_msg}")
-                import traceback
-                logger.debug(traceback.format_exc())
-
-                # 检查是否是服务器断开连接错误
-                if "disconnected" in error_msg.lower() or "connection" in error_msg.lower():
-                    logger.info("检测到服务器断开连接，将在10秒后重新连接...")
-                else:
-                    logger.info("发生错误，将在10秒后重新尝试...")
-            finally:
-                try:
-                    # 确保正确关闭应用
-                    if (self.application and (
-                            hasattr(self.application, 'is_running') and (
-                            self.application.is_running))):
-                        logger.info("停止轮询并关闭应用...")
-                        # 先停止updater（如果存在）
-                        if hasattr(self.application, 'updater') and self.application.updater:
-                            await self.application.updater.stop()
-                        # 再停止应用
-                        await self.application.stop()
-                        await self.application.shutdown()
-                except Exception as e:
-                    logger.warning(f"关闭Application时发生错误: {str(e)}")
-
-                logger.info("机器人已关闭，准备重新连接")
-
-                # 等待10秒后重新连接
-                logger.info("等待10秒后重新连接...")
-                await asyncio.sleep(10)
+        try:
+            # 使用communicator的start_polling方法，它已经包含了自动重连和连接检测
+            await self.communicator.start_polling()
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            logger.info("收到停止信号，正在关闭...")
+            # 确保正确关闭通信器
+            await self.communicator.disconnect()
+        except Exception as e:
+            logger.error(f"轮询过程中发生错误: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # 确保正确关闭通信器
+            await self.communicator.disconnect()
