@@ -10,7 +10,7 @@ from downloader import (
     cancel_all_downloads, reset_download_cancelled
 )
 from nextcloud_client import upload_to_nextcloud
-from utils import retry, format_file_size
+from utils import retry, format_file_size, safe_truncate_filename
 from telegram_communicator import TelegramCommunicator
 
 
@@ -423,12 +423,15 @@ class TelegramHandler:
             file_name = os.path.basename(file_path)
             video_title = info.get('title', 'Unknown Video')
 
+            # 安全截断文件名，确保不超过64字节
+            safe_file_name = safe_truncate_filename(file_name, max_bytes=64)
+
             # 更新进度消息
             await self.communicator.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=progress_message.message_id,
                 text=f"📤 正在上传到Nextcloud...\n\n"
-                f"📁 文件: {file_name}\n"
+                f"📁 文件: {safe_file_name}\n"
                 f"📊 大小: {format_file_size(file_size)}"
             )
 
@@ -442,7 +445,7 @@ class TelegramHandler:
             remote_dir = f"{remote_dir}/{media_type_dir}"
 
             # 上传文件到Nextcloud
-            remote_file_path = f"{remote_dir}/{file_name}"
+            remote_file_path = f"{remote_dir}/{safe_file_name}"
             file_url = await asyncio.to_thread(
                 upload_to_nextcloud,
                 file_path,

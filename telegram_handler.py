@@ -7,6 +7,7 @@ from downloader import (is_youtube_url, download_video, is_youtube_playlist,
                         download_playlist, get_playlist_id)
 from nextcloud import upload_file_to_nextcloud, get_nextcloud_client
 from config import CONFIG
+from utils import safe_truncate_filename
 
 
 # 重试装饰器
@@ -747,13 +748,16 @@ class TelegramHandler:
                         playlist_id = get_playlist_id(playlist_url)
                         upload_dir = f"{CONFIG['NEXTCLOUD_UPLOAD_DIR']}/playlist_{playlist_id}"
 
+                    # 安全截断文件名，确保不超过64字节
+                    safe_file_name = safe_truncate_filename(file_info['name'], max_bytes=64)
+
                     # 构建远程路径
-                    remote_path = f"{upload_dir}/{file_info['name']}"
+                    remote_path = f"{upload_dir}/{safe_file_name}"
 
                     # 更新进度消息为正在上传
                     message = (f"📤 正在上传视频 {video_result['index']}/{total_videos}\n"
                                f"标题: {file_info['title']}\n"
-                               f"文件: {file_info['name']}\n"
+                               f"文件: {safe_file_name}\n"
                                f"大小: {file_info['size']}\n\n"
                                f"已完成: {downloaded_videos} 个\n"
                                f"上传中: 1 个\n"
@@ -783,7 +787,7 @@ class TelegramHandler:
                     # 更新进度消息为上传完成
                     message = (f"✅ 视频 {video_result['index']}/{total_videos} 上传完成\n"
                                f"标题: {file_info['title']}\n"
-                               f"文件: {file_info['name']}\n\n"
+                               f"文件: {safe_file_name}\n\n"
                                f"已完成: {downloaded_videos} 个\n"
                                f"失败: {failed_videos} 个"),
 

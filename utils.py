@@ -232,6 +232,74 @@ def format_file_size(size_bytes):
     return f"{size:.2f} {units[unit_index]}"
 
 
+def safe_truncate_filename(filename, max_bytes=64):
+    """
+    根据字节数安全截断文件名，考虑中文等多字节字符
+
+    Args:
+        filename: 原始文件名
+        max_bytes: 最大允许字节数（默认64字节）
+
+    Returns:
+        str: 截断后的安全文件名
+    """
+    if not filename:
+        return "unknown_file.mp3"
+
+    # 先清理文件名
+    filename = sanitize_filename(filename)
+
+    # 分离文件名和扩展名
+    name, ext = os.path.splitext(filename)
+
+    # 计算扩展名的字节长度
+    ext_bytes = len(ext.encode('utf-8'))
+
+    # 计算文件名主体的最大允许字节数
+    max_name_bytes = max_bytes - ext_bytes
+
+    # 如果扩展名本身就超过最大字节数，使用默认文件名
+    if max_name_bytes <= 0:
+        return f"file{ext}"
+
+    # 如果文件名主体不超过最大字节数，直接返回
+    if len(name.encode('utf-8')) <= max_name_bytes:
+        return filename
+
+    # 否则，截断文件名主体
+    # 初始尝试使用二分法找到合适的截断点
+    left = 0
+    right = len(name)
+    best_len = 0
+
+    while left <= right:
+        mid = (left + right) // 2
+        current_bytes = len(name[:mid].encode('utf-8'))
+
+        if current_bytes <= max_name_bytes:
+            best_len = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    # 确保截断后的文件名有意义
+    if best_len == 0:
+        return f"file{ext}"
+
+    # 截断文件名并添加省略号（如果需要）
+    truncated_name = name[:best_len]
+
+    # 检查是否需要添加省略号
+    ellipsis = "..."
+    ellipsis_bytes = len(ellipsis.encode('utf-8'))
+
+    # 如果添加省略号后仍在限制内，添加省略号
+    if len(truncated_name.encode('utf-8')) + ellipsis_bytes <= max_name_bytes:
+        truncated_name += ellipsis
+
+    return f"{truncated_name}{ext}"
+
+
 # 清理临时目录
 def cleanup_temp_files(temp_dir):
     """

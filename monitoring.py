@@ -163,8 +163,8 @@ async def resource_monitor(user_states=None, nextcloud_cache=None):
             # 检查用户状态是否过期
             current_time = time.time()
             expired_users = [user_id for user_id, state_info in user_states.items()
-                             if (current_time - state_info.get('timestamp', current_time)) >
-                             CONFIG['monitor']['user_state_timeout']]
+                             if (current_time - state_info.get('timestamp', current_time)) > (
+                                 CONFIG['monitor']['user_state_timeout'])]
 
             # 清理过期用户状态
             for user_id in expired_users:
@@ -200,7 +200,7 @@ async def resource_monitor(user_states=None, nextcloud_cache=None):
                             if await communicator.connect():
                                 await communicator.bot.send_message(
                                     chat_id=CONFIG['telegram']['admin_chat_id'],
-                                    text=f"⚠️ YTBot内存警告：\n当前内存使用: {memory_used_mb:.2f} MB\n" +
+                                    text=f"⚠️ YTBot内存警告：\n当前内存使用: {memory_used_mb:.2f} MB\n"
                                          "已执行自动清理以释放内存"
                                 )
                                 await communicator.disconnect()
