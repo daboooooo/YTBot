@@ -306,28 +306,52 @@ def setup_signal_handlers():
         # 发送关闭通知给管理员（如果有）
         if CONFIG['telegram']['admin_chat_id']:
             try:
-                from telegram_communicator import TelegramCommunicator
+                # 使用同步方式发送关闭通知，避免事件循环冲突
+                from telegram import Bot
+                from telegram.request import HTTPXRequest
+                import os
 
-                # 创建事件循环来运行异步代码
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # 获取Telegram token
+                token = CONFIG['telegram']['token']
 
-                async def send_shutdown_notification():
-                    communicator = TelegramCommunicator()
-                    if await communicator.connect():
-                        try:
-                            await communicator.bot.send_message(
-                                chat_id=CONFIG['telegram']['admin_chat_id'],
-                                text="🛑 YTBot正在关闭，可能是由于系统重启或更新。\n将在完成当前任务后停止。"
-                            )
-                            logger.info("关闭通知已发送")
-                        except Exception as msg_e:
-                            logger.warning("无法发送关闭通知: %s", str(msg_e))
-                        finally:
-                            await communicator.disconnect()
+                # 处理代理配置
+                proxy_url = os.environ.get('PROXY_URL')
 
-                loop.run_until_complete(send_shutdown_notification())
-                loop.close()
+                if proxy_url:
+                    # 处理代理URL
+                    from urllib.parse import urlparse
+                    parsed = urlparse(proxy_url)
+                    clean_proxy_url = f"{parsed.scheme}://{parsed.netloc}"
+
+                    # 创建HTTPXRequest with proxy
+                    request = HTTPXRequest(
+                        proxy_url=clean_proxy_url,
+                        proxy_kwargs={
+                            'verify': False
+                        }
+                    )
+                    bot = Bot(token=token, request=request)
+                else:
+                    # 创建Bot without proxy
+                    bot = Bot(token=token)
+
+                # 使用get_event_loop来获取当前事件循环，避免创建新的循环
+                import asyncio
+                loop = asyncio.get_event_loop()
+
+                # 异步发送消息
+                async def send_message():
+                    try:
+                        await bot.send_message(
+                            chat_id=CONFIG['telegram']['admin_chat_id'],
+                            text="🛑 YTBot正在关闭，可能是由于系统重启或更新。\n将在完成当前任务后停止。"
+                        )
+                        logger.info("关闭通知已发送")
+                    except Exception as msg_e:
+                        logger.warning("无法发送关闭通知: %s", str(msg_e))
+
+                # 使用run_until_complete来执行异步函数
+                loop.run_until_complete(send_message())
             except Exception as e:
                 logger.error("处理关闭通知时出错: %s", str(e))
 

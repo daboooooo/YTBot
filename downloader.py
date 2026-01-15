@@ -166,7 +166,7 @@ def _setup_download_options(temp_dir, download_type):
     """
     # 创建基础配置
     ydl_opts = {
-        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+        'outtmpl': os.path.join(temp_dir, '%(title).50s.%(ext)s'),  # 限制标题长度为50个字符
         'quiet': CONFIG['download']['quiet'],
         'no_warnings': False,  # 设为False以查看更多警告信息
         'retries': CONFIG['download']['retries'],
