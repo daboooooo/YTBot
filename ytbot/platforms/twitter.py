@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 # Try to import playwright, provide helpful error if not available
 try:
     from playwright.async_api import async_playwright, Browser, BrowserContext
+    from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -33,6 +34,65 @@ except ImportError:
         "Playwright not installed. Twitter/X content extraction will not work. "
         "Install with: pip install playwright && playwright install chromium"
     )
+
+
+def ensure_browser_installed() -> bool:
+    """
+    Check if Playwright browser is installed, install if not.
+    Returns True if browser is available (either already installed or just installed).
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return False
+
+    try:
+        with sync_playwright() as p:
+            try:
+                p.chromium.executable_path
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    logger.info("Playwright browser not found. Installing chromium...")
+    import subprocess
+    import sys
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        if result.returncode == 0:
+            logger.info("Playwright chromium browser installed successfully")
+            return True
+        else:
+            logger.error(f"Failed to install Playwright browser: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout while installing Playwright browser")
+        return False
+    except Exception as e:
+        logger.error(f"Error installing Playwright browser: {e}")
+        return False
+
+
+_BROWSER_CHECKED = False
+
+
+def check_and_install_browser():
+    """Check and install browser once per session."""
+    global _BROWSER_CHECKED
+    if not _BROWSER_CHECKED:
+        _BROWSER_CHECKED = True
+        if PLAYWRIGHT_AVAILABLE and not ensure_browser_installed():
+            logger.warning(
+                "Playwright browser installation failed. "
+                "Twitter/X content extraction may not work. "
+                "Try running manually: playwright install chromium"
+            )
 
 
 class TwitterContentExtractor:
@@ -47,7 +107,12 @@ class TwitterContentExtractor:
     async def initialize_browser(self):
         """Initialize Playwright browser with anti-detection measures"""
         if not PLAYWRIGHT_AVAILABLE:
-            raise RuntimeError("Playwright not installed. Install with: pip install playwright && playwright install chromium")
+            raise RuntimeError(
+                "Playwright not installed. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
+
+        check_and_install_browser()
 
         if self.browser is None:
             playwright = await async_playwright().start()

@@ -10,6 +10,9 @@ aiofiles>=0.8.0
 aiohttp>=3.8.0
 requests>=2.28.0
 
+# Twitter/X content extraction
+playwright>=1.58.0
+
 # Development dependencies (install with: pip install -e .[dev])
 # pytest>=7.0.0
 # pytest-asyncio>=0.21.0
