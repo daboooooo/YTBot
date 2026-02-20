@@ -110,7 +110,11 @@ venv/
 *.csv
 *.log
 *.mp3
+*.mp4
+*.webm
 *.html
+
+test_downloads/
 
 # asciinema
 *.cast

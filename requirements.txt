@@ -1,7 +1,18 @@
-python-telegram-bot==22.5
-yt-dlp
+# Core dependencies
+python-telegram-bot>=20.0
+yt-dlp>=2026.2.4
 webdavclient3==3.14.6
-requests==2.31.0
-httpx[socks]==0.27.0
-psutil==7.1.1
-python-dotenv==1.2.1
+python-dotenv>=0.19.0
+psutil>=5.9.0
+
+# Optional dependencies for enhanced functionality
+aiofiles>=0.8.0
+aiohttp>=3.8.0
+requests>=2.28.0
+
+# Development dependencies (install with: pip install -e .[dev])
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+# black>=22.0.0
+# flake8>=4.0.0
+# mypy>=0.950
