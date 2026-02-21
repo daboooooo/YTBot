@@ -103,6 +103,7 @@ class TwitterContentExtractor:
     def __init__(self):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self._playwright = None
 
     async def initialize_browser(self):
         """Initialize Playwright browser with anti-detection measures"""
@@ -115,10 +116,10 @@ class TwitterContentExtractor:
         check_and_install_browser()
 
         if self.browser is None:
-            playwright = await async_playwright().start()
+            self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
-            self.browser = await playwright.chromium.launch(
+            self.browser = await self._playwright.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -171,11 +172,16 @@ class TwitterContentExtractor:
             """)
 
     async def close_browser(self):
-        """Close the browser instance"""
+        """Close the browser instance and cleanup resources"""
         if self.browser:
             await self.browser.close()
             self.browser = None
+        if self.context:
+            await self.context.close()
             self.context = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
 
     async def expand_long_tweet(self, page) -> bool:
         """Click 'Show more' button to expand long tweets"""
@@ -187,18 +193,30 @@ class TwitterContentExtractor:
             'span:has-text("Show more")'
         ]
 
-        for selector in expand_selectors:
-            try:
-                btn = await page.query_selector(selector)
-                if btn:
-                    await btn.click()
-                    await page.wait_for_timeout(1500)
-                    logger.info("Expanded long tweet content")
-                    return True
-            except Exception:
-                continue
+        expanded = False
+        max_attempts = 5  # 最多尝试5次展开
 
-        return False
+        for attempt in range(max_attempts):
+            found_button = False
+            for selector in expand_selectors:
+                try:
+                    btn = await page.query_selector(selector)
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_timeout(1500)
+                        logger.info(
+                            f"Expanded long tweet content (attempt {attempt + 1})"
+                        )
+                        expanded = True
+                        found_button = True
+                        break
+                except Exception:
+                    continue
+
+            if not found_button:
+                break
+
+        return expanded
 
     async def extract_formatted_content(self, page, base_url: str) -> Dict[str, Any]:
         """Extract tweet content with formatting information"""
@@ -208,9 +226,8 @@ class TwitterContentExtractor:
                                      document.querySelector('article [lang]') ||
                                      document.querySelector('article');
 
-                if (!tweetElement) return { text: '', html: '', formats: [], images: [] };
+                if (!tweetElement) return { text: '', html: '', formats: [], images: [], embeddedContent: [] };
 
-                // Extract images
                 const images = [];
                 const imgElements = document.querySelectorAll('[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]');
                 imgElements.forEach(img => {
@@ -224,22 +241,78 @@ class TwitterContentExtractor:
                     }
                 });
 
-                // Extract code blocks
                 const codeBlocks = [];
-                tweetElement.querySelectorAll('code, pre').forEach(c => {
-                    const text = c.textContent;
-                    if (text.includes('\\n') || text.length > 50) {
+                const embeddedContent = [];
+                
+                tweetElement.querySelectorAll('pre').forEach(pre => {
+                    const code = pre.querySelector('code') || pre;
+                    const text = code.textContent.trim();
+                    if (text) {
+                        let language = '';
+                        const codeEl = pre.querySelector('code');
+                        if (codeEl && codeEl.className) {
+                            const langMatch = codeEl.className.match(/language-(\\w+)/);
+                            if (langMatch) language = langMatch[1];
+                        }
+                        
+                        if (!language && text.startsWith('{') && text.endsWith('}')) {
+                            language = 'json';
+                        } else if (!language && text.startsWith('<') && text.endsWith('>')) {
+                            language = 'html';
+                        } else if (!language && (text.includes('function ') || text.includes('const ') || text.includes('let '))) {
+                            language = 'javascript';
+                        } else if (!language && (text.includes('def ') || text.includes('import '))) {
+                            language = 'python';
+                        } else if (!language && text.includes('typescript')) {
+                            language = 'typescript';
+                        } else if (!language && text.includes('markdown')) {
+                            language = 'markdown';
+                        }
+                        
+                        embeddedContent.push({
+                            type: 'code',
+                            text: text,
+                            language: language,
+                            isMultiline: text.includes('\\n') || text.length > 50
+                        });
+                        
                         codeBlocks.push({
                             text: text,
+                            language: language,
                             isMultiline: true
                         });
                     }
                 });
+                
+                tweetElement.querySelectorAll('code').forEach(c => {
+                    if (!c.closest('pre')) {
+                        const text = c.textContent.trim();
+                        if (text && (text.includes('\\n') || text.length > 50)) {
+                            let language = '';
+                            if (c.className) {
+                                const langMatch = c.className.match(/language-(\\w+)/);
+                                if (langMatch) language = langMatch[1];
+                            }
+                            if (!language && text.startsWith('{') && text.endsWith('}')) {
+                                language = 'json';
+                            }
+                            embeddedContent.push({
+                                type: 'code',
+                                text: text,
+                                language: language,
+                                isMultiline: true
+                            });
+                            codeBlocks.push({
+                                text: text,
+                                language: language,
+                                isMultiline: true
+                            });
+                        }
+                    }
+                });
 
-                // Extract formatting information
                 const formats = [];
 
-                // Links
                 tweetElement.querySelectorAll('a').forEach(a => {
                     let href = a.getAttribute('href');
                     const text = a.textContent.trim();
@@ -247,7 +320,6 @@ class TwitterContentExtractor:
                         if (href.startsWith('/')) {
                             href = base + href;
                         }
-                        // Filter out analytics, view counts, etc.
                         if (!href.includes('/analytics') &&
                             !href.includes('/status/') &&
                             !text.match(/^\\d/) &&
@@ -264,7 +336,6 @@ class TwitterContentExtractor:
                     }
                 });
 
-                // Bold text
                 tweetElement.querySelectorAll('strong, b').forEach(b => {
                     const text = b.textContent.trim();
                     if (text && text.length > 1) {
@@ -272,7 +343,6 @@ class TwitterContentExtractor:
                     }
                 });
 
-                // Inline code
                 tweetElement.querySelectorAll('code').forEach(c => {
                     const text = c.textContent.trim();
                     if (text && !c.closest('pre')) {
@@ -283,7 +353,6 @@ class TwitterContentExtractor:
                     }
                 });
 
-                // Italic text
                 tweetElement.querySelectorAll('em, i').forEach(i => {
                     const text = i.textContent.trim();
                     if (text && text.length > 1 && !i.closest('a') && !i.closest('code')) {
@@ -291,7 +360,6 @@ class TwitterContentExtractor:
                     }
                 });
 
-                // Clean text content
                 let text = tweetElement.textContent.trim();
                 text = text.replace(/[\\d,]+\\s*查看/g, '');
                 text = text.replace(/[\\d,]+\\s*views/gi, '');
@@ -311,7 +379,6 @@ class TwitterContentExtractor:
                 text = text.replace(/[·•]\\s*$/g, '');
                 text = text.replace(/\\s+/g, ' ').trim();
 
-                // Clean HTML
                 let html = tweetElement.innerHTML;
                 html = html.replace(/<svg[^>]*>.*?<\\/svg>/gi, '');
                 html = html.replace(/<button[^>]*data-testid="reply"[^>]*>.*?<\\/button>/gi, '');
@@ -326,7 +393,8 @@ class TwitterContentExtractor:
                     html: html,
                     formats: formats,
                     codeBlocks: codeBlocks,
-                    images: images
+                    images: images,
+                    embeddedContent: embeddedContent
                 };
             }
         """, base_url)
@@ -346,20 +414,9 @@ class TwitterContentExtractor:
                 })
 
                 full_text = block['text']
-                if markdown.includes(full_text):
-                    markdown = markdown.replace(full_text, placeholder)
-                else:
-                    first_line = full_text.split('\n')[0]
-                    if first_line in markdown:
-                        start_idx = markdown.index(first_line)
-                        end_idx = start_idx
-                        lines = full_text.split('\n')
-                        for line in lines:
-                            line_idx = markdown.find(line, end_idx)
-                            if line_idx != -1:
-                                end_idx = line_idx + len(line)
-                        if end_idx > start_idx:
-                            markdown = markdown[:start_idx] + placeholder + markdown[end_idx:]
+                markdown = self._replace_code_in_markdown(
+                    markdown, full_text, placeholder
+                )
 
         # Sort formats by text length (longest first) to avoid partial replacements
         sorted_formats = sorted(content.get('formats', []), key=lambda x: len(x.get('text', '')), reverse=True)
@@ -391,6 +448,24 @@ class TwitterContentExtractor:
         for item in code_block_placeholders:
             markdown = markdown.replace(item['placeholder'], item['codeBlock'])
 
+        return markdown
+
+    def _replace_code_in_markdown(self, markdown: str, full_text: str, placeholder: str) -> str:
+        """Replace code text in markdown with placeholder, handling partial matches"""
+        if full_text in markdown:
+            return markdown.replace(full_text, placeholder)
+        else:
+            first_line = full_text.split('\n')[0]
+            if first_line in markdown:
+                start_idx = markdown.index(first_line)
+                end_idx = start_idx
+                lines = full_text.split('\n')
+                for line in lines:
+                    line_idx = markdown.find(line, end_idx)
+                    if line_idx != -1:
+                        end_idx = line_idx + len(line)
+                if end_idx > start_idx:
+                    return markdown[:start_idx] + placeholder + markdown[end_idx:]
         return markdown
 
     async def scrape_tweet(self, url: str) -> Dict[str, Any]:
@@ -564,8 +639,13 @@ class TwitterHandler(PlatformHandler):
 
             # Determine content type based on media
             content_type = ContentType.TEXT
+            html_content = result.get('html', '')
             if result.get('images'):
                 content_type = ContentType.IMAGE
+            # Check for video in HTML content
+            if html_content and ('<video' in html_content or">video</span>" in html_content or
+                                 'data-testid="videoPlayer"' in html_content):
+                content_type = ContentType.VIDEO
 
             # Extract author from URL or title
             author_match = re.search(r'(twitter|x)\.com/(\w+)/status/', url)
@@ -750,6 +830,33 @@ class TwitterHandler(PlatformHandler):
             margin: 15px 0;
             display: block;
         }}
+        .content pre {{
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 15px 0;
+        }}
+        .content pre code {{
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.9em;
+            line-height: 1.5;
+            white-space: pre;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background: none;
+            padding: 0;
+            display: block;
+            tab-size: 4;
+        }}
+        .content code {{
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 0.9em;
+        }}
         .footer {{
             margin-top: 30px;
             padding-top: 15px;
@@ -817,12 +924,12 @@ class TwitterHandler(PlatformHandler):
         for orig_url, local_path in local_images.items():
             html = html.replace(orig_url, local_path)
 
+        html = self._convert_x_code_blocks_to_pre(html)
+
         html = re.sub(r'<section[^>]*>', '', html)
         html = re.sub(r'</section>', '\n\n', html)
         html = re.sub(r'<div[^>]*>', '', html)
         html = re.sub(r'</div>', '\n', html)
-        html = re.sub(r'<span[^>]*>', '', html)
-        html = re.sub(r'</span>', '', html)
         html = re.sub(r'<svg[^>]*>.*?</svg>', '', html, flags=re.DOTALL)
         html = re.sub(r'<button[^>]*>.*?</button>', '', html, flags=re.DOTALL)
         html = re.sub(r'<path[^>]*>.*?</path>', '', html, flags=re.DOTALL)
@@ -845,20 +952,46 @@ class TwitterHandler(PlatformHandler):
             html
         )
 
-        html = re.sub(r'<br\s*/?>', '\n', html)
-        html = re.sub(r'<p[^>]*>', '\n\n', html)
-        html = re.sub(r'</p>', '\n\n', html)
+        html = self._preserve_pre_blocks(html, lambda h: re.sub(r'<br\s*/?>', '\n', h))
+        html = self._preserve_pre_blocks(html, lambda h: re.sub(r'<p[^>]*>', '\n\n', h))
+        html = self._preserve_pre_blocks(html, lambda h: re.sub(r'</p>', '\n\n', h))
 
         html = re.sub(r'<img[^>]*>', r'\n\n\g<0>\n\n', html)
 
         html = re.sub(r'\n\s*\n\s*\n+', '\n\n', html)
-        html = re.sub(r'^\s+', '', html, flags=re.MULTILINE)
+        # 保护pre块后移除行首空白，避免代码缩进丢失
+        html = self._preserve_pre_blocks(
+            html, lambda h: re.sub(r'^\s+', '', h, flags=re.MULTILINE)
+        )
 
         lines = html.split('\n')
         formatted_lines = []
+        in_code_block = False
+        code_block_content = []
+
         for line in lines:
             stripped = line.strip()
             if not stripped:
+                continue
+
+            if stripped.startswith('<pre') and '<code' in stripped:
+                in_code_block = True
+                code_block_content = [stripped]
+                continue
+
+            if in_code_block:
+                # 在代码块内，保留原始行（包括缩进），不调用strip()
+                if '</code></pre>' in stripped or '</pre>' in stripped:
+                    in_code_block = False
+                    code_block_content.append(line)
+                    full_block = '\n'.join(code_block_content)
+                    formatted_lines.append('')
+                    formatted_lines.append(full_block)
+                    formatted_lines.append('')
+                    code_block_content = []
+                else:
+                    # 保留代码块内的原始行，保留缩进
+                    code_block_content.append(line)
                 continue
 
             if stripped.startswith('<h2>') or stripped.startswith('<h3>'):
@@ -866,6 +999,10 @@ class TwitterHandler(PlatformHandler):
                 formatted_lines.append(stripped)
                 formatted_lines.append('')
             elif stripped.startswith('<img'):
+                formatted_lines.append('')
+                formatted_lines.append(stripped)
+                formatted_lines.append('')
+            elif stripped.startswith('<pre'):
                 formatted_lines.append('')
                 formatted_lines.append(stripped)
                 formatted_lines.append('')
@@ -887,6 +1024,112 @@ class TwitterHandler(PlatformHandler):
         result = '\n'.join(formatted_lines)
         result = re.sub(r'\n\s*\n\s*\n+', '\n\n', result)
         return result.strip()
+
+    def _convert_x_code_blocks_to_pre(self, html_content: str) -> str:
+        """Convert X's special code block format to standard pre/code blocks"""
+        import re
+        import html as html_module
+        import json
+
+        def clean_code_content(code_str):
+            """Clean code content by removing HTML tags and unescaping"""
+            code_str = html_module.unescape(code_str)
+            code_str = re.sub(r'<span[^>]*>', '', code_str)
+            code_str = re.sub(r'</span>', '', code_str)
+            code_str = re.sub(r'<[^>]+>', '', code_str)
+            # 只去除每行的首尾空白，但保留行内的缩进
+            lines = code_str.split('\n')
+            cleaned_lines = [line.rstrip() for line in lines]
+            # 去除首尾的空白行，但保留代码块内的缩进
+            while cleaned_lines and not cleaned_lines[0].strip():
+                cleaned_lines.pop(0)
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+            return '\n'.join(cleaned_lines)
+
+        def format_code_with_indent(code_str, language):
+            """Format code with proper indentation based on language"""
+            if language == 'json':
+                try:
+                    parsed = json.loads(code_str)
+                    return json.dumps(parsed, indent=4, ensure_ascii=False)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            lines = code_str.split('\n')
+            formatted_lines = []
+            indent_level = 0
+            indent_str = '    '
+            
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    formatted_lines.append('')
+                    continue
+                
+                close_brackets = sum(1 for c in stripped if c in '}]')
+                open_brackets = sum(1 for c in stripped if c in '{[')
+                
+                if stripped.startswith('}') or stripped.startswith(']'):
+                    indent_level = max(0, indent_level - close_brackets)
+                
+                formatted_lines.append(indent_str * indent_level + stripped)
+                
+                if stripped.endswith('{') or stripped.endswith('['):
+                    indent_level += open_brackets
+                elif open_brackets > close_brackets:
+                    indent_level += (open_brackets - close_brackets)
+            
+            return '\n'.join(formatted_lines)
+
+        def process_pre_code_blocks(html_str):
+            """Process existing pre/code blocks"""
+            result = html_str
+            pattern = r'(<pre[^>]*><code[^>]*class="language-(\w+)"[^>]*>)(.*?)(</code></pre>)'
+            
+            def replace_match(match):
+                lang = match.group(2)
+                code_content = match.group(3)
+                
+                cleaned = clean_code_content(code_content)
+                formatted = format_code_with_indent(cleaned, lang)
+                escaped = html_module.escape(formatted)
+                
+                return f'<pre><code class="language-{lang}">{escaped}</code></pre>'
+            
+            return re.sub(pattern, replace_match, result, flags=re.DOTALL)
+
+        def remove_language_label_before_pre(html_str):
+            """Remove language label <p>json</p> before pre blocks"""
+            pattern = r'<p>(\w+)</p>\s*(<pre[^>]*><code[^>]*class="language-\1"[^>]*>)'
+            return re.sub(pattern, r'\2', html_str)
+
+        html_content = process_pre_code_blocks(html_content)
+        html_content = remove_language_label_before_pre(html_content)
+
+        return html_content
+
+    def _preserve_pre_blocks(self, html_content: str, transform_func) -> str:
+        """Apply transform function while preserving pre blocks"""
+        import re
+
+        pre_blocks = []
+        placeholder_idx = [0]
+
+        def save_pre_block(match):
+            placeholder = f'__PRE_BLOCK_{placeholder_idx[0]}__'
+            pre_blocks.append((placeholder, match.group(0)))
+            placeholder_idx[0] += 1
+            return placeholder
+
+        html_content = re.sub(r'<pre[^>]*>.*?</pre>', save_pre_block, html_content, flags=re.DOTALL)
+
+        html_content = transform_func(html_content)
+
+        for placeholder, block in pre_blocks:
+            html_content = html_content.replace(placeholder, block)
+
+        return html_content
 
     def _generate_markdown(self, result: Dict[str, Any]) -> str:
         """Generate formatted Markdown from scraped tweet data"""

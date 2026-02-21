@@ -32,7 +32,7 @@ async function extractFormattedContent(page, baseUrl) {
                          document.querySelector('article [lang]') ||
                          document.querySelector('article');
 
-    if (!tweetElement) return { text: '', html: '', formats: [], images: [] };
+    if (!tweetElement) return { text: '', html: '', formats: [], images: [], embeddedContent: [] };
 
     const images = [];
     const imgElements = document.querySelectorAll('[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]');
@@ -48,13 +48,64 @@ async function extractFormattedContent(page, baseUrl) {
     });
 
     const codeBlocks = [];
-    tweetElement.querySelectorAll('code, pre').forEach(c => {
-      const text = c.textContent;
-      if (text.includes('\n') || text.length > 50) {
+    const embeddedContent = [];
+    
+    tweetElement.querySelectorAll('pre').forEach(pre => {
+      const code = pre.querySelector('code') || pre;
+      const text = code.textContent.trim();
+      if (text) {
+        let language = '';
+        const codeEl = pre.querySelector('code');
+        if (codeEl && codeEl.className) {
+          const langMatch = codeEl.className.match(/language-(\w+)/);
+          if (langMatch) language = langMatch[1];
+        }
+        
+        if (!language && text.startsWith('{') && text.endsWith('}')) {
+          language = 'json';
+        } else if (!language && text.startsWith('<') && text.endsWith('>')) {
+          language = 'html';
+        } else if (!language && (text.includes('function ') || text.includes('const ') || text.includes('let '))) {
+          language = 'javascript';
+        } else if (!language && (text.includes('def ') || text.includes('import '))) {
+          language = 'python';
+        }
+        
+        embeddedContent.push({
+          type: 'code',
+          text: text,
+          language: language,
+          isMultiline: text.includes('\n') || text.length > 50
+        });
+        
         codeBlocks.push({
           text: text,
+          language: language,
           isMultiline: true
         });
+      }
+    });
+    
+    tweetElement.querySelectorAll('code').forEach(c => {
+      if (!c.closest('pre')) {
+        const text = c.textContent.trim();
+        if (text && (text.includes('\n') || text.length > 50)) {
+          let language = '';
+          if (text.startsWith('{') && text.endsWith('}')) {
+            language = 'json';
+          }
+          embeddedContent.push({
+            type: 'code',
+            text: text,
+            language: language,
+            isMultiline: true
+          });
+          codeBlocks.push({
+            text: text,
+            language: language,
+            isMultiline: true
+          });
+        }
       }
     });
 
@@ -139,7 +190,8 @@ async function extractFormattedContent(page, baseUrl) {
       html: html,
       formats: formats,
       codeBlocks: codeBlocks,
-      images: images
+      images: images,
+      embeddedContent: embeddedContent
     };
   }, baseUrl);
 }
@@ -148,13 +200,47 @@ function convertToMarkdown(content) {
   let markdown = content.text;
 
   const codeBlockPlaceholders = [];
-  if (content.codeBlocks && content.codeBlocks.length > 0) {
+  if (content.embeddedContent && content.embeddedContent.length > 0) {
+    for (let i = 0; i < content.embeddedContent.length; i++) {
+      const item = content.embeddedContent[i];
+      if (item.type === 'code') {
+        const placeholder = `__CODE_BLOCK_${i}__`;
+        const lang = item.language || '';
+        codeBlockPlaceholders.push({
+          placeholder: placeholder,
+          codeBlock: '\n```' + lang + '\n' + item.text + '\n```\n'
+        });
+
+        const fullText = item.text;
+        if (markdown.includes(fullText)) {
+          markdown = markdown.replace(fullText, placeholder);
+        } else {
+          const firstLine = fullText.split('\n')[0];
+          if (markdown.includes(firstLine)) {
+            const startIdx = markdown.indexOf(firstLine);
+            let endIdx = startIdx;
+            const lines = fullText.split('\n');
+            for (const line of lines) {
+              const lineIdx = markdown.indexOf(line, endIdx);
+              if (lineIdx !== -1) {
+                endIdx = lineIdx + line.length;
+              }
+            }
+            if (endIdx > startIdx) {
+              markdown = markdown.substring(0, startIdx) + placeholder + markdown.substring(endIdx);
+            }
+          }
+        }
+      }
+    }
+  } else if (content.codeBlocks && content.codeBlocks.length > 0) {
     for (let i = 0; i < content.codeBlocks.length; i++) {
       const block = content.codeBlocks[i];
       const placeholder = `__CODE_BLOCK_${i}__`;
+      const lang = block.language || '';
       codeBlockPlaceholders.push({
         placeholder: placeholder,
-        codeBlock: '\n```\n' + block.text + '\n```\n'
+        codeBlock: '\n```' + lang + '\n' + block.text + '\n```\n'
       });
 
       const fullText = block.text;
@@ -247,6 +333,19 @@ function saveToLocal(title, content, url, outputDir = '.') {
   processedHtml = processedHtml.replace(/href="\/([^"]+)"/g, `href="https://x.com/$1"`);
   processedHtml = processedHtml.replace(/src="\/([^"]+)"/g, `src="https://x.com/$1"`);
 
+  let embeddedContentHtml = '';
+  if (content.embeddedContent && content.embeddedContent.length > 0) {
+    embeddedContentHtml = `<div class="embedded-content">\n`;
+    for (const item of content.embeddedContent) {
+      if (item.type === 'code') {
+        const lang = item.language || '';
+        const langLabel = lang ? `<span class="code-lang">${lang}</span>` : '';
+        embeddedContentHtml += `<pre class="code-block">${langLabel}<code class="language-${lang || 'text'}">${escapeHtml(item.text)}</code></pre>\n`;
+      }
+    }
+    embeddedContentHtml += `</div>\n`;
+  }
+
   let html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -269,6 +368,14 @@ function saveToLocal(title, content, url, outputDir = '.') {
     .content pre code { background: none; padding: 0; }
     .content strong { font-weight: 700; }
     hr { border: none; border-top: 1px solid #e1e8ed; margin: 20px 0; }
+    .embedded-content { margin: 20px 0; }
+    .code-block { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow-x: auto; margin: 15px 0; position: relative; }
+    .code-block code { font-family: 'SF Mono', Monaco, 'Courier New', monospace; font-size: 0.9em; line-height: 1.5; white-space: pre; }
+    .code-lang { position: absolute; top: 8px; right: 12px; font-size: 0.75em; color: #8b949e; text-transform: uppercase; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+    .language-json .token-string { color: #ce9178; }
+    .language-json .token-number { color: #b5cea8; }
+    .language-json .token-boolean { color: #569cd6; }
+    .language-json .token-null { color: #569cd6; }
   </style>
 </head>
 <body>
@@ -279,6 +386,7 @@ function saveToLocal(title, content, url, outputDir = '.') {
   </div>
   <hr>
   ${imagesHtml}
+  ${embeddedContentHtml}
   <div class="content">${processedHtml}</div>
 </body>
 </html>`;
@@ -287,6 +395,15 @@ function saveToLocal(title, content, url, outputDir = '.') {
   fs.writeFileSync(htmlPath, html, 'utf-8');
 
   return { mdPath, htmlPath };
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 async function scrapeXContent(url, options = {}) {
@@ -422,6 +539,7 @@ async function scrapeXContent(url, options = {}) {
       formats: content.formats,
       codeBlocks: content.codeBlocks,
       images: content.images,
+      embeddedContent: content.embeddedContent || [],
       url: url
     };
 

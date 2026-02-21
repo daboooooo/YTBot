@@ -258,13 +258,18 @@ class TelegramHandler:
                 )
                 return
 
-            # Get platform handler to check if it's YouTube
+            # Get platform handler to check platform type
             handler = self.download_service.platform_manager.get_handler(url)
 
             if handler and handler.name == "YouTube":
                 # For YouTube, ask user to select download type
                 await self._ask_download_type(
                     chat_id, progress_message['message_id'], url, content_info
+                )
+            elif handler and handler.name == "Twitter/X":
+                # For Twitter/X, download as text content
+                await self._proceed_with_download(
+                    chat_id, progress_message['message_id'], url, "text", None
                 )
             else:
                 # For other platforms, download as video by default
@@ -477,7 +482,7 @@ class TelegramHandler:
                 )
                 return
 
-            if handler.name == "Twitter":
+            if handler.name == "Twitter/X":
                 action_text = "正在获取长文"
             elif download_type == "audio":
                 action_text = "正在下载音频"

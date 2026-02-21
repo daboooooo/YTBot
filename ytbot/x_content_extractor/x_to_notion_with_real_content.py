@@ -13,12 +13,15 @@ from notion_client import Client
 def extract_content_with_js(url):
     """使用JavaScript/Node.js脚本提取X内容"""
     try:
+        # 获取当前脚本所在目录
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
         # 运行JavaScript脚本提取内容
         result = subprocess.run(
             ['node', 'x_content_scraper.js', url],
             capture_output=True,
             text=True,
-            cwd='/home/codespace/myopenclaw_local/x_content_extractor',
+            cwd=script_dir,
             timeout=60
         )
 
