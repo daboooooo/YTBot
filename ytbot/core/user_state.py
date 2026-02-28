@@ -20,7 +20,8 @@ class UserState(Enum):
     """User interaction states"""
     IDLE = "idle"  # 空闲状态
     WAITING_DOWNLOAD_TYPE = "waiting_download_type"  # 等待用户选择下载类型
-    WAITING_CONFIRMATION = "waiting_confirmation"  # 等待用户确认
+    WAITING_CONFIRMATION = "waiting_confirmation"  # 等待用户确认（不支持的链接）
+    WAITING_TEXT_CONFIRMATION = "waiting_text_confirmation"  # 等待用户确认（文本内容保存）
     DOWNLOADING = "downloading"  # 下载中
     ERROR = "error"  # 错误状态
 

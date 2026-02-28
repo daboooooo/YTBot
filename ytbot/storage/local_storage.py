@@ -163,18 +163,45 @@ class LocalStorageManager:
                 timestamp = datetime.now().strftime("%H%M%S")
                 target_path = target_dir / f"{name}_{timestamp}{ext}"
 
-            shutil.copy2(html_file, target_path)
+            # Create a directory for this tweet's files
+            # Use the filename (without extension) as directory name
+            tweet_dir = target_path.parent / target_path.stem
+            tweet_dir.mkdir(exist_ok=True)
 
+            # Copy HTML file into the tweet directory
+            html_target = tweet_dir / target_path.name
+            shutil.copy2(html_file, html_target)
+
+            # Update target_path to point to the HTML inside tweet directory
+            target_path = html_target
+
+            # Copy images to tweet directory
             images_source = source_dir / "images"
             if images_source.exists():
-                images_target = target_path.parent / target_path.stem
+                images_target = tweet_dir / "images"
                 images_target.mkdir(exist_ok=True)
 
                 for img_file in images_source.iterdir():
                     if img_file.is_file():
                         shutil.copy2(img_file, images_target / img_file.name)
 
-                logger.info(f"Directory saved to local storage: {target_path} (with images)")
+            # Copy videos to tweet directory
+            videos_source = source_dir / "videos"
+            if videos_source.exists():
+                videos_target = tweet_dir / "videos"
+                videos_target.mkdir(exist_ok=True)
+
+                for video_file in videos_source.iterdir():
+                    if video_file.is_file():
+                        shutil.copy2(video_file, videos_target / video_file.name)
+
+            has_images = images_source.exists()
+            has_videos = videos_source.exists()
+            if has_images or has_videos:
+                logger.info(
+                    f"Directory saved to local storage: {target_path} "
+                    f"(images: {has_images}, videos: {has_videos})"
+                )
             else:
                 logger.info(f"File saved to local storage: {target_path}")
 

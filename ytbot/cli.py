@@ -79,11 +79,12 @@ class YTBot:
         # Initialize ConnectionMonitor
         self.connection_monitor = ConnectionMonitor()
 
-        # Set up service connections for ConnectionMonitor
+        # Set up service connections for ConnectionMonitor with reconnect callback
         if self.telegram_service and self.storage_service:
             self.connection_monitor.set_services(
                 self.telegram_service,
-                self.storage_service.nextcloud_storage
+                self.storage_service.nextcloud_storage,
+                on_reconnect_callback=self._on_telegram_reconnected
             )
         logger.info("✅ ConnectionMonitor initialized")
 
@@ -236,6 +237,31 @@ class YTBot:
         # Store tasks for cleanup
         self.monitoring_tasks = monitoring_tasks
         logger.info(f"📊 Started {len(monitoring_tasks)} monitoring tasks")
+
+    async def _on_telegram_reconnected(self):
+        """Callback when Telegram connection is restored"""
+        logger.info("🔄 Telegram reconnection callback triggered")
+
+        try:
+            # Send notification to admin about reconnection
+            admin_chat_id = CONFIG['telegram'].get('admin_chat_id')
+            if admin_chat_id and self.telegram_service and self.telegram_service.connected:
+                from datetime import datetime
+
+                reconnect_message = (
+                    f"🔄 **Telegram 连接已恢复**\n\n"
+                    f"⏰ 恢复时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"✅ 机器人已重新连接并可以接收消息"
+                )
+
+                await self.telegram_service.send_message(
+                    chat_id=int(admin_chat_id),
+                    text=reconnect_message
+                )
+                logger.info(f"✅ Reconnection notification sent to admin (chat_id: {admin_chat_id})")
+
+        except Exception as e:
+            logger.error(f"❌ Error in reconnection callback: {e}")
 
     async def _send_startup_notification(self):
         """Send startup notification to admin"""

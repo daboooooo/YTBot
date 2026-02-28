@@ -7,9 +7,8 @@ Monitors connectivity to external services (Telegram, Nextcloud, etc.)
 import asyncio
 import time
 import socket
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 
-from ..core.config import CONFIG
 from ..core.logger import get_logger
 from ..services.telegram_service import TelegramService
 from ..storage.nextcloud_storage import NextcloudStorage
@@ -24,9 +23,9 @@ class ConnectionMonitor:
         self.monitoring = False
         self.last_checks: Dict[str, float] = {}
         self.check_intervals = {
-            "telegram": 300,  # 5 minutes
+            "telegram": 60,   # 1 minute - check more frequently for faster reconnection
             "nextcloud": 300,  # 5 minutes
-            "network": 60,    # 1 minute
+            "network": 30,    # 30 seconds
         }
         self.status: Dict[str, bool] = {
             "telegram": False,
@@ -35,11 +34,19 @@ class ConnectionMonitor:
         }
         self.telegram_service: Optional[TelegramService] = None
         self.nextcloud_storage: Optional[NextcloudStorage] = None
+        self._reconnect_in_progress = False
+        self._on_telegram_reconnect: Optional[Callable] = None
 
-    def set_services(self, telegram_service: TelegramService, nextcloud_storage: NextcloudStorage):
+    def set_services(
+        self,
+        telegram_service: TelegramService,
+        nextcloud_storage: NextcloudStorage,
+        on_reconnect_callback: Optional[Callable] = None
+    ):
         """Set the services to monitor"""
         self.telegram_service = telegram_service
         self.nextcloud_storage = nextcloud_storage
+        self._on_telegram_reconnect = on_reconnect_callback
 
     async def start_monitoring(self):
         """Start connection monitoring"""
@@ -71,14 +78,20 @@ class ConnectionMonitor:
             self.last_checks["network"] = current_time
 
         # Check Telegram connection
-        if (self.telegram_service and
-            current_time - self.last_checks.get("telegram", 0) > self.check_intervals["telegram"]):
+        telegram_check_needed = (
+            self.telegram_service and
+            current_time - self.last_checks.get("telegram", 0) > self.check_intervals["telegram"]
+        )
+        if telegram_check_needed:
             await self._check_telegram_connection()
             self.last_checks["telegram"] = current_time
 
         # Check Nextcloud connection
-        if (self.nextcloud_storage and
-            current_time - self.last_checks.get("nextcloud", 0) > self.check_intervals["nextcloud"]):
+        nextcloud_check_needed = (
+            self.nextcloud_storage and
+            current_time - self.last_checks.get("nextcloud", 0) > self.check_intervals["nextcloud"]
+        )
+        if nextcloud_check_needed:
             await self._check_nextcloud_connection()
             self.last_checks["nextcloud"] = current_time
 
@@ -111,29 +124,70 @@ class ConnectionMonitor:
             self.status["network"] = False
 
     async def _check_telegram_connection(self):
-        """Check Telegram connection"""
+        """Check Telegram connection and auto-reconnect if needed"""
         if not self.telegram_service:
             self.status["telegram"] = False
             return
 
+        was_connected = self.status["telegram"]
+
         try:
-            # Check if Telegram service is connected
-            if self.telegram_service.connected:
-                # Try to get bot info as a test
-                bot_info = await self.telegram_service.get_bot_info()
-                if bot_info:
-                    self.status["telegram"] = True
-                    logger.debug("Telegram connection test successful")
-                else:
-                    self.status["telegram"] = False
-                    logger.warning("Telegram connection test failed")
+            # Check if Telegram service is connected and healthy
+            is_healthy = await self.telegram_service.check_connection_health()
+
+            if is_healthy:
+                if not was_connected:
+                    logger.info("✅ Telegram connection restored")
+                self.status["telegram"] = True
+                logger.debug("Telegram connection test successful")
             else:
                 self.status["telegram"] = False
-                logger.warning("Telegram service not connected")
+                logger.warning("Telegram connection test failed")
+
+                # Attempt reconnection if network is available
+                if self.status["network"] and not self._reconnect_in_progress:
+                    await self._attempt_telegram_reconnect()
 
         except Exception as e:
             logger.error(f"Telegram connection check error: {e}")
             self.status["telegram"] = False
+
+            # Attempt reconnection if network is available
+            if self.status["network"] and not self._reconnect_in_progress:
+                await self._attempt_telegram_reconnect()
+
+    async def _attempt_telegram_reconnect(self):
+        """Attempt to reconnect to Telegram servers"""
+        if self._reconnect_in_progress:
+            return
+
+        self._reconnect_in_progress = True
+        logger.info("🔄 Telegram connection lost, attempting reconnection...")
+
+        try:
+            if self.telegram_service:
+                success = await self.telegram_service.reconnect()
+
+                if success:
+                    logger.info("✅ Telegram reconnection successful")
+                    self.status["telegram"] = True
+
+                    # Notify callback if set
+                    if self._on_telegram_reconnect:
+                        try:
+                            await self._on_telegram_reconnect()
+                        except Exception as e:
+                            logger.error(f"Error in reconnect callback: {e}")
+                else:
+                    logger.error("❌ Telegram reconnection failed")
+                    self.status["telegram"] = False
+
+        except Exception as e:
+            logger.error(f"Error during Telegram reconnection: {e}")
+            self.status["telegram"] = False
+
+        finally:
+            self._reconnect_in_progress = False
 
     async def _check_nextcloud_connection(self):
         """Check Nextcloud connection"""

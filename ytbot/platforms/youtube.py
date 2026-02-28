@@ -155,6 +155,11 @@ class YouTubeHandler(PlatformHandler):
                         error_message=f"Downloaded {content_type.value} file not found"
                     )
 
+                # Download subtitles
+                subtitle_files = await self._download_subtitles(url, temp_dir, ydl_opts)
+                if subtitle_files:
+                    logger.info(f"Downloaded subtitles: {subtitle_files}")
+
                 # Create content info
                 content_info = ContentInfo(
                     url=url,
@@ -508,3 +513,78 @@ class YouTubeHandler(PlatformHandler):
                 return files[0]
 
         return None
+
+    async def _download_subtitles(
+        self,
+        url: str,
+        temp_dir: str,
+        original_opts: Dict[str, Any]
+    ) -> List[str]:
+        """
+        Download subtitles for a YouTube video.
+
+        Uses the same configuration parameters as the original download,
+        but adds --all-subs and --skip-download to download only subtitles.
+
+        Args:
+            url: YouTube video URL
+            temp_dir: Temporary directory for downloads
+            original_opts: Original yt-dlp options used for video/audio download
+
+        Returns:
+            List of downloaded subtitle file paths
+        """
+        try:
+            logger.info(f"Attempting to download subtitles for: {url}")
+
+            # Build subtitle download options based on original options
+            subtitle_opts = {
+                'outtmpl': str(Path(temp_dir) / '%(title).50s.%(ext)s'),
+                'quiet': original_opts.get('quiet', True),
+                'no_warnings': original_opts.get('no_warnings', True),
+                'retries': original_opts.get('retries', 3),
+                'fragment_retries': original_opts.get('fragment_retries', 3),
+                'timeout': original_opts.get('timeout', 30),
+                'socket_timeout': original_opts.get('socket_timeout', 30),
+                'http_headers': original_opts.get('http_headers', {}),
+                'ignoreerrors': original_opts.get('ignoreerrors', True),
+                'sleep_interval_requests': original_opts.get('sleep_interval_requests', 2),
+                'sleep_interval': original_opts.get('sleep_interval', 5),
+                'max_sleep_interval': original_opts.get('max_sleep_interval', 30),
+                # Subtitle-specific options
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': [
+                    'en', 'zh', 'zh-CN', 'zh-TW', 'ja', 'ko',
+                    'es', 'fr', 'de', 'ru', 'pt'
+                ],
+                'skip_download': True,  # Don't download video/audio
+            }
+
+            # Add extractor args if present in original options
+            if 'extractor_args' in original_opts:
+                subtitle_opts['extractor_args'] = original_opts['extractor_args']
+
+            downloaded_subtitles = []
+
+            with yt_dlp.YoutubeDL(subtitle_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+
+                if info:
+                    # Find downloaded subtitle files
+                    temp_path = Path(temp_dir)
+                    for ext in ['.srt', '.vtt', '.ttml', '.srv3', '.srv2', '.srv1', '.json3']:
+                        files = list(temp_path.rglob(f'*{ext}'))
+                        for f in files:
+                            downloaded_subtitles.append(str(f))
+
+            if downloaded_subtitles:
+                logger.info(f"Successfully downloaded {len(downloaded_subtitles)} subtitle files")
+            else:
+                logger.info("No subtitles available for this video")
+
+            return downloaded_subtitles
+
+        except Exception as e:
+            logger.warning(f"Failed to download subtitles: {e}")
+            return []

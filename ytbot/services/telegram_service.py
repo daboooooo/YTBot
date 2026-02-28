@@ -4,7 +4,8 @@ Telegram service for YTBot
 Handles Telegram bot communication and message processing.
 """
 
-from typing import Optional, Dict, Any
+import asyncio
+from typing import Optional, Dict, Any, Callable, List
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
 
@@ -22,6 +23,14 @@ class TelegramService:
         self.application: Optional[Application] = None
         self.token = CONFIG['telegram']['token']
         self._connected = False
+        self._handlers_registered = False
+        self._command_handlers: List[tuple] = []
+        self._message_handlers: List[tuple] = []
+        self._callback_handlers: List[Callable] = []
+        self._error_handlers: List[Callable] = []
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 10
+        self._reconnect_delay = 5  # seconds
 
     @log_function_entry_exit(logger)
     async def connect(self) -> bool:
@@ -79,6 +88,123 @@ class TelegramService:
         except Exception as e:
             logger.error(f"❌ Error disconnecting from Telegram: {e}")
             logger.exception("Disconnection error details:")
+
+    @log_function_entry_exit(logger)
+    async def reconnect(self) -> bool:
+        """
+        Reconnect to Telegram servers with automatic retry logic.
+
+        Returns:
+            bool: True if reconnection successful, False otherwise
+        """
+        logger.info("🔄 Starting Telegram reconnection...")
+
+        # Disconnect first if still connected
+        if self._connected or self.application:
+            logger.info("📴 Disconnecting existing connection before reconnect...")
+            await self.disconnect()
+            await asyncio.sleep(1)
+
+        # Attempt reconnection with exponential backoff
+        for attempt in range(1, self._max_reconnect_attempts + 1):
+            self._reconnect_attempts = attempt
+            logger.info(f"🔄 Reconnection attempt {attempt}/{self._max_reconnect_attempts}")
+
+            try:
+                # Try to connect
+                success = await self.connect()
+
+                if success and self.application:
+                    logger.info("✅ Reconnection successful, re-registering handlers...")
+
+                    # Re-register all handlers
+                    await self._reregister_handlers()
+
+                    # Start polling
+                    await self.application.initialize()
+                    await self.application.start()
+                    await self.application.updater.start_polling()
+
+                    logger.info("✅ Telegram reconnection complete, polling restarted")
+                    self._reconnect_attempts = 0
+                    return True
+
+            except Exception as e:
+                logger.error(f"❌ Reconnection attempt {attempt} failed: {e}")
+
+            # Wait before next attempt (exponential backoff)
+            delay = min(self._reconnect_delay * (2 ** (attempt - 1)), 60)
+            logger.info(f"⏳ Waiting {delay} seconds before next reconnection attempt...")
+            await asyncio.sleep(delay)
+
+        logger.error(f"❌ Failed to reconnect after {self._max_reconnect_attempts} attempts")
+        return False
+
+    async def _reregister_handlers(self):
+        """Re-register all previously registered handlers after reconnection."""
+        if not self.application:
+            logger.error("❌ Cannot re-register handlers: application not initialized")
+            return
+
+        logger.info("📝 Re-registering handlers...")
+
+        # Re-register command handlers
+        for command, callback in self._command_handlers:
+            try:
+                self.application.add_handler(CommandHandler(command, callback))
+                logger.debug(f"✅ Re-registered command handler: /{command}")
+            except Exception as e:
+                logger.error(f"❌ Failed to re-register command handler /{command}: {e}")
+
+        # Re-register message handlers
+        for filters, callback in self._message_handlers:
+            try:
+                self.application.add_handler(MessageHandler(filters, callback))
+                logger.debug("✅ Re-registered message handler")
+            except Exception as e:
+                logger.error(f"❌ Failed to re-register message handler: {e}")
+
+        # Re-register callback handlers
+        for callback in self._callback_handlers:
+            try:
+                self.application.add_handler(CallbackQueryHandler(callback))
+                logger.debug("✅ Re-registered callback handler")
+            except Exception as e:
+                logger.error(f"❌ Failed to re-register callback handler: {e}")
+
+        # Re-register error handlers
+        for callback in self._error_handlers:
+            try:
+                self.application.add_error_handler(callback)
+                logger.debug("✅ Re-registered error handler")
+            except Exception as e:
+                logger.error(f"❌ Failed to re-register error handler: {e}")
+
+        logger.info(
+            f"✅ Handlers re-registered: {len(self._command_handlers)} commands, "
+            f"{len(self._message_handlers)} message handlers, "
+            f"{len(self._callback_handlers)} callback handlers, "
+            f"{len(self._error_handlers)} error handlers"
+        )
+        self._handlers_registered = True
+
+    async def check_connection_health(self) -> bool:
+        """
+        Check if the Telegram connection is healthy.
+
+        Returns:
+            bool: True if connection is healthy, False otherwise
+        """
+        if not self.connected or not self.bot:
+            return False
+
+        try:
+            # Try to get bot info as a health check
+            bot_info = await self.bot.get_me()
+            return bot_info is not None
+        except Exception as e:
+            logger.debug(f"Connection health check failed: {e}")
+            return False
 
     @property
     def connected(self) -> bool:
@@ -196,6 +322,9 @@ class TelegramService:
         func_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
         logger.debug(f"Callback function: {func_name}")
 
+        # Store handler for reconnection
+        self._command_handlers.append((command, callback))
+
         if not self.application:
             logger.error("❌ Telegram application not initialized")
             return
@@ -215,6 +344,9 @@ class TelegramService:
         func_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
         logger.debug(f"Callback function: {func_name}")
 
+        # Store handler for reconnection
+        self._message_handlers.append((filters, callback))
+
         if not self.application:
             logger.error("❌ Telegram application not initialized")
             return
@@ -233,6 +365,9 @@ class TelegramService:
         func_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
         logger.debug(f"Callback function: {func_name}")
 
+        # Store handler for reconnection
+        self._callback_handlers.append(callback)
+
         if not self.application:
             logger.error("❌ Telegram application not initialized")
             return
@@ -250,6 +385,9 @@ class TelegramService:
         logger.info("➕ Adding error handler")
         func_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
         logger.debug(f"Error handler function: {func_name}")
+
+        # Store handler for reconnection
+        self._error_handlers.append(callback)
 
         if not self.application:
             logger.error("❌ Telegram application not initialized")

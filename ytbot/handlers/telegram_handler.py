@@ -226,17 +226,411 @@ class TelegramHandler:
             await self._handle_download_type_response(chat_id, message_text)
             return
 
+        if user_state == UserState.WAITING_CONFIRMATION:
+            # User is responding to unsupported format confirmation
+            await self._handle_unsupported_format_response(chat_id, message_text)
+            return
+
+        if user_state == UserState.WAITING_TEXT_CONFIRMATION:
+            # User is responding to text content save confirmation
+            await self._handle_text_save_response(chat_id, message_text)
+            return
+
         # Check if it's a URL we can handle
         if not self.download_service.can_handle_url(message_text):
-            await self.telegram_service.send_message(
-                chat_id=chat_id,
-                text="抱歉，暂不支持该链接。目前支持的平台：\n"
-                     f"{', '.join(self.download_service.get_supported_platforms())}"
-            )
+            # Check if the message looks like a URL
+            if self._is_url(message_text):
+                # Ask user if they want to save the content
+                await self._ask_save_unsupported_content(chat_id, message_text)
+            else:
+                # Not a URL, ask if user wants to save the text content
+                await self._ask_save_text_content(chat_id, message_text)
             return
 
         # Handle the download request
         await self._handle_download_request(chat_id, message_text)
+
+    def _is_url(self, text: str) -> bool:
+        """Check if text is a URL"""
+        import re
+        url_pattern = re.compile(
+            r'^https?://'  # http:// or https://
+            r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain
+            r'localhost|'  # localhost
+            r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or ip
+            r'(?::\d+)?'  # optional port
+            r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+        return bool(url_pattern.match(text))
+
+    async def _ask_save_unsupported_content(self, chat_id: int, url: str):
+        """Ask user if they want to save unsupported URL content"""
+        # Store state data
+        self.state_manager.set_state(
+            chat_id,
+            UserState.WAITING_CONFIRMATION,
+            {
+                'url': url,
+                'action': 'save_unsupported_content'
+            }
+        )
+
+        # Create inline keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ 保存", callback_data="save_content_yes"),
+                InlineKeyboardButton("❌ 忽略", callback_data="save_content_no")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = (
+            f"⚠️ 检测到不支持的链接格式\n\n"
+            f"🔗 {url[:80]}{'...' if len(url) > 80 else ''}\n\n"
+            f"目前支持的平台：\n"
+            f"{', '.join(self.download_service.get_supported_platforms())}\n\n"
+            f"是否需要保存该链接的文本内容到本地？"
+        )
+
+        await self.telegram_service.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            reply_markup=reply_markup
+        )
+
+    async def _handle_unsupported_format_response(self, chat_id: int, message_text: str):
+        """Handle user response for unsupported format"""
+        # Get state data
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 会话已过期，请重新发送链接。"
+            )
+            return
+
+        url = state_data.get('url')
+
+        # Parse user input
+        text_lower = message_text.lower()
+
+        if any(word in text_lower for word in ['是', 'yes', 'y', '保存', 'save', '确认']):
+            await self._save_unsupported_content(chat_id, url)
+        elif any(word in text_lower for word in ['否', 'no', 'n', '忽略', 'ignore', '取消']):
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="已忽略该链接。"
+            )
+        else:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 无效的选择，请输入 '是' 或 '否'。"
+            )
+            return
+
+        # Clear state
+        self.state_manager.clear_state(chat_id)
+
+    async def _ask_save_text_content(self, chat_id: int, text: str):
+        """Ask user if they want to save text content"""
+        # Store state data
+        self.state_manager.set_state(
+            chat_id,
+            UserState.WAITING_TEXT_CONFIRMATION,
+            {
+                'text_content': text,
+                'action': 'save_text_content'
+            }
+        )
+
+        # Create inline keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ 保存", callback_data="save_text_yes"),
+                InlineKeyboardButton("❌ 忽略", callback_data="save_text_no")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Show preview of the text (first 100 characters)
+        preview = text[:100] + "..." if len(text) > 100 else text
+
+        message_text = (
+            f"📝 检测到文本内容\n\n"
+            f"预览：\n```\n{preview}\n```\n\n"
+            f"是否需要保存这段文本内容到本地？"
+        )
+
+        await self.telegram_service.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def _handle_text_save_response(self, chat_id: int, message_text: str):
+        """Handle user response for text content save"""
+        # Get state data
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 会话已过期，请重新发送内容。"
+            )
+            return
+
+        text_content = state_data.get('text_content')
+
+        # Parse user input
+        text_lower = message_text.lower()
+
+        if any(word in text_lower for word in ['是', 'yes', 'y', '保存', 'save', '确认']):
+            await self._save_text_content(chat_id, text_content)
+        elif any(word in text_lower for word in ['否', 'no', 'n', '忽略', 'ignore', '取消']):
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="已忽略该内容。"
+            )
+        else:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 无效的选择，请输入 '是' 或 '否'。"
+            )
+            return
+
+        # Clear state
+        self.state_manager.clear_state(chat_id)
+
+    async def _save_text_content(self, chat_id: int, text: str):
+        """Save text content to HTML file"""
+        try:
+            import os
+            from datetime import datetime
+            from ..core.config import CONFIG
+
+            # Get downloads directory
+            downloads_dir = CONFIG['local_storage']['path']
+            os.makedirs(downloads_dir, exist_ok=True)
+
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"text_content_{timestamp}.html"
+            filepath = os.path.join(downloads_dir, filename)
+
+            # Convert text to HTML with proper formatting
+            html_content = self._generate_text_html(text, timestamp)
+
+            # Save to HTML file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text=f"✅ 已保存文本内容到文件：\n`{filename}`",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to save text content: {e}")
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text=f"❌ 保存失败：{str(e)}"
+            )
+
+    def _generate_text_html(self, text: str, timestamp: str) -> str:
+        """Generate HTML content from text"""
+        import re
+        from datetime import datetime
+
+        # Escape HTML special characters
+        import html
+        escaped_text = html.escape(text)
+
+        # Convert URLs to clickable links
+        url_pattern = r'(https?://[^\s<>"\']+)'
+        escaped_text = re.sub(
+            url_pattern,
+            r'<a href="\1" target="_blank">\1</a>',
+            escaped_text
+        )
+
+        # Convert line breaks to <br> tags
+        escaped_text = escaped_text.replace('\n', '<br>\n')
+
+        # Format the timestamp
+        formatted_time = datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')
+
+        html_template = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>保存的文本内容</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.8;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+
+        .container {{
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }}
+
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+
+        .header h1 {{
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }}
+
+        .header .timestamp {{
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+
+        .content {{
+            padding: 40px;
+            font-size: 16px;
+            line-height: 1.8;
+        }}
+
+        .content a {{
+            color: #667eea;
+            text-decoration: none;
+            border-bottom: 1px solid #667eea;
+        }}
+
+        .content a:hover {{
+            background: rgba(102, 126, 234, 0.1);
+        }}
+
+        .content br {{
+            display: block;
+            margin: 8px 0;
+        }}
+
+        .footer {{
+            background: #f8f9fa;
+            padding: 20px 40px;
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            border-top: 1px solid #e9ecef;
+        }}
+
+        .word-count {{
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-top: 10px;
+        }}
+
+        @media (max-width: 600px) {{
+            body {{
+                padding: 10px;
+            }}
+
+            .header {{
+                padding: 20px;
+            }}
+
+            .header h1 {{
+                font-size: 20px;
+            }}
+
+            .content {{
+                padding: 20px;
+                font-size: 15px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📝 保存的文本内容</h1>
+            <div class="timestamp">保存时间：{formatted_time}</div>
+            <div class="word-count">共 {len(text)} 个字符</div>
+        </div>
+        <div class="content">
+            {escaped_text}
+        </div>
+        <div class="footer">
+            由 YTBot 自动保存
+        </div>
+    </div>
+</body>
+</html>'''
+
+        return html_template
+
+    async def _save_unsupported_content(self, chat_id: int, url: str):
+        """Save unsupported URL content to JSON file"""
+        try:
+            import json
+            import os
+            from datetime import datetime
+            from ..core.config import CONFIG
+
+            # Prepare data to save
+            data = {
+                'url': url,
+                'saved_at': datetime.now().isoformat(),
+                'chat_id': chat_id,
+                'status': 'unsupported_format'
+            }
+
+            # Get downloads directory
+            downloads_dir = CONFIG['local_storage']['path']
+            os.makedirs(downloads_dir, exist_ok=True)
+
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"unsupported_content_{timestamp}.json"
+            filepath = os.path.join(downloads_dir, filename)
+
+            # Save to JSON file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text=f"✅ 已保存链接信息到文件：\n`{filename}`",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to save unsupported content: {e}")
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text=f"❌ 保存失败：{str(e)}"
+            )
 
     async def _handle_download_request(self, chat_id: int, url: str):
         """Handle a download request from user"""
@@ -371,6 +765,14 @@ class TelegramHandler:
         if callback_data in ['download_audio', 'download_video']:
             await self._handle_download_type_callback(chat_id, callback_data, query)
 
+        # Handle unsupported content save confirmation
+        if callback_data in ['save_content_yes', 'save_content_no']:
+            await self._handle_save_content_callback(chat_id, callback_data, query)
+
+        # Handle text content save confirmation
+        if callback_data in ['save_text_yes', 'save_text_no']:
+            await self._handle_save_text_callback(chat_id, callback_data, query)
+
     async def _handle_download_type_callback(
         self,
         chat_id: int,
@@ -408,6 +810,76 @@ class TelegramHandler:
         await self._proceed_with_download(
             chat_id, message_id, url, download_type, content_info
         )
+
+    async def _handle_save_content_callback(
+        self,
+        chat_id: int,
+        callback_data: str,
+        query
+    ):
+        """
+        Handle save content confirmation from callback.
+
+        Args:
+            chat_id: Telegram chat ID
+            callback_data: Callback data string
+            query: Callback query object
+        """
+        # Get state data
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await query.edit_message_text(
+                "❌ 会话已过期，请重新发送链接。"
+            )
+            return
+
+        url = state_data.get('url')
+
+        if callback_data == "save_content_yes":
+            # Save the content
+            await query.edit_message_text("💾 正在保存链接信息...")
+            await self._save_unsupported_content(chat_id, url)
+        else:
+            await query.edit_message_text("❌ 已忽略该链接。")
+
+        # Clear state
+        self.state_manager.clear_state(chat_id)
+
+    async def _handle_save_text_callback(
+        self,
+        chat_id: int,
+        callback_data: str,
+        query
+    ):
+        """
+        Handle save text content confirmation from callback.
+
+        Args:
+            chat_id: Telegram chat ID
+            callback_data: Callback data string
+            query: Callback query object
+        """
+        # Get state data
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await query.edit_message_text(
+                "❌ 会话已过期，请重新发送内容。"
+            )
+            return
+
+        text_content = state_data.get('text_content')
+
+        if callback_data == "save_text_yes":
+            # Save the content
+            await query.edit_message_text("💾 正在保存文本内容...")
+            await self._save_text_content(chat_id, text_content)
+        else:
+            await query.edit_message_text("❌ 已忽略该内容。")
+
+        # Clear state
+        self.state_manager.clear_state(chat_id)
 
     async def _handle_download_type_response(self, chat_id: int, message_text: str):
         """
@@ -483,7 +955,7 @@ class TelegramHandler:
                 return
 
             if handler.name == "Twitter/X":
-                action_text = "正在获取长文"
+                action_text = "正在获取推文"
             elif download_type == "audio":
                 action_text = "正在下载音频"
             else:

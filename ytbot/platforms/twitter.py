@@ -21,6 +21,13 @@ from ytbot.platforms.base import PlatformHandler, ContentInfo, ContentType, Down
 from ytbot.core.logger import get_logger
 from ytbot.services.storage_service import StorageService
 
+# Try to import aiohttp for link preview
+aiohttp = None
+try:
+    import aiohttp
+except ImportError:
+    pass
+
 logger = get_logger(__name__)
 
 # Try to import playwright, provide helpful error if not available
@@ -141,8 +148,12 @@ class TwitterContentExtractor:
             )
 
             # Create context with realistic settings
+            user_agent = (
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
             self.context = await self.browser.new_context(
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                user_agent=user_agent,
                 viewport={'width': 1920, 'height': 1080},
                 timezone_id='Asia/Shanghai',
                 locale='zh-CN,zh;q=0.9,en;q=0.8',
@@ -185,22 +196,44 @@ class TwitterContentExtractor:
 
     async def expand_long_tweet(self, page) -> bool:
         """Click 'Show more' button to expand long tweets"""
-        expand_selectors = [
-            'div[role="button"]:has-text("显示更多")',
-            'div[role="button"]:has-text("Show more")',
-            '[data-testid="tweet-text-show-more-link"]',
-            'span:has-text("显示更多")',
-            'span:has-text("Show more")'
-        ]
-
         expanded = False
         max_attempts = 5  # 最多尝试5次展开
 
         for attempt in range(max_attempts):
             found_button = False
-            for selector in expand_selectors:
-                try:
-                    btn = await page.query_selector(selector)
+            try:
+                # Use JavaScript to find and click the "Show more" button
+                # This avoids Playwright-specific :has-text() selector issues
+                btn_info = await page.evaluate("""
+                    () => {
+                        const buttons = document.querySelectorAll('div[role="button"], span');
+                        for (const btn of buttons) {
+                            const text = btn.textContent.trim();
+                            if (text === '显示更多' || text === 'Show more') {
+                                return {
+                                    found: true,
+                                    text: text,
+                                    xpath: '//div[role="button"][contains(text(),"' + text + '")]'
+                                };
+                            }
+                        }
+                        // Try data-testid selector
+                        const showMoreLink = document.querySelector(
+                            '[data-testid="tweet-text-show-more-link"]'
+                        );
+                        if (showMoreLink) {
+                            return { found: true, text: 'Show more (data-testid)', xpath: null };
+                        }
+                        return { found: false };
+                    }
+                """)
+
+                if btn_info.get('found'):
+                    if btn_info.get('xpath'):
+                        btn = await page.query_selector(f"text={btn_info['text']}")
+                    else:
+                        btn = await page.query_selector('[data-testid="tweet-text-show-more-link"]')
+
                     if btn:
                         await btn.click()
                         await page.wait_for_timeout(1500)
@@ -209,27 +242,527 @@ class TwitterContentExtractor:
                         )
                         expanded = True
                         found_button = True
-                        break
-                except Exception:
-                    continue
 
-            if not found_button:
-                break
+                if not found_button:
+                    break
+
+            except Exception as e:
+                logger.debug(f"Expand attempt {attempt + 1} failed: {e}")
+                continue
 
         return expanded
 
+    async def extract_author_and_time(self, page) -> Dict[str, str]:
+        """
+        Extract author username and publish time from the tweet page.
+
+        Args:
+            page: Playwright page object
+
+        Returns:
+            Dict with 'author' (username with @) and 'timestamp' (ISO format)
+        """
+        result = await page.evaluate("""
+            () => {
+                let author = '';
+                let timestamp = '';
+
+                // Try to extract author from various selectors
+                const authorSelectors = [
+                    'a[href^="/"] > div > span',
+                    'a[role="link"] span',
+                    '[data-testid="User-Name"] a',
+                    'article a[href^="/"]',
+                    'div[data-testid="User-Name"] a',
+                    'a[href*="/status/"]',
+                ];
+
+                for (const selector of authorSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    for (const el of elements) {
+                        const text = el.textContent.trim();
+                        const href = el.getAttribute('href') || '';
+                        // Check if it looks like a username
+                        if (text && (text.startsWith('@') || href.match(/^\/[\w_]+$/))) {
+                            if (text.startsWith('@')) {
+                                author = text;
+                            } else if (href) {
+                                author = '@' + href.replace('/', '');
+                            }
+                            break;
+                        }
+                    }
+                    if (author) break;
+                }
+
+                // Fallback: extract from URL if available
+                if (!author) {
+                    const urlMatch = window.location.pathname.match(/\/(\w+)\/status\//);
+                    if (urlMatch) {
+                        author = '@' + urlMatch[1];
+                    }
+                }
+
+                // Try to extract timestamp from various selectors
+                const timeSelectors = [
+                    'time',
+                    'time[datetime]',
+                    '[data-testid="tweet"] time',
+                    'article time',
+                    'a[href*="/status/"] time',
+                ];
+
+                for (const selector of timeSelectors) {
+                    const timeEl = document.querySelector(selector);
+                    if (timeEl) {
+                        // Try datetime attribute first
+                        const datetime = timeEl.getAttribute('datetime');
+                        if (datetime) {
+                            timestamp = datetime;
+                            break;
+                        }
+                        // Fallback to text content
+                        const text = timeEl.textContent.trim();
+                        if (text) {
+                            timestamp = text;
+                            break;
+                        }
+                    }
+                }
+
+                return {
+                    author: author || 'Unknown',
+                    timestamp: timestamp || ''
+                };
+            }
+        """)
+
+        author = result.get('author')
+        timestamp = result.get('timestamp')
+        logger.info(
+            f"Extracted author: {author}, timestamp: {timestamp}"
+        )
+        return result
+
+    async def detect_post_type(self, page) -> Dict[str, Any]:
+        """
+        Detect if the post is a long article or regular tweet
+
+        Returns:
+            Dict with 'post_type' ('article' or 'regular') and 'article_title' if applicable
+        """
+        result = await page.evaluate("""
+            () => {
+                // Check for article title
+                const articleTitleSelectors = [
+                    '[data-testid="articleTitle"]',
+                    '[data-testid="tweetTitle"]',
+                    'article h2',
+                    'article h1',
+                    '[role="article"] h2',
+                    '[role="article"] h1',
+                    'div[data-testid="cellInnerDiv"] h2',
+                    'div[data-testid="cellInnerDiv"] h1'
+                ];
+
+                let articleTitle = '';
+                for (const selector of articleTitleSelectors) {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        const text = element.textContent.trim();
+                        if (text && text.length > 0 && text.length < 200) {
+                            articleTitle = text;
+                            break;
+                        }
+                    }
+                }
+
+                // Check for article-specific page structure
+                const articleStructureSelectors = [
+                    'article',
+                    '[data-testid="tweetArticle"]',
+                    '[data-testid="longTweet"]',
+                    'div[data-testid="cellInnerDiv"] article'
+                ];
+
+                let hasArticleStructure = false;
+                for (const selector of articleStructureSelectors) {
+                    if (document.querySelector(selector)) {
+                        hasArticleStructure = true;
+                        break;
+                    }
+                }
+
+                // Get tweet text content for length check
+                const tweetTextSelectors = [
+                    '[data-testid="tweetText"]',
+                    'article [lang]',
+                    '[data-testid="tweet"] div[dir="auto"]'
+                ];
+
+                let tweetText = '';
+                for (const selector of tweetTextSelectors) {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        tweetText = element.textContent.trim();
+                        break;
+                    }
+                }
+
+                // Check content length (280 is X's standard tweet limit)
+                const contentLength = tweetText.length;
+                const isLongContent = contentLength > 280;
+
+                // Determine post type
+                // It's an article if:
+                // 1. Has article title, OR
+                // 2. Has article structure AND long content, OR
+                // 3. Has "Show more" button (indicates long-form content)
+                // Check for "Show more" button by iterating elements
+                let hasShowMore = !!document.querySelector(
+                    '[data-testid="tweet-text-show-more-link"]'
+                );
+                if (!hasShowMore) {
+                    const buttons = document.querySelectorAll('div[role="button"]');
+                    for (const btn of buttons) {
+                        const text = btn.textContent.trim();
+                        if (text === 'Show more' || text === '显示更多') {
+                            hasShowMore = true;
+                            break;
+                        }
+                    }
+                }
+
+                let postType = 'regular';
+                const isArticle = articleTitle ||
+                    (hasArticleStructure && isLongContent) ||
+                    (hasShowMore && isLongContent);
+                if (isArticle) {
+                    postType = 'article';
+                }
+
+                return {
+                    post_type: postType,
+                    article_title: articleTitle,
+                    content_length: contentLength,
+                    has_article_structure: hasArticleStructure,
+                    has_show_more: hasShowMore
+                };
+            }
+        """)
+
+        logger.info(
+            f"Detected post type: {result.get('post_type')} "
+            f"(content length: {result.get('content_length')}, "
+            f"has title: {bool(result.get('article_title'))})"
+        )
+
+        return result
+
+    async def detect_video(self, page) -> Dict[str, Any]:
+        """
+        Detect videos in the tweet page using JavaScript.
+
+        Returns:
+            Dict with:
+            - has_video: bool - Whether any video is detected
+            - video_urls: List[str] - List of native video URLs
+            - embedded_videos: List[Dict] - List of embedded video info
+                Each dict contains: type, url, title (if available)
+        """
+        result = await page.evaluate("""
+            () => {
+                const videoUrls = [];
+                const embeddedVideos = [];
+
+                // 1. Check for native X video player
+                const videoPlayer = document.querySelector('[data-testid="videoPlayer"]');
+                const hasNativeVideo = !!videoPlayer;
+
+                // 2. Check for <video> tags
+                const videoElements = document.querySelectorAll('video');
+                videoElements.forEach(video => {
+                    // Get video source
+                    let src = video.getAttribute('src');
+                    if (!src) {
+                        const sourceEl = video.querySelector('source');
+                        if (sourceEl) {
+                            src = sourceEl.getAttribute('src');
+                        }
+                    }
+                    if (src) {
+                        // Skip blob URLs (browser-local, not accessible by yt-dlp)
+                        if (src.startsWith('blob:')) {
+                            return;
+                        }
+                        // Ensure absolute URL
+                        if (src.startsWith('//')) src = 'https:' + src;
+                        else if (src.startsWith('/')) src = window.location.origin + src;
+                        if (!videoUrls.includes(src)) {
+                            videoUrls.push(src);
+                        }
+                    }
+
+                    // Check for poster image as fallback
+                    const poster = video.getAttribute('poster');
+                    if (poster && !poster.startsWith('blob:') && !videoUrls.includes(poster)) {
+                        videoUrls.push(poster);
+                    }
+                });
+
+                // 3. Check for video in media containers
+                const mediaContainers = document.querySelectorAll(
+                    '[data-testid="tweetPhoto"], [data-testid="videoComponent"]'
+                );
+                mediaContainers.forEach(container => {
+                    const videoEl = container.querySelector('video');
+                    if (videoEl) {
+                        let src = videoEl.getAttribute('src');
+                        if (!src) {
+                            const sourceEl = videoEl.querySelector('source');
+                            if (sourceEl) {
+                                src = sourceEl.getAttribute('src');
+                            }
+                        }
+                        if (src) {
+                            if (src.startsWith('//')) src = 'https:' + src;
+                            else if (src.startsWith('/')) src = window.location.origin + src;
+                            if (!videoUrls.includes(src)) {
+                                videoUrls.push(src);
+                            }
+                        }
+                    }
+                });
+
+                // 4. Check for embedded iframes (YouTube, Vimeo, etc.)
+                const iframes = document.querySelectorAll('iframe');
+                iframes.forEach(iframe => {
+                    const src = iframe.getAttribute('src');
+                    if (src) {
+                        // Detect video platform
+                        let platform = null;
+                        let videoId = null;
+
+                        if (src.includes('youtube.com') || src.includes('youtu.be')) {
+                            platform = 'youtube';
+                            // Extract video ID
+                            const match = src.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
+                            if (match) videoId = match[1];
+                        } else if (src.includes('vimeo.com')) {
+                            platform = 'vimeo';
+                            const match = src.match(/vimeo\.com\/(\d+)/);
+                            if (match) videoId = match[1];
+                        } else if (src.includes('tiktok.com')) {
+                            platform = 'tiktok';
+                        } else if (src.includes('dailymotion.com')) {
+                            platform = 'dailymotion';
+                        } else if (src.includes('twitch.tv')) {
+                            platform = 'twitch';
+                        }
+
+                        if (platform) {
+                            embeddedVideos.push({
+                                type: platform,
+                                url: src,
+                                videoId: videoId,
+                                title: iframe.getAttribute('title') || null,
+                                width: iframe.getAttribute('width') || null,
+                                height: iframe.getAttribute('height') || null
+                            });
+                        }
+                    }
+                });
+
+                // 5. Check for video cards/links
+                const cardLinks = document.querySelectorAll(
+                    'a[href*="youtube.com"], a[href*="youtu.be"], a[href*="vimeo.com"]'
+                );
+                cardLinks.forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href) {
+                        let platform = null;
+                        let videoId = null;
+
+                        if (href.includes('youtube.com') || href.includes('youtu.be')) {
+                            platform = 'youtube';
+                            const match = href.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
+                            if (match) videoId = match[1];
+                        } else if (href.includes('vimeo.com')) {
+                            platform = 'vimeo';
+                            const match = href.match(/vimeo\.com\/(\d+)/);
+                            if (match) videoId = match[1];
+                        }
+
+                        if (platform) {
+                            // Check if not already in embeddedVideos
+                            const exists = embeddedVideos.some(v => v.url === href);
+                            if (!exists) {
+                                embeddedVideos.push({
+                                    type: platform,
+                                    url: href,
+                                    videoId: videoId,
+                                    title: link.textContent.trim() || null
+                                });
+                            }
+                        }
+                    }
+                });
+
+                return {
+                    has_video: hasNativeVideo || videoUrls.length > 0 || embeddedVideos.length > 0,
+                    video_urls: videoUrls,
+                    embedded_videos: embeddedVideos
+                };
+            }
+        """)
+
+        logger.info(
+            f"Video detection: has_video={result.get('has_video')}, "
+            f"native_videos={len(result.get('video_urls', []))}, "
+            f"embedded_videos={len(result.get('embedded_videos', []))}"
+        )
+
+        return result
+
+    async def extract_external_links(self, page, base_url: str) -> List[Dict[str, str]]:
+        """
+        Extract external links from the tweet page.
+
+        Filters out:
+        - twitter.com, x.com domain links
+        - Internal anchor links (starting with #)
+        - javascript: links
+
+        Args:
+            page: Playwright page object
+            base_url: Base URL for resolving relative links
+
+        Returns:
+            List of dicts with 'text' and 'url' keys
+        """
+        links = await page.evaluate("""
+            (base) => {
+                const links = [];
+                const anchorElements = document.querySelectorAll('a');
+
+                anchorElements.forEach(a => {
+                    let href = a.getAttribute('href') || '';
+                    const text = a.textContent.trim();
+
+                    // Skip empty links
+                    if (!href || !text) return;
+
+                    // Resolve relative URLs
+                    if (href.startsWith('/')) {
+                        href = base + href;
+                    } else if (href.startsWith('//')) {
+                        href = 'https:' + href;
+                    }
+
+                    // Parse URL to check domain
+                    let urlObj;
+                    try {
+                        urlObj = new URL(href);
+                    } catch (e) {
+                        return; // Invalid URL
+                    }
+
+                    // Filter out twitter/x domains
+                    const hostname = urlObj.hostname.toLowerCase();
+                    if (hostname.includes('twitter.com') ||
+                        hostname.includes('x.com') ||
+                        hostname.includes('mobile.twitter.com')) {
+                        return;
+                    }
+
+                    // Filter out anchor-only links
+                    if (href.startsWith('#')) return;
+
+                    // Filter out javascript: links
+                    if (href.toLowerCase().startsWith('javascript:')) return;
+
+                    // Filter out analytics and intent links
+                    if (href.includes('/analytics') ||
+                        href.includes('/intent/') ||
+                        href.includes('twitter.com/intent')) return;
+
+                    // Filter out view counts and engagement metrics
+                    if (text.match(/^\\d/) ||
+                        text.match(/^[\\d,]+查看$/) ||
+                        text.match(/^[\\d,]+ views$/i) ||
+                        text.match(/^[\\d,]+$/) ||
+                        text.length <= 1) return;
+
+                    links.push({
+                        text: text,
+                        url: href
+                    });
+                });
+
+                // Remove duplicates based on URL
+                const seen = new Set();
+                return links.filter(link => {
+                    if (seen.has(link.url)) return false;
+                    seen.add(link.url);
+                    return true;
+                });
+            }
+        """, base_url)
+
+        logger.info(f"Extracted {len(links)} external links")
+        return links
+
     async def extract_formatted_content(self, page, base_url: str) -> Dict[str, Any]:
-        """Extract tweet content with formatting information"""
-        return await page.evaluate("""
+        """Extract tweet content with formatting information and post type detection"""
+        # First detect post type
+        post_type_info = await self.detect_post_type(page)
+
+        # Detect videos
+        video_info = await self.detect_video(page)
+
+        content_result = await page.evaluate("""
             (base) => {
                 const tweetElement = document.querySelector('[data-testid="tweetText"]') ||
                                      document.querySelector('article [lang]') ||
                                      document.querySelector('article');
 
-                if (!tweetElement) return { text: '', html: '', formats: [], images: [], embeddedContent: [] };
+                if (!tweetElement) {
+                    return {
+                        text: '',
+                        html: '',
+                        formats: [],
+                        images: [],
+                        embeddedContent: [],
+                        articleTitle: ''
+                    };
+                }
+
+                // Extract article title if present
+                let articleTitle = '';
+                const titleSelectors = [
+                    '[data-testid="articleTitle"]',
+                    '[data-testid="tweetTitle"]',
+                    'article h2',
+                    'article h1',
+                    '[role="article"] h2',
+                    '[role="article"] h1'
+                ];
+                for (const selector of titleSelectors) {
+                    const el = document.querySelector(selector);
+                    if (el) {
+                        const text = el.textContent.trim();
+                        if (text && text.length > 0 && text.length < 200) {
+                            articleTitle = text;
+                            break;
+                        }
+                    }
+                }
 
                 const images = [];
-                const imgElements = document.querySelectorAll('[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]');
+                const imageMetadata = [];
+                const imgElements = document.querySelectorAll(
+                    '[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]'
+                );
                 imgElements.forEach(img => {
                     let src = img.getAttribute('src') || img.getAttribute('data-src');
                     if (src) {
@@ -237,13 +770,21 @@ class TwitterContentExtractor:
                         else if (src.startsWith('/')) src = base + src;
                         if (!images.includes(src)) {
                             images.push(src);
+                            // Extract image metadata
+                            const metadata = {
+                                url: src,
+                                width: img.naturalWidth || null,
+                                height: img.naturalHeight || null,
+                                alt: img.getAttribute('alt') || null
+                            };
+                            imageMetadata.push(metadata);
                         }
                     }
                 });
 
                 const codeBlocks = [];
                 const embeddedContent = [];
-                
+
                 tweetElement.querySelectorAll('pre').forEach(pre => {
                     const code = pre.querySelector('code') || pre;
                     const text = code.textContent.trim();
@@ -254,28 +795,30 @@ class TwitterContentExtractor:
                             const langMatch = codeEl.className.match(/language-(\\w+)/);
                             if (langMatch) language = langMatch[1];
                         }
-                        
+
                         if (!language && text.startsWith('{') && text.endsWith('}')) {
                             language = 'json';
                         } else if (!language && text.startsWith('<') && text.endsWith('>')) {
                             language = 'html';
-                        } else if (!language && (text.includes('function ') || text.includes('const ') || text.includes('let '))) {
+                        } else if (!language && (text.includes('function ') ||
+                                    text.includes('const ') || text.includes('let '))) {
                             language = 'javascript';
-                        } else if (!language && (text.includes('def ') || text.includes('import '))) {
+                        } else if (!language && (text.includes('def ') ||
+                                    text.includes('import '))) {
                             language = 'python';
                         } else if (!language && text.includes('typescript')) {
                             language = 'typescript';
                         } else if (!language && text.includes('markdown')) {
                             language = 'markdown';
                         }
-                        
+
                         embeddedContent.push({
                             type: 'code',
                             text: text,
                             language: language,
                             isMultiline: text.includes('\\n') || text.length > 50
                         });
-                        
+
                         codeBlocks.push({
                             text: text,
                             language: language,
@@ -283,7 +826,7 @@ class TwitterContentExtractor:
                         });
                     }
                 });
-                
+
                 tweetElement.querySelectorAll('code').forEach(c => {
                     if (!c.closest('pre')) {
                         const text = c.textContent.trim();
@@ -394,10 +937,38 @@ class TwitterContentExtractor:
                     formats: formats,
                     codeBlocks: codeBlocks,
                     images: images,
-                    embeddedContent: embeddedContent
+                    embeddedContent: embeddedContent,
+                    articleTitle: articleTitle
                 };
             }
         """, base_url)
+
+        # Merge post type information with content result
+        content_result['post_type'] = post_type_info.get('post_type', 'regular')
+        art_title = content_result.get('articleTitle')
+        post_type_title = post_type_info.get('article_title', '')
+        content_result['article_title'] = art_title or post_type_title
+
+        # Add video information
+        content_result['has_video'] = video_info.get('has_video', False)
+        content_result['video_urls'] = video_info.get('video_urls', [])
+        content_result['embedded_videos'] = video_info.get('embedded_videos', [])
+
+        # Add image-related fields
+        images = content_result.get('images', [])
+        content_result['has_images'] = len(images) > 0
+        content_result['image_metadata'] = content_result.get('imageMetadata', [])
+
+        # Calculate media count (images + native videos)
+        video_count = len(video_info.get('video_urls', []))
+        image_count = len(images)
+        content_result['media_count'] = image_count + video_count
+
+        # Extract external links
+        external_links = await self.extract_external_links(page, base_url)
+        content_result['external_links'] = external_links
+
+        return content_result
 
     def convert_to_markdown(self, content: Dict[str, Any]) -> str:
         """Convert extracted content to Markdown format"""
@@ -419,7 +990,11 @@ class TwitterContentExtractor:
                 )
 
         # Sort formats by text length (longest first) to avoid partial replacements
-        sorted_formats = sorted(content.get('formats', []), key=lambda x: len(x.get('text', '')), reverse=True)
+        sorted_formats = sorted(
+            content.get('formats', []),
+            key=lambda x: len(x.get('text', '')),
+            reverse=True
+        )
 
         # Apply formatting
         for format_item in sorted_formats:
@@ -484,8 +1059,12 @@ class TwitterContentExtractor:
 
         try:
             # Set HTTP headers
+            accept_header = (
+                'text/html,application/xhtml+xml,application/xml;q=0.9,'
+                'image/webp,image/apng,*/*;q=0.8'
+            )
             await page.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept': accept_header,
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
@@ -551,6 +1130,12 @@ class TwitterContentExtractor:
                     except Exception:
                         continue
 
+            # Extract author and timestamp
+            author_time_info = await self.extract_author_and_time(page)
+            author = author_time_info.get('author', '')
+            timestamp = author_time_info.get('timestamp', '')
+
+            # Build result with post type information
             result = {
                 'success': True,
                 'title': title or 'X Post',
@@ -559,10 +1144,31 @@ class TwitterContentExtractor:
                 'formats': content.get('formats', []),
                 'codeBlocks': content.get('codeBlocks', []),
                 'images': content.get('images', []),
-                'url': url
+                'url': url,
+                'post_type': content.get('post_type', 'regular'),
+                'article_title': content.get('article_title', ''),
+                'external_links': content.get('external_links', []),
+                'has_video': content.get('has_video', False),
+                'video_urls': content.get('video_urls', []),
+                'embedded_videos': content.get('embedded_videos', []),
+                'author': author,
+                'timestamp': timestamp
             }
 
-            logger.info(f"Successfully extracted tweet content ({len(result['content'])} chars, {len(result['images'])} images)")
+            # Log post type for debugging
+            post_type = result['post_type']
+            article_title = result['article_title']
+            if post_type == 'article':
+                logger.info(
+                    f"Successfully extracted article content "
+                    f"({len(result['content'])} chars, {len(result['images'])} images, "
+                    f"title: {article_title or 'N/A'})"
+                )
+            else:
+                logger.info(
+                    f"Successfully extracted tweet content "
+                    f"({len(result['content'])} chars, {len(result['images'])} images)"
+                )
 
             await page.close()
             return result
@@ -589,6 +1195,200 @@ class TwitterHandler(PlatformHandler):
         ]
         self.extractor = TwitterContentExtractor()
         self.storage_service = StorageService()
+
+    async def fetch_link_preview(self, url: str) -> Dict[str, Optional[str]]:
+        """
+        Fetch link preview information (Open Graph tags) for a given URL.
+
+        Args:
+            url: The URL to fetch preview for
+
+        Returns:
+            Dict with 'title', 'description', and 'image' keys (values may be None)
+        """
+        if aiohttp is None:
+            logger.warning("aiohttp not installed, cannot fetch link preview")
+            return {'title': None, 'description': None, 'image': None}
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    ),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                }) as response:
+                    if response.status != 200:
+                        logger.warning(f"Failed to fetch link preview: HTTP {response.status}")
+                        return {'title': None, 'description': None, 'image': None}
+
+                    html = await response.text()
+
+                    # Parse Open Graph tags
+                    result = {'title': None, 'description': None, 'image': None}
+
+                    # og:title
+                    title_pat = (
+                        r'<meta[^>]*property=["\']og:title["\'][^>]*'
+                        r'content=["\']([^"\']+)["\']'
+                    )
+                    title_match = re.search(title_pat, html, re.IGNORECASE)
+                    if not title_match:
+                        title_pat2 = (
+                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                            r'property=["\']og:title["\']'
+                        )
+                        title_match = re.search(title_pat2, html, re.IGNORECASE)
+                    if title_match:
+                        result['title'] = title_match.group(1).strip()
+
+                    # og:description
+                    desc_pat = (
+                        r'<meta[^>]*property=["\']og:description["\'][^>]*'
+                        r'content=["\']([^"\']+)["\']'
+                    )
+                    desc_match = re.search(desc_pat, html, re.IGNORECASE)
+                    if not desc_match:
+                        desc_pat2 = (
+                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                            r'property=["\']og:description["\']'
+                        )
+                        desc_match = re.search(desc_pat2, html, re.IGNORECASE)
+                    if desc_match:
+                        result['description'] = desc_match.group(1).strip()
+
+                    # og:image
+                    img_pat = (
+                        r'<meta[^>]*property=["\']og:image["\'][^>]*'
+                        r'content=["\']([^"\']+)["\']'
+                    )
+                    image_match = re.search(img_pat, html, re.IGNORECASE)
+                    if not image_match:
+                        img_pat2 = (
+                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                            r'property=["\']og:image["\']'
+                        )
+                        image_match = re.search(img_pat2, html, re.IGNORECASE)
+                    if image_match:
+                        result['image'] = image_match.group(1).strip()
+
+                    has_title = result['title'] is not None
+                    logger.info(f"Fetched link preview for {url}: title={has_title}")
+                    return result
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching link preview for {url}")
+            return {'title': None, 'description': None, 'image': None}
+        except Exception as e:
+            logger.warning(f"Error fetching link preview for {url}: {e}")
+            return {'title': None, 'description': None, 'image': None}
+
+    def generate_title(
+        self,
+        post_type: str,
+        content: str,
+        author: str,
+        external_links: List[Dict[str, Any]],
+        has_video: bool,
+        article_title: str = ""
+    ) -> str:
+        """
+        Generate a smart title based on post type and content.
+
+        Args:
+            post_type: 'article' or 'regular'
+            content: The post content text
+            author: The post author
+            external_links: List of external links in the post
+            has_video: Whether the post contains video
+            article_title: The article title (for article type)
+
+        Returns:
+            Generated title string
+        """
+        if post_type == 'article' and article_title:
+            return self.clean_title(article_title)
+
+        # For regular posts
+        title = ""
+
+        if content and content.strip():
+            # Extract first sentence (split by 。!?)
+            delimiters = r'[。！？\.\!?]'
+            sentences = re.split(delimiters, content.strip())
+            first_sentence = sentences[0].strip() if sentences else ""
+
+            if first_sentence:
+                # Limit to 30 characters
+                if len(first_sentence) > 30:
+                    title = first_sentence[:30]
+                else:
+                    title = first_sentence
+            else:
+                # If no sentence delimiter found, take first 30 chars
+                title = content.strip()[:30]
+        else:
+            # Empty content, use {@author} - {date} format
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            title = f"{author} - {date_str}"
+
+        # Add markers
+        markers = []
+        if has_video:
+            markers.append("[含视频]")
+        if external_links:
+            markers.append("[含链接]")
+
+        if markers:
+            title = f"{' '.join(markers)} {title}"
+
+        return self.clean_title(title)
+
+    def clean_title(self, title: str) -> str:
+        """
+        Clean and normalize the title.
+
+        - Remove newlines and extra spaces
+        - Keep Chinese/English characters, numbers, common punctuation
+        - Remove emoji and special symbols
+        - Max 50 characters, add ellipsis if truncated
+
+        Args:
+            title: Raw title string
+
+        Returns:
+            Cleaned title string
+        """
+        if not title:
+            return ""
+
+        # Remove newlines and normalize spaces
+        cleaned = title.replace('\n', ' ').replace('\r', ' ')
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        # Keep only allowed characters:
+        # - Chinese characters (\u4e00-\u9fff)
+        # - English letters (a-zA-Z)
+        # - Numbers (0-9)
+        # - Common punctuation: ，。！？、：""''
+        # - Spaces
+        # - Square brackets for markers: [ ]
+        allowed_pattern = (
+            r'[^\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9\s，。！？、：""''\[\]]'  # noqa: W605
+        )
+        cleaned = re.sub(allowed_pattern, '', cleaned)
+
+        # Normalize spaces again
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        # Truncate to 50 characters and add ellipsis if needed
+        max_length = 50
+        if len(cleaned) > max_length:
+            cleaned = cleaned[:max_length - 1] + "…"
+
+        return cleaned
 
     def can_handle(self, url: str) -> bool:
         """Check if this handler can process the given URL"""
@@ -640,30 +1440,59 @@ class TwitterHandler(PlatformHandler):
             # Determine content type based on media
             content_type = ContentType.TEXT
             html_content = result.get('html', '')
+            has_video = False
             if result.get('images'):
                 content_type = ContentType.IMAGE
             # Check for video in HTML content
-            if html_content and ('<video' in html_content or">video</span>" in html_content or
+            if html_content and ('<video' in html_content or
+                                 ">video</span>" in html_content or
                                  'data-testid="videoPlayer"' in html_content):
                 content_type = ContentType.VIDEO
+                has_video = True
 
             # Extract author from URL or title
             author_match = re.search(r'(twitter|x)\.com/(\w+)/status/', url)
             author = f"@{author_match.group(2)}" if author_match else "Unknown"
 
+            # Get post type and article title from result
+            post_type = result.get('post_type', 'regular')
+            article_title = result.get('article_title', '')
+            content = result.get('content', '')
+            formats = result.get('formats', [])
+
+            # Extract external links from formats
+            external_links = [
+                fmt for fmt in formats
+                if fmt.get('type') == 'link'
+            ]
+
+            # Generate smart title
+            generated_title = self.generate_title(
+                post_type=post_type,
+                content=content,
+                author=author,
+                external_links=external_links,
+                has_video=has_video,
+                article_title=article_title
+            )
+
             return ContentInfo(
                 url=url,
-                title=result.get('title', 'Tweet'),
-                description=result.get('content', '')[:200],
+                title=generated_title,
+                description=content[:200],
                 content_type=content_type,
                 uploader=author,
                 upload_date=datetime.now().strftime('%Y-%m-%d'),
                 metadata={
                     'tweet_id': tweet_id,
                     'images': result.get('images', []),
-                    'formats': result.get('formats', []),
-                    'full_content': result.get('content'),
-                    'html': result.get('html')
+                    'formats': formats,
+                    'full_content': content,
+                    'html': html_content,
+                    'post_type': post_type,
+                    'article_title': article_title,
+                    'has_video': has_video,
+                    'external_links': external_links
                 }
             )
 
@@ -688,9 +1517,10 @@ class TwitterHandler(PlatformHandler):
             result = await self.extractor.scrape_tweet(url)
 
             if not result.get('success'):
+                err_msg = result.get('error', 'Failed to scrape tweet')
                 return DownloadResult(
                     success=False,
-                    error_message=result.get('error', 'Failed to scrape tweet')
+                    error_message=err_msg
                 )
 
             if progress_callback:
@@ -700,6 +1530,7 @@ class TwitterHandler(PlatformHandler):
             images_dir = os.path.join(temp_dir, 'images')
             os.makedirs(images_dir, exist_ok=True)
 
+            # Download images
             images = result.get('images', [])
             local_images = {}
             if images:
@@ -710,12 +1541,57 @@ class TwitterHandler(PlatformHandler):
                     })
                 local_images = await self._download_images(images, images_dir)
 
+            # Download videos if present
+            video_urls = result.get('video_urls', [])
+            local_videos = []
+            has_video = result.get('has_video', False)
+            # Download videos if detected (regardless of content_type)
+            if has_video:
+                if progress_callback:
+                    await progress_callback({
+                        "status": "downloading_videos",
+                        "progress": 70
+                    })
+                videos_dir = os.path.join(temp_dir, 'videos')
+                os.makedirs(videos_dir, exist_ok=True)
+
+                # Filter out blob URLs (browser-local, not accessible by yt-dlp)
+                valid_video_urls = [
+                    url for url in video_urls
+                    if url and not url.startswith('blob:')
+                ]
+
+                # If we have valid video URLs, use them
+                # Otherwise, use the tweet URL itself for yt-dlp to extract
+                if valid_video_urls:
+                    for video_url in valid_video_urls:
+                        video_path = await self.download_video(
+                            video_url, videos_dir
+                        )
+                        if video_path:
+                            local_videos.append(video_path)
+                            logger.info(f"Video saved to: {video_path}")
+                else:
+                    # Use the original tweet URL to download video
+                    logger.info(
+                        f"No valid video URLs, using tweet URL: {url}"
+                    )
+                    video_path = await self.download_video(url, videos_dir)
+                    if video_path:
+                        local_videos.append(video_path)
+                        logger.info(f"Video saved to: {video_path}")
+
+                # Log videos directory contents
+                if os.path.exists(videos_dir):
+                    video_files = os.listdir(videos_dir)
+                    logger.info(f"Videos in {videos_dir}: {video_files}")
+
             tweet_id = self.extract_tweet_id(url) or 'unknown'
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"tweet_{tweet_id}_{timestamp}.html"
             temp_file = os.path.join(temp_dir, filename)
 
-            html_content = self._generate_html(result, local_images)
+            html_content = self._generate_html(result, local_images, local_videos)
             with open(temp_file, 'w', encoding='utf-8') as f:
                 f.write(html_content)
 
@@ -724,19 +1600,64 @@ class TwitterHandler(PlatformHandler):
             if progress_callback:
                 await progress_callback({"status": "completed", "progress": 100})
 
-            author_match = re.search(r'(twitter|x)\.com/(\w+)/status/', url)
-            author = f"@{author_match.group(2)}" if author_match else "Unknown"
+            # Extract author
+            author = result.get('author', '')
+            if not author:
+                author_match = re.search(r'(twitter|x)\.com/(\w+)/status/', url)
+                author = f"@{author_match.group(2)}" if author_match else "Unknown"
+
+            # Get post type and generate title
+            post_type = result.get('post_type', 'regular')
+            article_title = result.get('article_title', '')
+            content_text = result.get('content', '')
+            has_video = result.get('has_video', False)
+            external_links = result.get('external_links', [])
+
+            # Generate smart title
+            generated_title = self.generate_title(
+                post_type=post_type,
+                content=content_text,
+                author=author,
+                external_links=external_links,
+                has_video=has_video,
+                article_title=article_title
+            )
+
+            # Determine content type based on media
+            actual_content_type = ContentType.TEXT
+            if result.get('has_video') or local_videos:
+                actual_content_type = ContentType.VIDEO
+            elif result.get('images') or local_images:
+                actual_content_type = ContentType.IMAGE
+
+            # Build complete metadata
+            metadata = {
+                'tweet_id': tweet_id,
+                'images': list(local_images.values()),
+                'videos': local_videos,
+                'formats': result.get('formats', []),
+                'full_content': content_text,
+                'html': result.get('html', ''),
+                'post_type': post_type,
+                'article_title': article_title,
+                'has_video': has_video,
+                'video_urls': video_urls,
+                'embedded_videos': result.get('embedded_videos', []),
+                'external_links': external_links,
+                'author': author,
+                'timestamp': result.get('timestamp', ''),
+                'local_images': local_images,
+                'local_videos': local_videos
+            }
 
             content_info = ContentInfo(
                 url=url,
-                title=result.get('title', 'Tweet'),
-                description=result.get('content', '')[:200],
-                content_type=ContentType.TEXT,
+                title=generated_title,
+                description=content_text[:200],
+                content_type=actual_content_type,
                 uploader=author,
                 upload_date=datetime.now().strftime('%Y-%m-%d'),
-                metadata={
-                    'images': list(local_images.values())
-                }
+                metadata=metadata
             )
 
             return DownloadResult(
@@ -753,51 +1674,319 @@ class TwitterHandler(PlatformHandler):
                 error_message=str(e)
             )
 
-    def _generate_html(self, result: Dict[str, Any], local_images: Dict[str, str] = None) -> str:
-        """Generate HTML file with original formatting preserved"""
-        title = result.get('title', 'X Post')
+    def _generate_html(
+        self,
+        result: Dict[str, Any],
+        local_images: Dict[str, Any] = None,
+        local_videos: List[str] = None
+    ) -> str:
+        """
+        Generate HTML file with unified template.
+
+        Template structure:
+        - Header: different styles for article vs regular posts
+        - Body: content with preserved formatting
+        - Media section: images with local paths, video players
+        - External links section: clickable cards
+        """
+        # Get basic info
+        post_type = result.get('post_type', 'regular')
+        article_title = result.get('article_title', '')
         url = result.get('url', '')
-        timestamp = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
         content = result.get('content', '')
         html_content = result.get('html', '')
         local_images = local_images or {}
+        local_videos = local_videos or []
 
+        # Determine title based on post type
+        if post_type == 'article' and article_title:
+            display_title = article_title
+        else:
+            display_title = result.get('title', 'X Post')
+
+        # Get author and publish time
+        author = result.get('author', '')
+        if not author:
+            author_match = re.search(
+                r'(twitter|x)\.com/(\w+)/status/', url
+            )
+            author = f"@{author_match.group(2)}" if author_match else "@unknown"
+
+        publish_time = result.get('publish_time', '')
+        if not publish_time:
+            publish_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Get media info
+        images = result.get('images', [])
+        video_urls = result.get('video_urls', [])
+        embedded_videos = result.get('embedded_videos', [])
+        external_links = result.get('external_links', [])
+
+        # Build header HTML based on post type
+        if post_type == 'article' and article_title:
+            header_html = f'''
+    <div class="header article-header">
+        <span class="post-type-badge article">Article</span>
+        <h1>{display_title}</h1>
+        <div class="meta">
+            <p class="author">作者: {author}</p>
+            <p class="time">发布时间: {publish_time}</p>
+            <p class="source">原文: <a href="{url}" target="_blank">{url}</a></p>
+        </div>
+    </div>'''
+        else:
+            header_html = f'''
+    <div class="header regular-header">
+        <span class="post-type-badge regular">Post</span>
+        <h1>{display_title}</h1>
+        <div class="meta">
+            <p class="author">作者: {author}</p>
+            <p class="time">发布时间: {publish_time}</p>
+            <p class="source">原文: <a href="{url}" target="_blank">{url}</a></p>
+        </div>
+    </div>'''
+
+        # Build content HTML
+        if html_content:
+            clean_content = self._clean_html_content(html_content, local_images)
+        else:
+            clean_content = f'<p>{content}</p>'
+
+        # Build media section HTML
+        media_html = ''
+        has_media = images or video_urls or embedded_videos
+        if has_media:
+            media_html = '\n    <div class="media-section">\n        <h2>媒体</h2>\n'
+
+            # Images with local paths or original URLs
+            if images:
+                media_html += '        <div class="images-grid">\n'
+                for i, img_url in enumerate(images, 1):
+                    # Use local path if available, otherwise original URL
+                    if img_url in local_images:
+                        img_info = local_images[img_url]
+                        img_path = img_info.get('local_path', img_url)
+                        alt_text = img_info.get('alt', f'图片 {i}')
+                    else:
+                        img_path = img_url
+                        alt_text = f'图片 {i}'
+                    media_html += (
+                        f'            <div class="image-item">\n'
+                        f'                <img src="{img_path}" '
+                        f'alt="{alt_text}" loading="lazy">\n'
+                        f'                <span class="image-label">图片 {i}</span>\n'
+                        f'            </div>\n'
+                    )
+                media_html += '        </div>\n'
+
+            # Native videos with player
+            # Use local videos if available, otherwise use original URLs
+            videos_to_show = local_videos if local_videos else video_urls
+            if videos_to_show:
+                media_html += '        <div class="videos-section">\n'
+                for i, video_path in enumerate(videos_to_show, 1):
+                    # Get just the filename for display
+                    if '/' in video_path:
+                        video_filename = os.path.basename(video_path)
+                    else:
+                        video_filename = video_path
+                    media_html += (
+                        f'            <div class="video-item">\n'
+                        f'                <h3>视频 {i}</h3>\n'
+                        f'                <video controls preload="metadata">\n'
+                        f'                    <source src="videos/{video_filename}" '
+                        f'type="video/mp4">\n'
+                        f'                    您的浏览器不支持视频播放。\n'
+                        f'                </video>\n'
+                        f'            </div>\n'
+                    )
+                media_html += '        </div>\n'
+
+            # Embedded videos (YouTube, Vimeo, etc.)
+            if embedded_videos:
+                media_html += '        <div class="embedded-videos-section">\n'
+                for video in embedded_videos:
+                    platform = video.get('type', 'video')
+                    video_url = video.get('url', '')
+                    video_title = video.get('title', '')
+                    video_id = video.get('videoId', '')
+
+                    media_html += (
+                        '            <div class="embedded-video-item">\n'
+                        f'                <h3>嵌入视频 ({platform})</h3>\n'
+                    )
+
+                    # Generate embed code based on platform
+                    if platform == 'youtube' and video_id:
+                        embed_url = (
+                            f"https://www.youtube.com/embed/{video_id}"
+                        )
+                        media_html += (
+                            '                <div class="video-embed">\n'
+                            f'                    <iframe src="{embed_url}" '
+                            'frameborder="0" allowfullscreen '
+                            f'title="{video_title or "YouTube video"}">'
+                            '</iframe>\n'
+                            '                </div>\n'
+                        )
+                    elif platform == 'vimeo' and video_id:
+                        embed_url = (
+                            f"https://player.vimeo.com/video/{video_id}"
+                        )
+                        media_html += (
+                            '                <div class="video-embed">\n'
+                            f'                    <iframe src="{embed_url}" '
+                            'frameborder="0" allowfullscreen '
+                            f'title="{video_title or "Vimeo video"}">'
+                            '</iframe>\n'
+                            '                </div>\n'
+                        )
+                    else:
+                        # Fallback: show as link
+                        media_html += (
+                            f'                <p><a href="{video_url}" '
+                            'target="_blank">'
+                            f'{video_title or video_url}</a></p>\n'
+                        )
+
+                    media_html += '            </div>\n'
+                media_html += '        </div>\n'
+
+            media_html += '    </div>\n'
+
+        # Build external links section HTML
+        links_html = ''
+        if external_links:
+            links_html = '\n    <div class="links-section">\n        <h2>外部链接</h2>\n'
+            links_html += '        <div class="links-list">\n'
+
+            for link in external_links:
+                link_text = link.get('text', '')
+                link_url = link.get('url', '')
+                preview = link.get('preview', {})
+                preview_title = preview.get('title', '')
+                preview_desc = preview.get('description', '')
+                preview_image = preview.get('image', '')
+
+                links_html += (
+                    f'            <a href="{link_url}" '
+                    'target="_blank" class="link-card">\n'
+                )
+
+                if preview_image:
+                    links_html += (
+                        '                <div class="link-image">\n'
+                        f'                    <img src="{preview_image}" '
+                        'alt="" loading="lazy">\n'
+                        '                </div>\n'
+                    )
+
+                links_html += '                <div class="link-content">\n'
+
+                if preview_title:
+                    links_html += (
+                        '                    <h3 class="link-title">'
+                        f'{preview_title}</h3>\n'
+                    )
+                elif link_text:
+                    links_html += (
+                        '                    <h3 class="link-title">'
+                        f'{link_text}</h3>\n'
+                    )
+
+                if preview_desc:
+                    desc = preview_desc[:150] + "..." if len(
+                        preview_desc
+                    ) > 150 else preview_desc
+                    links_html += (
+                        '                    <p class="link-description">'
+                        f'{desc}</p>\n'
+                    )
+
+                links_html += (
+                    '                    <span class="link-url">'
+                    f'{link_url}</span>\n'
+                )
+                links_html += '                </div>\n'
+                links_html += '            </a>\n'
+
+            links_html += '        </div>\n    </div>\n'
+
+        # Build full HTML document
         html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
+    <title>{display_title}</title>
     <style>
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         Helvetica, Arial, sans-serif;
             max-width: 800px;
             margin: 0 auto;
             padding: 20px;
             line-height: 1.8;
-            background-color: #fff;
+            background-color: #f7f9fa;
             color: #0f1419;
         }}
         .header {{
-            border-bottom: 1px solid #e1e8ed;
-            padding-bottom: 15px;
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
             margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .article-header {{
+            border-left: 4px solid #1d9bf0;
+        }}
+        .regular-header {{
+            border-left: 4px solid #00ba7c;
+        }}
+        .post-type-badge {{
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.75em;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+        }}
+        .post-type-badge.article {{
+            background: #e8f5fe;
+            color: #1d9bf0;
+        }}
+        .post-type-badge.regular {{
+            background: #e0f7ed;
+            color: #00ba7c;
         }}
         .header h1 {{
-            font-size: 1.4em;
-            margin: 0 0 10px 0;
+            font-size: 1.5em;
+            margin: 0 0 16px 0;
             line-height: 1.3;
+            color: #0f1419;
         }}
         .meta {{
             color: #536471;
             font-size: 0.9em;
         }}
+        .meta p {{
+            margin: 4px 0;
+        }}
         .meta a {{
             color: #1d9bf0;
             text-decoration: none;
         }}
+        .meta a:hover {{
+            text-decoration: underline;
+        }}
         .content {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
             font-size: 1.05em;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }}
         .content p {{
             margin: 0 0 1em 0;
@@ -818,6 +2007,9 @@ class TwitterHandler(PlatformHandler):
             color: #1d9bf0;
             text-decoration: none;
         }}
+        .content a:hover {{
+            text-decoration: underline;
+        }}
         .content strong {{
             font-weight: 600;
         }}
@@ -826,7 +2018,7 @@ class TwitterHandler(PlatformHandler):
         }}
         .content img {{
             max-width: 100%;
-            border-radius: 16px;
+            border-radius: 12px;
             margin: 15px 0;
             display: block;
         }}
@@ -857,31 +2049,148 @@ class TwitterHandler(PlatformHandler):
             font-family: 'SF Mono', Monaco, monospace;
             font-size: 0.9em;
         }}
+        .media-section {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .media-section h2 {{
+            font-size: 1.2em;
+            margin: 0 0 16px 0;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #e1e8ed;
+        }}
+        .images-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }}
+        .image-item {{
+            position: relative;
+        }}
+        .image-item img {{
+            width: 100%;
+            height: auto;
+            border-radius: 12px;
+            object-fit: cover;
+        }}
+        .image-label {{
+            display: block;
+            margin-top: 8px;
+            font-size: 0.85em;
+            color: #536471;
+        }}
+        .videos-section, .embedded-videos-section {{
+            margin-top: 20px;
+        }}
+        .video-item, .embedded-video-item {{
+            margin-bottom: 20px;
+        }}
+        .video-item h3, .embedded-video-item h3 {{
+            font-size: 1em;
+            margin: 0 0 12px 0;
+            color: #536471;
+        }}
+        .video-item video {{
+            width: 100%;
+            max-height: 500px;
+            border-radius: 12px;
+        }}
+        .video-embed {{
+            position: relative;
+            padding-bottom: 56.25%;
+            height: 0;
+            overflow: hidden;
+            border-radius: 12px;
+        }}
+        .video-embed iframe {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }}
+        .links-section {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .links-section h2 {{
+            font-size: 1.2em;
+            margin: 0 0 16px 0;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #e1e8ed;
+        }}
+        .links-list {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .link-card {{
+            display: flex;
+            gap: 16px;
+            padding: 16px;
+            border: 1px solid #e1e8ed;
+            border-radius: 12px;
+            text-decoration: none;
+            color: inherit;
+            transition: background-color 0.2s;
+        }}
+        .link-card:hover {{
+            background-color: #f7f9fa;
+        }}
+        .link-image {{
+            flex-shrink: 0;
+            width: 100px;
+            height: 100px;
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        .link-image img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }}
+        .link-content {{
+            flex: 1;
+            min-width: 0;
+        }}
+        .link-title {{
+            font-size: 1em;
+            font-weight: 600;
+            margin: 0 0 8px 0;
+            color: #0f1419;
+        }}
+        .link-description {{
+            font-size: 0.9em;
+            color: #536471;
+            margin: 0 0 8px 0;
+            line-height: 1.5;
+        }}
+        .link-url {{
+            font-size: 0.85em;
+            color: #1d9bf0;
+        }}
         .footer {{
-            margin-top: 30px;
-            padding-top: 15px;
-            border-top: 1px solid #e1e8ed;
+            text-align: center;
+            padding: 20px;
             color: #536471;
             font-size: 0.85em;
         }}
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>{title}</h1>
-        <div class="meta">
-            <p>原始链接: <a href="{url}" target="_blank">{url}</a></p>
-            <p>提取时间: {timestamp}</p>
-        </div>
+{header_html}
+    <div class="content">
+{clean_content}
     </div>
-'''
-        clean_content = self._clean_html_content(html_content, local_images) if html_content else content
-
-        html += '    <div class="content">\n'
-        html += clean_content + '\n'
-        html += '    </div>\n'
-
-        html += '''    <div class="footer">
+{media_html}{links_html}    <div class="footer">
         <p>由 YTBot 自动提取</p>
     </div>
 </body>
@@ -889,40 +2198,228 @@ class TwitterHandler(PlatformHandler):
 
         return html
 
-    async def _download_images(self, image_urls: list, images_dir: str) -> Dict[str, str]:
-        """Download images to local directory"""
-        import aiohttp
+    def _detect_image_extension(self, img_url: str, content_type: str = None) -> str:
+        """
+        Detect image extension from URL and content type.
 
+        Supports: webp, png, jpg, jpeg, gif
+
+        Args:
+            img_url: The image URL
+            content_type: HTTP Content-Type header
+                (optional)
+
+        Returns:
+            File extension including the dot (e.g., '.jpg')
+        """
+        # Check URL patterns first
+        url_lower = img_url.lower()
+
+        # Check for format parameter in URL
+        if 'format=webp' in url_lower or 'format=web' in url_lower:
+            return '.webp'
+        if 'format=png' in url_lower:
+            return '.png'
+        if 'format=jpg' in url_lower or 'format=jpeg' in url_lower:
+            return '.jpg'
+        if 'format=gif' in url_lower:
+            return '.gif'
+
+        # Check file extension in URL path
+        import re
+        ext_match = re.search(r'\.(webp|png|jpe?g|gif)(?:\?|#|$)', url_lower)
+        if ext_match:
+            ext = ext_match.group(1)
+            if ext == 'jpeg':
+                return '.jpg'
+            return f'.{ext}'
+
+        # Check content type if available
+        if content_type:
+            ct_lower = content_type.lower()
+            if 'webp' in ct_lower:
+                return '.webp'
+            if 'png' in ct_lower:
+                return '.png'
+            if 'gif' in ct_lower:
+                return '.gif'
+            if 'jpeg' in ct_lower or 'jpg' in ct_lower:
+                return '.jpg'
+
+        # Default to jpg
+        return '.jpg'
+
+    async def _download_images(
+        self,
+        image_urls: list,
+        images_dir: str,
+        image_metadata: List[Dict] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Download images to local directory with metadata.
+
+        Args:
+            image_urls: List of image URLs to download
+            images_dir: Directory to save images
+            image_metadata: Optional list of image metadata dicts
+
+        Returns:
+            Dict mapping original URL to dict with:
+                - local_path: Relative path to saved image
+                - filename: Saved filename
+                - size: File size in bytes
+                - width: Image width (if available)
+                - height: Image height (if available)
+                - format: Image format
+        """
         local_images = {}
+        metadata_map = {}
+        if image_metadata:
+            for meta in image_metadata:
+                url = meta.get('url')
+                if url:
+                    metadata_map[url] = meta
+
         async with aiohttp.ClientSession() as session:
             for i, img_url in enumerate(image_urls):
                 try:
-                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with session.get(img_url, timeout=timeout) as response:
                         if response.status == 200:
                             content = await response.read()
-                            ext = '.jpg'
-                            if 'format=png' in img_url:
-                                ext = '.png'
-                            elif 'format=webp' in img_url:
-                                ext = '.webp'
-                            local_filename = f'image_{i+1}{ext}'
+                            content_type = response.headers.get('Content-Type', '')
+
+                            # Detect extension from URL and content type
+                            ext = self._detect_image_extension(img_url, content_type)
+
+                            # Use sequential naming: image_1.jpg, image_2.png, etc.
+                            local_filename = f'image_{i + 1}{ext}'
                             local_path = os.path.join(images_dir, local_filename)
+
                             with open(local_path, 'wb') as f:
                                 f.write(content)
-                            local_images[img_url] = f'images/{local_filename}'
-                            logger.info(f"Downloaded image: {local_filename}")
+
+                            # Build result with metadata
+                            file_size = len(content)
+                            meta = metadata_map.get(img_url, {})
+
+                            local_images[img_url] = {
+                                'local_path': f'images/{local_filename}',
+                                'filename': local_filename,
+                                'size': file_size,
+                                'width': meta.get('width'),
+                                'height': meta.get('height'),
+                                'format': ext.lstrip('.'),
+                                'alt': meta.get('alt')
+                            }
+
+                            logger.info(
+                                f"Downloaded image {i + 1}/{len(image_urls)}: "
+                                f"{local_filename} ({file_size} bytes)"
+                            )
                 except Exception as e:
                     logger.warning(f"Failed to download image {img_url}: {e}")
 
         return local_images
 
-    def _clean_html_content(self, html: str, local_images: Dict[str, str] = None) -> str:
+    async def download_video(self, video_url: str, output_path: str) -> Optional[str]:
+        """
+        Download X/Twitter native video using yt-dlp.
+
+        Args:
+            video_url: The video URL to download
+            output_path: Directory to save the video
+
+        Returns:
+            Path to the downloaded video file, or None if download failed
+        """
+        try:
+            # Check if yt-dlp is available
+            try:
+                import yt_dlp
+            except ImportError:
+                logger.error(
+                    "yt-dlp not installed. Cannot download videos. "
+                    "Install with: pip install yt-dlp"
+                )
+                return None
+
+            # Ensure output directory exists
+            os.makedirs(output_path, exist_ok=True)
+
+            # Generate output filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_template = os.path.join(
+                output_path, f'video_{timestamp}.%(ext)s'
+            )
+
+            # Configure yt-dlp options
+            ydl_opts = {
+                'format': 'best',  # Download best quality
+                'outtmpl': output_template,
+                'quiet': True,
+                'no_warnings': True,
+                'cookiesfrombrowser': None,  # Don't use browser cookies
+                'http_headers': {
+                    'User-Agent': (
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/120.0.0.0 Safari/537.36'
+                    ),
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
+            }
+
+            # Skip blob URLs (browser-local, not accessible by yt-dlp)
+            if video_url.startswith('blob:'):
+                logger.warning(f"Skipping blob URL (not accessible): {video_url}")
+                return None
+
+            logger.info(f"Starting video download: {video_url}")
+
+            # Download video
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                if info:
+                    # Get the actual downloaded file path
+                    filename = ydl.prepare_filename(info)
+                    logger.info(f"yt-dlp prepared filename: {filename}")
+                    logger.info(f"Output directory: {output_path}")
+                    logger.info(f"Directory contents: {os.listdir(output_path)}")
+                    if os.path.exists(filename):
+                        logger.info(f"Video downloaded successfully: {filename}")
+                        return filename
+                    else:
+                        # Try to find the file with actual extension
+                        base_path = filename.rsplit('.', 1)[0]
+                        for ext in ['.mp4', '.webm', '.mkv', '.mov']:
+                            alt_path = base_path + ext
+                            if os.path.exists(alt_path):
+                                logger.info(
+                                    f"Video downloaded successfully: {alt_path}"
+                                )
+                                return alt_path
+
+            logger.error(f"Video download failed: {video_url}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error downloading video {video_url}: {e}")
+            return None
+
+    def _clean_html_content(self, html: str, local_images: Dict[str, Any] = None) -> str:
         """Clean HTML content and extract meaningful text with formatting"""
         import re
         local_images = local_images or {}
 
         for orig_url, local_path in local_images.items():
-            html = html.replace(orig_url, local_path)
+            # Handle both Dict[str, str] and Dict[str, Dict] formats
+            if isinstance(local_path, dict):
+                path_value = local_path.get('local_path', orig_url)
+            else:
+                path_value = local_path
+            html = html.replace(orig_url, path_value)
 
         html = self._convert_x_code_blocks_to_pre(html)
 
@@ -1132,23 +2629,46 @@ class TwitterHandler(PlatformHandler):
         return html_content
 
     def _generate_markdown(self, result: Dict[str, Any]) -> str:
-        """Generate formatted Markdown from scraped tweet data"""
-        title = result.get('title', 'X Post')
-        url = result.get('url', '')
-        timestamp = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+        """
+        Generate formatted Markdown from scraped tweet data using unified template.
 
+        Template structure:
+        - Header: title, author, publish time, original URL, post type
+        - Body: content with preserved formatting
+        - Media section: images and videos
+        - External links section: links with preview info
+        """
+        # Get basic info
+        post_type = result.get('post_type', 'regular')
+        article_title = result.get('article_title', '')
+        url = result.get('url', '')
+
+        # Determine title based on post type
+        if post_type == 'article' and article_title:
+            title = article_title
+        else:
+            title = result.get('title', 'X Post')
+
+        # Get author and publish time from metadata
+        author = result.get('author', '')
+        if not author:
+            # Fallback: extract from URL
+            author_match = re.search(r'(twitter|x)\.com/(\w+)/status/', url)
+            author = f"@{author_match.group(2)}" if author_match else "@unknown"
+
+        publish_time = result.get('publish_time', '')
+        if not publish_time:
+            publish_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Build header section
         markdown = f"# {title}\n\n"
-        markdown += f"> 原始链接: {url}\n"
-        markdown += f"> 提取时间: {timestamp}\n\n"
+        markdown += f"> 作者: {author}\n"
+        markdown += f"> 时间: {publish_time}\n"
+        markdown += f"> 原文: {url}\n"
+        markdown += f"> 类型: {post_type}\n\n"
         markdown += "---\n\n"
 
-        images = result.get('images', [])
-        if images:
-            markdown += "## 图片\n\n"
-            for img_url in images:
-                markdown += f"![图片]({img_url})\n\n"
-            markdown += "---\n\n"
-
+        # Build body content
         html_content = result.get('html', '')
         if html_content:
             formatted_content = self._html_to_markdown(html_content)
@@ -1165,6 +2685,73 @@ class TwitterHandler(PlatformHandler):
                 formatted_content = ''
 
         markdown += formatted_content
+        markdown += "\n\n---\n\n"
+
+        # Build media section
+        images = result.get('images', [])
+        video_urls = result.get('video_urls', [])
+        embedded_videos = result.get('embedded_videos', [])
+
+        has_media = images or video_urls or embedded_videos
+        if has_media:
+            markdown += "## 媒体\n\n"
+
+            # Images
+            if images:
+                for i, img_url in enumerate(images, 1):
+                    markdown += f"**图片 {i}**: ![图片 {i}]({img_url})\n\n"
+
+            # Native videos
+            if video_urls:
+                for i, video_url in enumerate(video_urls, 1):
+                    markdown += f"**视频 {i}**: [{video_url}]({video_url})\n\n"
+
+            # Embedded videos (YouTube, Vimeo, etc.)
+            if embedded_videos:
+                for video in embedded_videos:
+                    platform = video.get('type', 'video')
+                    video_url = video.get('url', '')
+                    video_title = video.get('title', '')
+                    if video_title:
+                        markdown += f"**嵌入视频 ({platform})**: "
+                        markdown += f"[{video_title}]({video_url})\n\n"
+                    else:
+                        markdown += f"**嵌入视频 ({platform})**: "
+                        markdown += f"[{video_url}]({video_url})\n\n"
+
+            markdown += "\n"
+
+        # Build external links section
+        external_links = result.get('external_links', [])
+        if external_links:
+            markdown += "## 外部链接\n\n"
+
+            for link in external_links:
+                link_text = link.get('text', '')
+                link_url = link.get('url', '')
+
+                if link_text and link_url:
+                    markdown += f"- [{link_text}]({link_url})\n"
+                elif link_url:
+                    markdown += f"- [{link_url}]({link_url})\n"
+
+                # Add preview info if available
+                preview = link.get('preview', {})
+                if preview:
+                    preview_title = preview.get('title', '')
+                    preview_desc = preview.get('description', '')
+                    if preview_title:
+                        markdown += f"  - 标题: {preview_title}\n"
+                    if preview_desc:
+                        # Truncate description if too long
+                        if len(preview_desc) > 100:
+                            desc = preview_desc[:100] + "..."
+                        else:
+                            desc = preview_desc
+                        markdown += f"  - 描述: {desc}\n"
+
+            markdown += "\n"
+
         return markdown
 
     def _html_to_markdown(self, html: str) -> str:
