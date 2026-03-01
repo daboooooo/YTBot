@@ -661,9 +661,9 @@ class TelegramHandler:
                     chat_id, progress_message['message_id'], url, content_info
                 )
             elif handler and handler.name == "Twitter/X":
-                # For Twitter/X, download as text content
-                await self._proceed_with_download(
-                    chat_id, progress_message['message_id'], url, "text", None
+                # For Twitter/X, show friendly preview and download as text content
+                await self._handle_twitter_download(
+                    chat_id, progress_message['message_id'], url, handler
                 )
             else:
                 # For other platforms, download as video by default
@@ -676,6 +676,73 @@ class TelegramHandler:
             await self.telegram_service.send_message(
                 chat_id=chat_id,
                 text="❌ 处理请求时发生错误，请稍后重试。"
+            )
+
+    async def _handle_twitter_download(
+        self,
+        chat_id: int,
+        message_id: int,
+        url: str,
+        handler
+    ):
+        """
+        Handle Twitter/X download with friendly preview message.
+
+        Args:
+            chat_id: Telegram chat ID
+            message_id: Message ID to update
+            url: Twitter/X URL
+            handler: Twitter handler instance
+        """
+        try:
+            # First, get content info to show preview
+            from ..platforms.twitter import TwitterContentExtractor
+
+            extractor = TwitterContentExtractor()
+
+            # Show initial message
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="🔍 正在分析 Twitter/X 内容..."
+            )
+
+            # Get content info
+            result = await extractor.scrape_tweet(url)
+
+            if not result.get('success'):
+                await self.telegram_service.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="❌ 无法获取推文内容，请检查链接是否有效。"
+                )
+                await extractor.close_browser()
+                return
+
+            # Generate friendly preview message
+            preview_text = handler.generate_telegram_preview(result, is_processing=True)
+
+            # Update message with preview
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=preview_text
+            )
+
+            # Close browser after getting info
+            await extractor.close_browser()
+
+            # Proceed with download
+            await self._proceed_with_download(
+                chat_id, message_id, url, "text", None
+            )
+
+        except Exception as e:
+            logger.error(f"Twitter download handling error: {e}")
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"❌ 处理 Twitter/X 链接时出错: {str(e)}"
             )
 
     async def _ask_download_type(

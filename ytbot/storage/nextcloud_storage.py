@@ -7,7 +7,7 @@ Provides Nextcloud WebDAV integration for cloud storage.
 import os
 import time
 from webdav3.client import Client as NextcloudClient
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 from ..core.config import CONFIG
 from ..core.logger import get_logger
@@ -116,6 +116,110 @@ class NextcloudStorage:
                     return None
 
         return None
+
+    def upload_directory(self, local_dir: str, remote_dir: str) -> Dict[str, Any]:
+        """
+        Upload a directory and all its contents to Nextcloud
+
+        Args:
+            local_dir: Local directory path
+            remote_dir: Remote directory path in Nextcloud
+
+        Returns:
+            dict: Upload result with 'success', 'file_url', 'uploaded_files', 'errors'
+        """
+        result = {
+            "success": False,
+            "file_url": None,
+            "uploaded_files": [],
+            "errors": []
+        }
+
+        if not self.client:
+            logger.error("Nextcloud client not connected")
+            result["errors"].append("Nextcloud client not connected")
+            return result
+
+        if not os.path.isdir(local_dir):
+            error_msg = f"Local directory does not exist: {local_dir}"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            return result
+
+        try:
+            # Ensure remote directory exists
+            self._ensure_directory_exists(remote_dir)
+
+            # Find HTML file (main file)
+            html_files = [f for f in os.listdir(local_dir) if f.endswith('.html')]
+            if not html_files:
+                error_msg = f"No HTML file found in directory: {local_dir}"
+                logger.error(error_msg)
+                result["errors"].append(error_msg)
+                return result
+
+            main_html = html_files[0]
+            uploaded_files = []
+            errors = []
+
+            # Walk through directory and upload all files
+            for root, dirs, files in os.walk(local_dir):
+                # Calculate relative path from local_dir
+                rel_root = os.path.relpath(root, local_dir)
+                if rel_root == '.':
+                    rel_root = ''
+
+                # Create corresponding remote directory
+                if rel_root:
+                    current_remote_dir = f"{remote_dir}/{rel_root}"
+                    self._ensure_directory_exists(current_remote_dir)
+
+                # Upload files in current directory
+                for file in files:
+                    local_file_path = os.path.join(root, file)
+                    if rel_root:
+                        remote_file_path = f"{remote_dir}/{rel_root}/{file}"
+                    else:
+                        remote_file_path = f"{remote_dir}/{file}"
+
+                    try:
+                        logger.info(f"Uploading: {local_file_path} -> {remote_file_path}")
+                        self.client.upload_sync(
+                            remote_path=remote_file_path,
+                            local_path=local_file_path
+                        )
+                        uploaded_files.append(remote_file_path)
+                        logger.info(f"Successfully uploaded: {file}")
+                    except Exception as e:
+                        error_msg = f"Failed to upload {file}: {e}"
+                        logger.error(error_msg)
+                        errors.append(error_msg)
+
+            # Build main HTML file URL
+            base_url = CONFIG['nextcloud']['url'].rstrip('/')
+            main_html_remote = f"{remote_dir}/{main_html}"
+            file_url = (f"{base_url}/remote.php/dav/files/"
+                       f"{CONFIG['nextcloud']['username']}{main_html_remote}")
+
+            result.update({
+                "success": len(errors) == 0 or main_html in [os.path.basename(f) for f in uploaded_files],
+                "file_url": file_url,
+                "uploaded_files": uploaded_files,
+                "errors": errors
+            })
+
+            if errors:
+                logger.warning(f"Directory upload completed with {len(errors)} errors")
+            else:
+                logger.info(f"Directory upload completed successfully: {file_url}")
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Directory upload failed: {e}"
+            logger.error(error_msg)
+            result["errors"].append(error_msg)
+            return result
 
     def _ensure_directory_exists(self, remote_dir: str):
         """Ensure remote directory exists, create if necessary"""

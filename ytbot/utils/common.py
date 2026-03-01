@@ -128,12 +128,13 @@ def safe_truncate_filename(filename: str, max_bytes: int = 64) -> str:
     return f"{truncated_name}{ext}"
 
 
-def sanitize_filename(filename: str) -> str:
+def sanitize_filename(filename: str, max_bytes: int = 120) -> str:
     """
     Sanitize filename by removing invalid characters and limiting length
 
     Args:
         filename: Original filename
+        max_bytes: Maximum bytes for filename (default 120 for Nextcloud compatibility)
 
     Returns:
         str: Sanitized filename
@@ -144,10 +145,9 @@ def sanitize_filename(filename: str) -> str:
     # Remove non-printable characters
     sanitized = ''.join(char for char in sanitized if ord(char) >= 32)
 
-    # Limit filename length
-    if len(sanitized) > 200:
-        name, ext = Path(sanitized).stem, Path(sanitized).suffix
-        sanitized = f"{name[:200 - len(ext)]}{ext}"
+    # Limit filename length to max_bytes (for Nextcloud compatibility)
+    # Nextcloud has a limit of 128 bytes for filenames
+    sanitized = safe_truncate_filename(sanitized, max_bytes)
 
     return sanitized
 

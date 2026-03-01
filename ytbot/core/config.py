@@ -102,6 +102,13 @@ CACHE_RETRY_INTERVAL = get_env_int_or_default("CACHE_RETRY_INTERVAL", 300)
 # Security Configuration
 CHECK_CERTIFICATE = get_env_bool_or_default("CHECK_CERTIFICATE", False)
 
+# Twitter/X Cookies Configuration
+# 支持两种方式:
+# 1. TWITTER_COOKIES_FILE: cookies JSON 文件路径
+# 2. TWITTER_COOKIES_JSON: 直接的 cookies JSON 字符串
+TWITTER_COOKIES_FILE = get_env_or_default("TWITTER_COOKIES_FILE", "")
+TWITTER_COOKIES_JSON = get_env_or_default("TWITTER_COOKIES_JSON", "")
+
 
 # Main Configuration Dictionary
 CONFIG = {

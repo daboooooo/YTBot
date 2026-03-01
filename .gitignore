@@ -121,3 +121,8 @@ test_downloads/
 
 # trae
 .trae/
+dev/
+
+# twitter cookies
+.twitter_cookies.json
+

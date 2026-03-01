@@ -112,6 +112,214 @@ class TwitterContentExtractor:
         self.context: Optional[BrowserContext] = None
         self._playwright = None
 
+    def _load_twitter_cookies(self) -> List[Dict[str, Any]]:
+        """
+        加载 Twitter/X cookies
+
+        支持三种方式（按优先级）:
+        1. 从项目根目录的 .twitter_cookies.json 文件加载
+        2. 从 TWITTER_COOKIES_FILE 环境变量指定的文件加载
+        3. 从 TWITTER_COOKIES_JSON 环境变量直接读取
+
+        Returns:
+            List of cookie dicts compatible with Playwright
+        """
+        import json
+        import time
+        from ytbot.core.config import TWITTER_COOKIES_FILE, TWITTER_COOKIES_JSON
+
+        cookies = []
+
+        # 方式0: 从项目根目录的 .twitter_cookies.json 加载（优先级最高）
+        default_cookie_file = '.twitter_cookies.json'
+        if os.path.exists(default_cookie_file):
+            try:
+                with open(default_cookie_file, 'r', encoding='utf-8') as f:
+                    cookie_data = json.load(f)
+                    if isinstance(cookie_data, list):
+                        cookies = cookie_data
+                        logger.info(
+                            f"Loaded {len(cookies)} cookies from default file: "
+                            f"{default_cookie_file}"
+                        )
+                    else:
+                        logger.warning("Invalid cookie file format")
+            except Exception as e:
+                logger.error(f"Failed to load cookies from default file: {e}")
+
+        # 方式1: 从 TWITTER_COOKIES_FILE 环境变量指定的文件加载
+        elif TWITTER_COOKIES_FILE and os.path.exists(TWITTER_COOKIES_FILE):
+            try:
+                with open(TWITTER_COOKIES_FILE, 'r', encoding='utf-8') as f:
+                    cookie_data = json.load(f)
+                    # 支持两种格式:
+                    # 1. Playwright 格式: [{name, value, domain, path, ...}]
+                    # 2. EditThisCookie 格式: [{name, value, domain, path, ...}]
+                    if isinstance(cookie_data, list):
+                        cookies = cookie_data
+                        logger.info(
+                            f"Loaded {len(cookies)} cookies from file: "
+                            f"{TWITTER_COOKIES_FILE}"
+                        )
+                    else:
+                        logger.warning("Invalid cookie file format")
+            except Exception as e:
+                logger.error(f"Failed to load cookies from file: {e}")
+
+        # 方式2: 从环境变量加载
+        elif TWITTER_COOKIES_JSON:
+            try:
+                cookie_data = json.loads(TWITTER_COOKIES_JSON)
+                if isinstance(cookie_data, list):
+                    cookies = cookie_data
+                    logger.info(f"Loaded {len(cookies)} cookies from env var")
+                else:
+                    logger.warning("Invalid cookie JSON format in env var")
+            except Exception as e:
+                logger.error(f"Failed to parse cookies from env var: {e}")
+
+        # 检查 cookie 过期时间
+        current_time = time.time()
+        expired_cookies = []
+        valid_cookies = []
+        
+        for cookie in cookies:
+            if isinstance(cookie, dict) and 'name' in cookie and 'value' in cookie:
+                # 检查过期时间
+                expires = cookie.get('expires')
+                if expires:
+                    # 如果过期时间是时间戳（数字）
+                    if isinstance(expires, (int, float)):
+                        if expires < current_time:
+                            expired_cookies.append(cookie['name'])
+                            continue
+                
+                valid_cookies.append(cookie)
+        
+        if expired_cookies:
+            logger.warning(f"Found {len(expired_cookies)} expired cookies: {expired_cookies}")
+        
+        logger.info(f"Valid cookies: {len(valid_cookies)}")
+
+        # 确保 cookies 格式正确 (Playwright 格式)
+        formatted_cookies = []
+        for cookie in valid_cookies:
+            formatted_cookie = {
+                'name': cookie['name'],
+                'value': cookie['value'],
+                'domain': cookie.get('domain', '.x.com'),
+                'path': cookie.get('path', '/'),
+            }
+            # 可选字段
+            if 'expires' in cookie:
+                formatted_cookie['expires'] = cookie['expires']
+            if 'httpOnly' in cookie:
+                formatted_cookie['httpOnly'] = cookie['httpOnly']
+            if 'secure' in cookie:
+                formatted_cookie['secure'] = cookie['secure']
+            if 'sameSite' in cookie:
+                # 转换 sameSite 值为 Playwright 支持的格式
+                same_site = cookie['sameSite']
+                if same_site == 'no_restriction':
+                    formatted_cookie['sameSite'] = 'None'
+                elif same_site == 'lax':
+                    formatted_cookie['sameSite'] = 'Lax'
+                elif same_site == 'strict':
+                    formatted_cookie['sameSite'] = 'Strict'
+                elif same_site in ['Strict', 'Lax', 'None']:
+                    formatted_cookie['sameSite'] = same_site
+                # 如果值不匹配任何已知格式，不添加 sameSite
+
+            formatted_cookies.append(formatted_cookie)
+
+        return formatted_cookies
+
+    async def _check_login_status(self, page) -> Dict[str, Any]:
+        """
+        检查 Twitter/X 登录状态
+        
+        Returns:
+            Dict with 'is_logged_in' (bool) and 'error_message' (str) if not logged in
+        """
+        result = await page.evaluate("""
+            () => {
+                // 检查登录状态的多种方式
+                
+                // 1. 检查是否有登录按钮
+                const loginButton = document.querySelector('[data-testid="loginButton"]');
+                const signInLink = document.querySelector('a[href="/login"]');
+                
+                // 2. 检查页面文本中是否有登录相关提示
+                const pageText = document.body.innerText;
+                const loginPrompts = [
+                    '登录',
+                    '注册',
+                    'Log in',
+                    'Sign up',
+                    '出错了',
+                    '重新加载',
+                    '登录注册出错了'
+                ];
+                
+                let hasLoginPrompt = false;
+                for (const prompt of loginPrompts) {
+                    if (pageText.includes(prompt)) {
+                        hasLoginPrompt = true;
+                        break;
+                    }
+                }
+                
+                // 3. 检查是否有用户头像（登录后通常有）
+                const userAvatar = document.querySelector(
+                    '[data-testid="primaryColumn"] img[src*="profile"], '
+                    + '[data-testid="SideNav_AccountSwitcher_Button"] img'
+                );
+                
+                // 4. 检查页面标题
+                const pageTitle = document.title;
+                const isErrorPage = pageTitle.includes('错误') || 
+                                   pageTitle.includes('Error') || 
+                                   pageTitle === '' ||
+                                   pageTitle === 'X';
+                
+                // 5. 检查是否有内容区域
+                const contentArea = document.querySelector('[data-testid="primaryColumn"]');
+                const hasContent = contentArea && contentArea.innerText.length > 100;
+                
+                // 判断逻辑
+                const isLoggedIn = userAvatar || (hasContent && !hasLoginPrompt && !isErrorPage);
+                
+                let errorMessage = '';
+                if (!isLoggedIn) {
+                    if (hasLoginPrompt) {
+                        errorMessage = '需要登录才能查看此内容，请更新 cookies';
+                    } else if (isErrorPage) {
+                        errorMessage = '页面加载错误，可能需要重新登录';
+                    } else {
+                        errorMessage = '无法确认登录状态';
+                    }
+                }
+                
+                return {
+                    is_logged_in: isLoggedIn,
+                    has_login_prompt: hasLoginPrompt,
+                    has_user_avatar: !!userAvatar,
+                    has_content: hasContent,
+                    is_error_page: isErrorPage,
+                    page_title: pageTitle,
+                    error_message: errorMessage
+                };
+            }
+        """)
+        
+        if not result.get('is_logged_in'):
+            logger.warning(f"Twitter/X login check failed: {result.get('error_message')}")
+            logger.warning(f"Page title: {result.get('page_title')}")
+        else:
+            logger.info("Twitter/X login status: OK")
+            
+        return result
+
     async def initialize_browser(self):
         """Initialize Playwright browser with anti-detection measures"""
         if not PLAYWRIGHT_AVAILABLE:
@@ -161,6 +369,12 @@ class TwitterContentExtractor:
                 permissions=['geolocation']
             )
 
+            # 加载并添加 cookies
+            cookies = self._load_twitter_cookies()
+            if cookies:
+                await self.context.add_cookies(cookies)
+                logger.info(f"Added {len(cookies)} cookies to browser context")
+
             # Inject anti-detection scripts
             await self.context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
@@ -197,51 +411,22 @@ class TwitterContentExtractor:
     async def expand_long_tweet(self, page) -> bool:
         """Click 'Show more' button to expand long tweets"""
         expanded = False
-        max_attempts = 5  # 最多尝试5次展开
+        max_attempts = 3  # 减少尝试次数
 
         for attempt in range(max_attempts):
             found_button = False
             try:
-                # Use JavaScript to find and click the "Show more" button
-                # This avoids Playwright-specific :has-text() selector issues
-                btn_info = await page.evaluate("""
-                    () => {
-                        const buttons = document.querySelectorAll('div[role="button"], span');
-                        for (const btn of buttons) {
-                            const text = btn.textContent.trim();
-                            if (text === '显示更多' || text === 'Show more') {
-                                return {
-                                    found: true,
-                                    text: text,
-                                    xpath: '//div[role="button"][contains(text(),"' + text + '")]'
-                                };
-                            }
-                        }
-                        // Try data-testid selector
-                        const showMoreLink = document.querySelector(
-                            '[data-testid="tweet-text-show-more-link"]'
-                        );
-                        if (showMoreLink) {
-                            return { found: true, text: 'Show more (data-testid)', xpath: null };
-                        }
-                        return { found: false };
-                    }
-                """)
+                # 只使用 data-testid 选择器，更精确
+                btn = await page.query_selector('[data-testid="tweet-text-show-more-link"]')
 
-                if btn_info.get('found'):
-                    if btn_info.get('xpath'):
-                        btn = await page.query_selector(f"text={btn_info['text']}")
-                    else:
-                        btn = await page.query_selector('[data-testid="tweet-text-show-more-link"]')
-
-                    if btn:
-                        await btn.click()
-                        await page.wait_for_timeout(1500)
-                        logger.info(
-                            f"Expanded long tweet content (attempt {attempt + 1})"
-                        )
-                        expanded = True
-                        found_button = True
+                if btn:
+                    await btn.click()
+                    await page.wait_for_timeout(1500)
+                    logger.info(
+                        f"Expanded long tweet content (attempt {attempt + 1})"
+                    )
+                    expanded = True
+                    found_button = True
 
                 if not found_button:
                     break
@@ -249,6 +434,109 @@ class TwitterContentExtractor:
             except Exception as e:
                 logger.debug(f"Expand attempt {attempt + 1} failed: {e}")
                 continue
+
+        return expanded
+
+    async def expand_thread_replies(self, page) -> bool:
+        """
+        点击"查看回复"按钮展开连续贴内容，并滚动加载更多内容
+
+        X/Twitter 在未登录状态下不会自动显示连续贴，
+        需要点击"查看 X 条回复"按钮才能看到完整线程
+
+        Returns:
+            bool - 是否成功展开回复
+        """
+        expanded = False
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            try:
+                # 查找"查看回复"或"Show replies"按钮
+                btn_info = await page.evaluate("""
+                    () => {
+                        const buttons = document.querySelectorAll(
+                            'div[role="button"], span, a'
+                        );
+                        for (const btn of buttons) {
+                            const text = btn.textContent.trim();
+                            // 匹配"查看 X 条回复"或"Show X replies"
+                            if (text.match(/查看.*回复/) ||
+                                text.match(/Show.*repl/i) ||
+                                text.includes('查看引用') ||
+                                text.includes('Show quotes')) {
+                                return {
+                                    found: true,
+                                    text: text,
+                                    element: btn.tagName
+                                };
+                            }
+                        }
+                        return { found: false };
+                    }
+                """)
+
+                if btn_info.get('found'):
+                    logger.info(f"Found reply button: {btn_info.get('text')}")
+
+                    # 尝试点击包含"查看"和"回复"文本的元素
+                    try:
+                        # 先尝试通过文本查找
+                        btn = await page.query_selector(
+                            'text=/查看.*回复|Show.*repl/i'
+                        )
+                        if btn:
+                            await btn.click()
+                            await page.wait_for_timeout(3000)
+                            logger.info(
+                                f"Clicked reply button (attempt {attempt + 1})"
+                            )
+                            expanded = True
+
+                            # 等待内容加载后再次检查是否有更多回复
+                            await page.wait_for_timeout(2000)
+                        else:
+                            break
+                    except Exception as click_err:
+                        logger.debug(f"Click failed: {click_err}")
+                        break
+                else:
+                    break
+
+            except Exception as e:
+                logger.debug(f"Expand replies attempt {attempt + 1} failed: {e}")
+                break
+        
+        # 滚动加载更多内容（连续贴）
+        try:
+            logger.info("Scrolling to load more thread content...")
+            previous_post_count = 0
+            scroll_attempts = 0
+            max_scroll_attempts = 5
+            
+            while scroll_attempts < max_scroll_attempts:
+                # 获取当前帖子数量
+                current_post_count = await page.evaluate(
+                    '() => document.querySelectorAll(\'article[data-testid="tweet"]\').length'
+                )
+                
+                if current_post_count > previous_post_count:
+                    logger.info(f"Loaded {current_post_count} posts so far")
+                    previous_post_count = current_post_count
+                    expanded = True
+                
+                # 滚动页面
+                await page.evaluate('window.scrollBy(0, 800)')
+                await page.wait_for_timeout(2000)
+                
+                scroll_attempts += 1
+            
+            # 滚动回顶部
+            await page.evaluate('window.scrollTo(0, 0)')
+            await page.wait_for_timeout(1000)
+            
+        except Exception as e:
+            logger.debug(f"Scroll loading failed: {e}")
 
         return expanded
 
@@ -353,7 +641,7 @@ class TwitterContentExtractor:
         """
         result = await page.evaluate("""
             () => {
-                // Check for article title
+                // Check for article title - 扩展选择器列表
                 const articleTitleSelectors = [
                     '[data-testid="articleTitle"]',
                     '[data-testid="tweetTitle"]',
@@ -362,7 +650,12 @@ class TwitterContentExtractor:
                     '[role="article"] h2',
                     '[role="article"] h1',
                     'div[data-testid="cellInnerDiv"] h2',
-                    'div[data-testid="cellInnerDiv"] h1'
+                    'div[data-testid="cellInnerDiv"] h1',
+                    // 长文页面特定的标题选择器
+                    '[data-testid="primaryColumn"] h2',
+                    '[data-testid="primaryColumn"] h1',
+                    'div[role="main"] h2',
+                    'div[role="main"] h1'
                 ];
 
                 let articleTitle = '';
@@ -370,9 +663,18 @@ class TwitterContentExtractor:
                     const element = document.querySelector(selector);
                     if (element) {
                         const text = element.textContent.trim();
-                        if (text && text.length > 0 && text.length < 200) {
-                            articleTitle = text;
-                            break;
+                        // 长文标题通常较长，且不应与推文内容完全相同
+                        // 检查是否是真正的article标题（不是普通推文）
+                        if (text && text.length > 50 && text.length < 500) {
+                            // 验证这个标题是否是article特有的（不是普通推文）
+                            // 通过检查是否有article特有的结构
+                            const hasArticleSpecificStructure = document.querySelector(
+                                '[data-testid="tweetArticle"], [data-testid="longTweet"]'
+                            );
+                            if (hasArticleSpecificStructure) {
+                                articleTitle = text;
+                                break;
+                            }
                         }
                     }
                 }
@@ -382,7 +684,9 @@ class TwitterContentExtractor:
                     'article',
                     '[data-testid="tweetArticle"]',
                     '[data-testid="longTweet"]',
-                    'div[data-testid="cellInnerDiv"] article'
+                    'div[data-testid="cellInnerDiv"] article',
+                    // 长文页面可能有特定的结构
+                    '[data-testid="primaryColumn"] article'
                 ];
 
                 let hasArticleStructure = false;
@@ -393,19 +697,40 @@ class TwitterContentExtractor:
                     }
                 }
 
+                // Check for "Article" badge/label in the page
+                // 长文页面顶部通常有 "Article" 标签
+                let hasArticleLabel = false;
+                const articleLabelSelectors = [
+                    'span:contains("Article")',
+                    'div:contains("Article")',
+                    '[data-testid="articleLabel"]'
+                ];
+                // 检查页面中是否有 "Article" 文本（不区分大小写）
+                const pageText = document.body.innerText.toLowerCase();
+                if (pageText.includes('article') || 
+                    pageText.includes('文章') || 
+                    document.title.toLowerCase().includes('article')) {
+                    hasArticleLabel = true;
+                }
+
                 // Get tweet text content for length check
                 const tweetTextSelectors = [
                     '[data-testid="tweetText"]',
                     'article [lang]',
-                    '[data-testid="tweet"] div[dir="auto"]'
+                    '[data-testid="tweet"] div[dir="auto"]',
+                    // 长文内容选择器
+                    '[data-testid="primaryColumn"] article div[lang]',
+                    'article div[data-testid="tweetText"]'
                 ];
 
                 let tweetText = '';
                 for (const selector of tweetTextSelectors) {
-                    const element = document.querySelector(selector);
-                    if (element) {
-                        tweetText = element.textContent.trim();
-                        break;
+                    const elements = document.querySelectorAll(selector);
+                    for (const element of elements) {
+                        const text = element.textContent.trim();
+                        if (text && text.length > tweetText.length) {
+                            tweetText = text;
+                        }
                     }
                 }
 
@@ -417,8 +742,8 @@ class TwitterContentExtractor:
                 // It's an article if:
                 // 1. Has article title, OR
                 // 2. Has article structure AND long content, OR
-                // 3. Has "Show more" button (indicates long-form content)
-                // Check for "Show more" button by iterating elements
+                // 3. Has "Article" label in page, OR
+                // 4. Has "Show more" button (indicates long-form content)
                 let hasShowMore = !!document.querySelector(
                     '[data-testid="tweet-text-show-more-link"]'
                 );
@@ -436,6 +761,7 @@ class TwitterContentExtractor:
                 let postType = 'regular';
                 const isArticle = articleTitle ||
                     (hasArticleStructure && isLongContent) ||
+                    hasArticleLabel ||
                     (hasShowMore && isLongContent);
                 if (isArticle) {
                     postType = 'article';
@@ -446,6 +772,7 @@ class TwitterContentExtractor:
                     article_title: articleTitle,
                     content_length: contentLength,
                     has_article_structure: hasArticleStructure,
+                    has_article_label: hasArticleLabel,
                     has_show_more: hasShowMore
                 };
             }
@@ -455,6 +782,202 @@ class TwitterContentExtractor:
             f"Detected post type: {result.get('post_type')} "
             f"(content length: {result.get('content_length')}, "
             f"has title: {bool(result.get('article_title'))})"
+        )
+
+        return result
+
+    async def detect_thread(self, page) -> Dict[str, Any]:
+        """
+        检测是否为连续贴(thread)并提取所有相关帖子
+
+        X/Twitter 连续贴的特点是：
+        1. 主帖显示为第一个 article 元素
+        2. 发帖人自己的回复会显示在线程中
+        3. 每个连续贴回复的第一个回复者就是发帖人自己
+        4. 最多可以级联二十级
+
+        Args:
+            page: Playwright page object
+
+        Returns:
+            Dict 包含:
+            - is_thread: bool - 是否为连续贴
+            - main_author: str - 主帖作者
+            - total_posts: int - 页面上所有帖子数量
+            - thread_posts_count: int - 识别为连续贴的帖子数量
+            - other_replies_count: int - 其他回复数量
+            - thread_posts: List[Dict] - 连续贴列表（发帖人自己的回复）
+            - other_replies: List[Dict] - 其他用户的回复列表
+        """
+        result = await page.evaluate("""
+            () => {
+                // 首先从URL中提取期望的作者
+                const urlAuthorMatch = window.location.pathname.match(
+                    /\\/([\\w_]+)\\/status\\//
+                );
+                const expectedAuthor = urlAuthorMatch ? '@' + urlAuthorMatch[1] : '';
+                
+                // 获取所有帖子元素 - 尝试多种选择器
+                let posts = document.querySelectorAll('article[data-testid="tweet"]');
+                
+                // 如果没有找到，尝试其他选择器
+                if (posts.length === 0) {
+                    posts = document.querySelectorAll('article');
+                }
+                
+                // 过滤掉没有内容的 article（可能是广告或其他元素）
+                const validPosts = Array.from(posts).filter(post => {
+                    const text = post.textContent.trim();
+                    return text.length > 10; // 至少有一些文本内容
+                });
+                
+                if (validPosts.length === 0) {
+                    return {
+                        is_thread: false,
+                        main_author: expectedAuthor,
+                        total_posts: 0,
+                        thread_posts_count: 0,
+                        other_replies_count: 0,
+                        thread_posts: [],
+                        other_replies: []
+                    };
+                }
+
+                // 尝试多种选择器获取作者
+                const authorSelectors = [
+                    'a[href^="/"] > div > span',
+                    '[data-testid="User-Name"] a',
+                    'a[role="link"] span',
+                    'div[data-testid="User-Name"] a span'
+                ];
+                
+                // 尝试找到与URL作者匹配的主帖
+                let mainPost = validPosts[0];
+                let mainAuthor = '';
+                
+                // 首先尝试在validPosts中找到与URL作者匹配的帖子
+                if (expectedAuthor) {
+                    for (const post of validPosts) {
+                        for (const selector of authorSelectors) {
+                            const authorEl = post.querySelector(selector);
+                            if (authorEl) {
+                                const text = authorEl.textContent.trim();
+                                if (text && text.toLowerCase() === expectedAuthor.toLowerCase()) {
+                                    mainPost = post;
+                                    mainAuthor = text;
+                                    break;
+                                }
+                            }
+                        }
+                        if (mainAuthor) break;
+                    }
+                }
+                
+                // 如果没找到匹配的，使用第一个帖子
+                if (!mainAuthor) {
+                    for (const selector of authorSelectors) {
+                        const authorEl = mainPost.querySelector(selector);
+                        if (authorEl) {
+                            const text = authorEl.textContent.trim();
+                            if (text && text.startsWith('@')) {
+                                mainAuthor = text;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // 如果还是没找到，使用URL中的作者
+                if (!mainAuthor && expectedAuthor) {
+                    mainAuthor = expectedAuthor;
+                }
+
+                // 使用过滤后的有效帖子
+                posts = validPosts;
+                
+                // 分析所有回复
+                const threadPosts = [];
+                const otherReplies = [];
+
+                // 从第二个元素开始检查（第一个是主帖）
+                for (let i = 1; i < posts.length; i++) {
+                    const post = posts[i];
+                    let postAuthor = '';
+
+                    // 尝试获取回复作者
+                    for (const selector of authorSelectors) {
+                        const authorEl = post.querySelector(selector);
+                        if (authorEl) {
+                            const text = authorEl.textContent.trim();
+                            if (text && text.startsWith('@')) {
+                                postAuthor = text;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 提取回复内容
+                    let content = '';
+                    const contentSelectors = [
+                        '[data-testid="tweetText"]',
+                        'div[lang]',
+                        '[role="link"] div[dir="auto"]'
+                    ];
+
+                    for (const selector of contentSelectors) {
+                        const contentEl = post.querySelector(selector);
+                        if (contentEl) {
+                            content = contentEl.textContent.trim();
+                            if (content) break;
+                        }
+                    }
+
+                    // 提取时间戳
+                    let timestamp = '';
+                    const timeEl = post.querySelector('time');
+                    if (timeEl) {
+                        timestamp = timeEl.getAttribute('datetime') || timeEl.textContent.trim();
+                    }
+
+                    // 检查是否是发帖人自己的回复（连续贴）
+                    // 条件：作者与主帖相同，或者是空作者（可能是加载问题）
+                    const isOpReply = (postAuthor === mainAuthor) ||
+                                      (postAuthor === '' && mainAuthor !== '');
+
+                    const postInfo = {
+                        index: i,
+                        author: postAuthor || mainAuthor,
+                        content: content,
+                        timestamp: timestamp,
+                        is_op_reply: isOpReply,
+                        element_index: i
+                    };
+
+                    if (isOpReply) {
+                        threadPosts.push(postInfo);
+                    } else {
+                        otherReplies.push(postInfo);
+                    }
+                }
+
+                return {
+                    is_thread: threadPosts.length > 0,
+                    main_author: mainAuthor,
+                    total_posts: posts.length,
+                    thread_posts_count: threadPosts.length,
+                    other_replies_count: otherReplies.length,
+                    thread_posts: threadPosts,
+                    other_replies: otherReplies
+                };
+            }
+        """)
+
+        logger.info(
+            f"Thread detection: is_thread={result.get('is_thread')}, "
+            f"main_author={result.get('main_author')}, "
+            f"total_posts={result.get('total_posts')}, "
+            f"thread_posts={result.get('thread_posts_count')}, "
+            f"other_replies={result.get('other_replies_count')}"
         )
 
         return result
@@ -503,11 +1026,8 @@ class TwitterContentExtractor:
                         }
                     }
 
-                    // Check for poster image as fallback
-                    const poster = video.getAttribute('poster');
-                    if (poster && !poster.startsWith('blob:') && !videoUrls.includes(poster)) {
-                        videoUrls.push(poster);
-                    }
+                    // Note: poster is just a thumbnail image, not a video URL
+                    // We don't add it to videoUrls to avoid confusion
                 });
 
                 // 3. Check for video in media containers
@@ -525,6 +1045,10 @@ class TwitterContentExtractor:
                             }
                         }
                         if (src) {
+                            // Skip blob URLs (browser-local, not accessible by yt-dlp)
+                            if (src.startsWith('blob:')) {
+                                return;
+                            }
                             if (src.startsWith('//')) src = 'https:' + src;
                             else if (src.startsWith('/')) src = window.location.origin + src;
                             if (!videoUrls.includes(src)) {
@@ -739,21 +1263,44 @@ class TwitterContentExtractor:
 
                 // Extract article title if present
                 let articleTitle = '';
-                const titleSelectors = [
-                    '[data-testid="articleTitle"]',
-                    '[data-testid="tweetTitle"]',
-                    'article h2',
-                    'article h1',
-                    '[role="article"] h2',
-                    '[role="article"] h1'
-                ];
-                for (const selector of titleSelectors) {
-                    const el = document.querySelector(selector);
-                    if (el) {
-                        const text = el.textContent.trim();
-                        if (text && text.length > 0 && text.length < 200) {
-                            articleTitle = text;
-                            break;
+                
+                // 首先尝试从页面标题中提取（对于长文页面）
+                // 页面标题格式通常是: "标题内容 on X: \"内容\" / X" 或 "作者 on X: \"内容\" / X"
+                const pageTitle = document.title;
+                if (pageTitle && pageTitle.includes(' on X:')) {
+                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
+                    if (titleMatch && titleMatch[1]) {
+                        articleTitle = titleMatch[1].trim();
+                    }
+                }
+                
+                // 如果从页面标题没有提取到，尝试从页面元素中提取
+                if (!articleTitle) {
+                    const titleSelectors = [
+                        '[data-testid="articleTitle"]',
+                        '[data-testid="tweetTitle"]',
+                        // 长文页面特定的选择器
+                        '[data-testid="primaryColumn"] h2',
+                        '[data-testid="primaryColumn"] h1',
+                        'div[role="main"] h2',
+                        'div[role="main"] h1',
+                        // 通用选择器
+                        'article h2',
+                        'article h1',
+                        '[role="article"] h2',
+                        '[role="article"] h1',
+                        // 第一个 article 中的大文本
+                        'article:first-of-type div[dir="auto"]'
+                    ];
+                    for (const selector of titleSelectors) {
+                        const el = document.querySelector(selector);
+                        if (el) {
+                            const text = el.textContent.trim();
+                            // 放宽长度限制，长文标题可能较长
+                            if (text && text.length > 0 && text.length < 500) {
+                                articleTitle = text;
+                                break;
+                            }
                         }
                     }
                 }
@@ -764,6 +1311,11 @@ class TwitterContentExtractor:
                     '[data-testid="tweetPhoto"] img, img[src*="pbs.twimg.com/media"]'
                 );
                 imgElements.forEach(img => {
+                    // Skip images inside video elements (thumbnails/posters)
+                    if (img.closest('video')) {
+                        return;
+                    }
+
                     let src = img.getAttribute('src') || img.getAttribute('data-src');
                     if (src) {
                         if (src.startsWith('//')) src = 'https:' + src;
@@ -970,6 +1522,185 @@ class TwitterContentExtractor:
 
         return content_result
 
+    async def extract_all_posts_content(
+        self,
+        page,
+        base_url: str,
+        thread_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        提取页面中所有帖子的详细内容，包括连续贴
+
+        Args:
+            page: Playwright page object
+            base_url: Base URL for resolving relative links
+            thread_info: 线程检测信息，来自 detect_thread()
+
+        Returns:
+            Dict 包含所有帖子的详细内容
+        """
+        if not thread_info.get('is_thread'):
+            return {
+                'is_thread': False,
+                'main_post': None,
+                'thread_posts': [],
+                'other_replies': []
+            }
+
+        result = await page.evaluate("""
+            (info) => {
+                const posts = document.querySelectorAll(
+                    'article[data-testid="tweet"]'
+                );
+                const mainAuthor = info.main_author;
+
+                // 提取单个帖子的完整内容
+                function extractPostContent(post, index) {
+                    const postData = {
+                        index: index,
+                        author: '',
+                        author_name: '',
+                        content: '',
+                        html: '',
+                        timestamp: '',
+                        images: [],
+                        is_op_reply: false
+                    };
+
+                    // 提取作者信息
+                    const authorSelectors = [
+                        '[data-testid="User-Name"] a',
+                        'a[href^="/"] > div > span',
+                        'div[data-testid="User-Name"] a span'
+                    ];
+
+                    for (const selector of authorSelectors) {
+                        const authorEl = post.querySelector(selector);
+                        if (authorEl) {
+                            const text = authorEl.textContent.trim();
+                            if (text && text.startsWith('@')) {
+                                postData.author = text;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 提取显示名称
+                    const nameSelectors = [
+                        '[data-testid="User-Name"] a span span',
+                        'div[data-testid="User-Name"] span:first-child'
+                    ];
+                    for (const selector of nameSelectors) {
+                        const nameEl = post.querySelector(selector);
+                        if (nameEl) {
+                            const text = nameEl.textContent.trim();
+                            if (text && !text.startsWith('@')) {
+                                postData.author_name = text;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 提取内容
+                    const contentSelectors = [
+                        '[data-testid="tweetText"]',
+                        'div[lang]',
+                        '[role="link"] div[dir="auto"]'
+                    ];
+
+                    for (const selector of contentSelectors) {
+                        const contentEl = post.querySelector(selector);
+                        if (contentEl) {
+                            postData.content = contentEl.textContent.trim();
+                            postData.html = contentEl.innerHTML;
+                            break;
+                        }
+                    }
+
+                    // 提取时间戳
+                    const timeEl = post.querySelector('time');
+                    if (timeEl) {
+                        postData.timestamp = timeEl.getAttribute('datetime')
+                            || timeEl.textContent.trim();
+                    }
+
+                    // 提取图片
+                    const imgElements = post.querySelectorAll(
+                        '[data-testid="tweetPhoto"] img, '
+                        + 'img[src*="pbs.twimg.com/media"]'
+                    );
+                    imgElements.forEach(img => {
+                        let src = img.getAttribute('src')
+                            || img.getAttribute('data-src');
+                        if (src) {
+                            if (src.startsWith('//')) src = 'https:' + src;
+                            else if (src.startsWith('/')) {
+                                src = 'https://x.com' + src;
+                            }
+                            if (!postData.images.includes(src)) {
+                                postData.images.push(src);
+                            }
+                        }
+                    });
+
+                    // 判断是否为发帖人自己的回复
+                    postData.is_op_reply = (postData.author === mainAuthor)
+                        || (postData.author === '' && mainAuthor !== '');
+
+                    // 清理内容中的噪音
+                    postData.content = postData.content
+                        .replace(/[\\d,]+\\s*查看/g, '')
+                        .replace(/[\\d,]+\\s*views/gi, '')
+                        .replace(/[\\d,]+\\s*回复/g, '')
+                        .replace(/[\\d,]+\\s*转帖/g, '')
+                        .replace(/[\\d,]+\\s*喜欢/g, '')
+                        .replace(/[\\d,]+\\s*书签/g, '')
+                        .replace(/分享帖子/g, '')
+                        .replace(/查看 \\d+ 条回复/g, '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+
+                    return postData;
+                }
+
+                // 提取所有帖子
+                const allPosts = [];
+                posts.forEach((post, index) => {
+                    allPosts.push(extractPostContent(post, index));
+                });
+
+                // 分离主帖、连续贴和其他回复
+                const mainPost = allPosts.length > 0 ? allPosts[0] : null;
+                const threadPosts = [];
+                const otherReplies = [];
+
+                for (let i = 1; i < allPosts.length; i++) {
+                    const post = allPosts[i];
+                    if (post.is_op_reply) {
+                        threadPosts.push(post);
+                    } else {
+                        otherReplies.push(post);
+                    }
+                }
+
+                return {
+                    is_thread: threadPosts.length > 0,
+                    main_post: mainPost,
+                    thread_posts: threadPosts,
+                    other_replies: otherReplies,
+                    all_posts: allPosts
+                };
+            }
+        """, thread_info)
+
+        logger.info(
+            f"Extracted all posts: main_post={result.get('main_post') is not None}, "
+            f"thread_posts={len(result.get('thread_posts', []))}, "
+            f"other_replies={len(result.get('other_replies', []))}"
+        )
+
+        return result
+
     def convert_to_markdown(self, content: Dict[str, Any]) -> str:
         """Convert extracted content to Markdown format"""
         markdown = content.get('text', '')
@@ -1058,21 +1789,9 @@ class TwitterContentExtractor:
         page = await self.context.new_page()
 
         try:
-            # Set HTTP headers
-            accept_header = (
-                'text/html,application/xhtml+xml,application/xml;q=0.9,'
-                'image/webp,image/apng,*/*;q=0.8'
-            )
+            # Set HTTP headers (简化headers，避免影响页面渲染)
             await page.set_extra_http_headers({
-                'Accept': accept_header,
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Cache-Control': 'max-age=0'
             })
 
             logger.info(f"Accessing tweet: {url}")
@@ -1083,22 +1802,42 @@ class TwitterContentExtractor:
             if response.status not in [200, 304]:
                 logger.warning(f"Page returned status {response.status}")
 
-            # Wait for tweet content to load
+            # Wait for page content to load
+            # 对于长文页面，等待 article 元素而不是 tweetText
+            logger.info("Waiting for page content to load...")
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        page.wait_for_selector('[data-testid="tweetText"]', timeout=15000),
-                        return_exceptions=True
-                    ),
-                    timeout=15
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for tweet elements, continuing anyway")
+                await page.wait_for_selector('article', timeout=15000)
+            except Exception:
+                logger.warning("Timeout waiting for article element, continuing anyway")
+
+            # 额外等待让 JavaScript 渲染完成（对于长文页面需要更长时间）
+            await page.wait_for_timeout(5000)
+
+            # 检查登录状态（在页面完全加载后检查）
+            login_status = await self._check_login_status(page)
+            if not login_status.get('is_logged_in'):
+                error_msg = login_status.get('error_message', '登录状态检查失败')
+                logger.error(f"Login check failed: {error_msg}")
+                return {
+                    'success': False,
+                    'error': f"Twitter/X 登录失败: {error_msg}"
+                }
 
             # Expand long tweets
             logger.info("Checking for long tweet expansion...")
             await self.expand_long_tweet(page)
             await page.wait_for_timeout(1000)
+
+            # 尝试展开回复（连续贴）- 在提取内容之前展开
+            logger.info("Checking for thread replies...")
+            await self.expand_thread_replies(page)
+            
+            # 等待内容加载完成
+            await page.wait_for_timeout(3000)
+
+            # 检测是否为连续贴(thread)
+            logger.info("Detecting thread...")
+            thread_info = await self.detect_thread(page)
 
             # Get page title
             title = await page.title()
@@ -1135,6 +1874,16 @@ class TwitterContentExtractor:
             author = author_time_info.get('author', '')
             timestamp = author_time_info.get('timestamp', '')
 
+            # 如果是连续贴，提取所有帖子内容
+            thread_content = None
+            if thread_info.get('is_thread'):
+                logger.info(
+                    f"Thread detected with {thread_info.get('thread_posts_count')} posts"
+                )
+                thread_content = await self.extract_all_posts_content(
+                    page, 'https://x.com', thread_info
+                )
+
             # Build result with post type information
             result = {
                 'success': True,
@@ -1152,13 +1901,36 @@ class TwitterContentExtractor:
                 'video_urls': content.get('video_urls', []),
                 'embedded_videos': content.get('embedded_videos', []),
                 'author': author,
-                'timestamp': timestamp
+                'timestamp': timestamp,
+                # 连续贴相关信息
+                'is_thread': thread_info.get('is_thread', False),
+                'thread_info': {
+                    'is_thread': thread_info.get('is_thread', False),
+                    'main_author': thread_info.get('main_author', ''),
+                    'total_posts': thread_info.get('total_posts', 1),
+                    'thread_posts_count': thread_info.get(
+                        'thread_posts_count', 0
+                    ),
+                    'other_replies_count': thread_info.get(
+                        'other_replies_count', 0
+                    )
+                },
+                'thread_content': thread_content
             }
 
             # Log post type for debugging
             post_type = result['post_type']
             article_title = result['article_title']
-            if post_type == 'article':
+            is_thread = result['is_thread']
+
+            if is_thread:
+                logger.info(
+                    f"Successfully extracted thread content "
+                    f"({len(result['content'])} chars main, "
+                    f"{result['thread_info']['thread_posts_count']} thread posts, "
+                    f"{len(result['images'])} images)"
+                )
+            elif post_type == 'article':
                 logger.info(
                     f"Successfully extracted article content "
                     f"({len(result['content'])} chars, {len(result['images'])} images, "
@@ -1195,6 +1967,109 @@ class TwitterHandler(PlatformHandler):
         ]
         self.extractor = TwitterContentExtractor()
         self.storage_service = StorageService()
+
+    def generate_telegram_preview(
+        self,
+        result: Dict[str, Any],
+        is_processing: bool = True
+    ) -> str:
+        """
+        生成友好的 Telegram 提示信息
+
+        根据内容类型显示不同的提示：
+        - 长文 (Article)
+        - 帖子 (Post)
+        - 帖子(含视频) (Post with Video)
+        - 连续贴+序号 (Thread with count)
+
+        Args:
+            result: scrape_tweet 返回的结果字典
+            is_processing: 是否显示"正在处理"状态
+
+        Returns:
+            格式化的 Telegram 消息文本
+        """
+        if not result.get('success'):
+            return "❌ 无法获取内容信息"
+
+        # 提取基本信息
+        post_type = result.get('post_type', 'regular')
+        is_thread = result.get('is_thread', False)
+        author = result.get('author', '@unknown')
+        content = result.get('content', '')
+        timestamp = result.get('timestamp', '')
+        has_video = result.get('has_video', False)
+        video_count = len(result.get('video_urls', []))
+        image_count = len(result.get('images', []))
+        thread_info = result.get('thread_info', {})
+        thread_count = thread_info.get('thread_posts_count', 0)
+
+        # 确定内容类型标签
+        if is_thread:
+            type_emoji = "🧵"
+            type_label = f"连续贴 ({thread_count}条)"
+        elif post_type == 'article':
+            type_emoji = "📄"
+            type_label = "长文"
+        elif has_video:
+            type_emoji = "🎬"
+            type_label = f"帖子(含{video_count}个视频)"
+        elif image_count > 0:
+            type_emoji = "🖼️"
+            type_label = f"帖子(含{image_count}张图片)"
+        else:
+            type_emoji = "💬"
+            type_label = "帖子"
+
+        # 构建内容预览
+        content_preview = content[:100] if len(content) > 100 else content
+        if len(content) > 100:
+            content_preview += "..."
+
+        # 格式化时间
+        time_str = ""
+        if timestamp:
+            try:
+                from datetime import datetime
+                # 尝试解析 ISO 格式时间
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime('%Y-%m-%d %H:%M')
+            except (ValueError, TypeError):
+                time_str = timestamp[:16] if len(timestamp) > 16 else timestamp
+
+        # 构建消息
+        lines = [
+            "🐦 Twitter/X 内容",
+            "",
+            f"{type_emoji} 类型: {type_label}",
+            f"👤 作者: {author}",
+        ]
+
+        # 添加标题（如果是长文）
+        if post_type == 'article' and result.get('article_title'):
+            lines.append(f"📰 标题: {result['article_title'][:80]}")
+
+        # 添加内容预览
+        if content_preview:
+            lines.append(f"📝 预览: {content_preview}")
+
+        # 添加时间
+        if time_str:
+            lines.append(f"⏰ 时间: {time_str}")
+
+        # 添加统计信息
+        stats = []
+        if result.get('external_links'):
+            stats.append(f"{len(result['external_links'])} 个链接")
+        if stats:
+            lines.append(f"📊 包含: {' | '.join(stats)}")
+
+        # 添加处理状态
+        if is_processing:
+            lines.append("")
+            lines.append("⏳ 正在获取内容，请稍候...")
+
+        return "\n".join(lines)
 
     async def fetch_link_preview(self, url: str) -> Dict[str, Optional[str]]:
         """
@@ -1308,8 +2183,16 @@ class TwitterHandler(PlatformHandler):
         Returns:
             Generated title string
         """
-        if post_type == 'article' and article_title:
-            return self.clean_title(article_title)
+        # 清理 article_title，去除常见的占位符
+        cleaned_article_title = article_title.strip() if article_title else ""
+        
+        # 如果 article_title 是常见的占位符，则忽略它
+        placeholder_titles = ['Article', 'Post', "Today's News", '']
+        if cleaned_article_title in placeholder_titles:
+            cleaned_article_title = ""
+        
+        if post_type == 'article' and cleaned_article_title:
+            return self.clean_title(cleaned_article_title)
 
         # For regular posts
         title = ""
@@ -1440,13 +2323,16 @@ class TwitterHandler(PlatformHandler):
             # Determine content type based on media
             content_type = ContentType.TEXT
             html_content = result.get('html', '')
-            has_video = False
+            # Use has_video from scrape result (detected by detect_video method)
+            has_video = result.get('has_video', False)
             if result.get('images'):
                 content_type = ContentType.IMAGE
-            # Check for video in HTML content
-            if html_content and ('<video' in html_content or
-                                 ">video</span>" in html_content or
-                                 'data-testid="videoPlayer"' in html_content):
+            # Check for video - use has_video from result or check HTML
+            video_in_html = (html_content and
+                             ('<video' in html_content or
+                              ">video</span>" in html_content or
+                              'data-testid="videoPlayer"' in html_content))
+            if has_video or video_in_html:
                 content_type = ContentType.VIDEO
                 has_video = True
 
@@ -1476,6 +2362,10 @@ class TwitterHandler(PlatformHandler):
                 article_title=article_title
             )
 
+            # Get thread info from result
+            is_thread = result.get('is_thread', False)
+            thread_info = result.get('thread_info', {})
+
             return ContentInfo(
                 url=url,
                 title=generated_title,
@@ -1492,7 +2382,9 @@ class TwitterHandler(PlatformHandler):
                     'post_type': post_type,
                     'article_title': article_title,
                     'has_video': has_video,
-                    'external_links': external_links
+                    'external_links': external_links,
+                    'is_thread': is_thread,
+                    'thread_info': thread_info
                 }
             )
 
@@ -1556,9 +2448,10 @@ class TwitterHandler(PlatformHandler):
                 os.makedirs(videos_dir, exist_ok=True)
 
                 # Filter out blob URLs (browser-local, not accessible by yt-dlp)
+                # and Twitter/X article URLs (not supported by yt-dlp)
                 valid_video_urls = [
                     url for url in video_urls
-                    if url and not url.startswith('blob:')
+                    if url and not url.startswith('blob:') and '/i/article/' not in url
                 ]
 
                 # If we have valid video URLs, use them
@@ -1751,6 +2644,69 @@ class TwitterHandler(PlatformHandler):
             clean_content = self._clean_html_content(html_content, local_images)
         else:
             clean_content = f'<p>{content}</p>'
+
+        # Build thread section HTML if it's a thread
+        thread_html = ''
+        is_thread = result.get('is_thread', False)
+        thread_content_data = result.get('thread_content')
+
+        if is_thread and thread_content_data:
+            thread_posts = thread_content_data.get('thread_posts', [])
+            if thread_posts:
+                thread_html = '\n    <div class="thread-section">\n'
+                thread_html += '        <h2>连续贴 (Thread)</h2>\n'
+                thread_html += '        <div class="thread-posts">\n'
+
+                for i, post in enumerate(thread_posts, 1):
+                    post_content = post.get('content', '')
+                    post_author = post.get('author', '')
+                    post_timestamp = post.get('timestamp', '')
+                    post_images = post.get('images', [])
+
+                    thread_html += (
+                        f'            <div class="thread-post" data-index="{i}">\n'
+                        f'                <div class="thread-post-header">\n'
+                        f'                    <span class="thread-post-number">#{i}</span>\n'
+                    )
+
+                    if post_author:
+                        thread_html += (
+                            f'                    <span class="thread-post-author">'
+                            f'{post_author}</span>\n'
+                        )
+
+                    if post_timestamp:
+                        thread_html += (
+                            f'                    <span class="thread-post-time">'
+                            f'{post_timestamp}</span>\n'
+                        )
+
+                    thread_html += '                </div>\n'
+                    thread_html += (
+                        f'                <div class="thread-post-content">\n'
+                        f'                    <p>{post_content}</p>\n'
+                    )
+
+                    # Add images for this thread post
+                    if post_images:
+                        thread_html += '                    <div class="thread-post-images">\n'
+                        for j, img_url in enumerate(post_images, 1):
+                            if img_url in local_images:
+                                img_info = local_images[img_url]
+                                img_path = img_info.get('local_path', img_url)
+                            else:
+                                img_path = img_url
+                            thread_html += (
+                                f'                        <img src="{img_path}" '
+                                f'alt="Thread图片 {i}-{j}" loading="lazy">\n'
+                            )
+                        thread_html += '                    </div>\n'
+
+                    thread_html += '                </div>\n'
+                    thread_html += '            </div>\n'
+
+                thread_html += '        </div>\n'
+                thread_html += '    </div>\n'
 
         # Build media section HTML
         media_html = ''
@@ -2049,6 +3005,73 @@ class TwitterHandler(PlatformHandler):
             font-family: 'SF Mono', Monaco, monospace;
             font-size: 0.9em;
         }}
+        .thread-section {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .thread-section h2 {{
+            font-size: 1.2em;
+            margin: 0 0 16px 0;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #e1e8ed;
+            color: #1d9bf0;
+        }}
+        .thread-posts {{
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }}
+        .thread-post {{
+            background: #f7f9fa;
+            border-radius: 12px;
+            padding: 16px;
+            border-left: 3px solid #1d9bf0;
+        }}
+        .thread-post-header {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+            font-size: 0.9em;
+        }}
+        .thread-post-number {{
+            background: #1d9bf0;
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 0.85em;
+        }}
+        .thread-post-author {{
+            color: #1d9bf0;
+            font-weight: 600;
+        }}
+        .thread-post-time {{
+            color: #536471;
+            font-size: 0.85em;
+        }}
+        .thread-post-content {{
+            color: #0f1419;
+            line-height: 1.6;
+        }}
+        .thread-post-content p {{
+            margin: 0 0 12px 0;
+        }}
+        .thread-post-images {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 8px;
+            margin-top: 12px;
+        }}
+        .thread-post-images img {{
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            object-fit: cover;
+        }}
         .media-section {{
             background: #fff;
             border-radius: 16px;
@@ -2190,7 +3213,7 @@ class TwitterHandler(PlatformHandler):
     <div class="content">
 {clean_content}
     </div>
-{media_html}{links_html}    <div class="footer">
+{thread_html}{media_html}{links_html}    <div class="footer">
         <p>由 YTBot 自动提取</p>
     </div>
 </body>
@@ -2376,6 +3399,11 @@ class TwitterHandler(PlatformHandler):
                 logger.warning(f"Skipping blob URL (not accessible): {video_url}")
                 return None
 
+            # Skip Twitter/X article URLs (not supported by yt-dlp)
+            if '/i/article/' in video_url:
+                logger.warning(f"Skipping Twitter/X article URL (not a video): {video_url}")
+                return None
+
             logger.info(f"Starting video download: {video_url}")
 
             # Download video
@@ -2405,6 +3433,11 @@ class TwitterHandler(PlatformHandler):
             return None
 
         except Exception as e:
+            error_msg = str(e)
+            # Check if it's an unsupported URL error (e.g., Twitter/X article URLs)
+            if "Unsupported URL" in error_msg:
+                logger.warning(f"URL not supported by yt-dlp, skipping: {video_url}")
+                return None
             logger.error(f"Error downloading video {video_url}: {e}")
             return None
 

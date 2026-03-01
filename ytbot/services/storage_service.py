@@ -57,10 +57,10 @@ class StorageService:
         content_type: str = "media"
     ) -> Dict[str, Any]:
         """
-        Store a file using the best available storage backend with detailed logging
+        Store a file or directory using the best available storage backend with detailed logging
 
         Args:
-            source_path: Local file path to store
+            source_path: Local file path or directory to store
             filename: Target filename
             content_type: Type of content (for organization)
 
@@ -87,10 +87,28 @@ class StorageService:
             result["error"] = error_msg
             return result
 
+        # Check if source is a directory
+        is_directory = os.path.isdir(source_path)
+
         # Get file size for logging
         try:
-            file_size = os.path.getsize(source_path)
-            logger.debug(f"File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            if is_directory:
+                # Calculate total size of directory
+                total_size = 0
+                for dirpath, dirnames, filenames in os.walk(source_path):
+                    for f in filenames:
+                        file_path = os.path.join(dirpath, f)
+                        file_size = os.path.getsize(file_path)
+                        total_size += file_size
+                size_mb = total_size / 1024 / 1024
+                dbg_msg = f"Dir size: {total_size} bytes"
+                logger.debug(
+                    f"{dbg_msg} ({size_mb:.2f} MB)"
+                )
+            else:
+                file_size = os.path.getsize(source_path)
+                size_mb = file_size / 1024 / 1024
+                logger.debug(f"File size: {file_size} bytes ({size_mb:.2f} MB)")
         except Exception as e:
             logger.warning(f"⚠️  Could not get file size: {e}")
 
@@ -106,26 +124,67 @@ class StorageService:
 
                 # Organize by content type
                 media_type_dir = content_type.capitalize()
-                remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
 
-                logger.debug(f"Remote path: {remote_path}")
-                logger.debug("Uploading to Nextcloud...")
+                if is_directory:
+                    # Upload directory (for Twitter content with images/videos)
+                    # Use filename (without extension) as directory name
+                    name, _ = os.path.splitext(filename)
+                    remote_path = (
+                        f"{remote_dir}/{media_type_dir}/{name}"
+                    )
 
-                file_url = self.nextcloud_storage.upload_file(source_path, remote_path)
+                    logger.debug(f"Remote path: {remote_path}")
+                    logger.debug("Uploading directory to Nextcloud...")
 
-                if file_url:
-                    logger.info(f"✅ File stored in Nextcloud: {file_url}")
-                    result.update({
-                        "success": True,
-                        "storage_type": "nextcloud",
-                        "file_url": file_url,
-                        "file_path": remote_path
-                    })
-                    return result
+                    nc_storage = self.nextcloud_storage
+                    upload_result = nc_storage.upload_directory(
+                        source_path, remote_path
+                    )
+
+                    if upload_result.get("success"):
+                        file_url = upload_result.get("file_url")
+                        msg = "✅ Directory stored in Nextcloud"
+                        logger.info(f"{msg}: {file_url}")
+                        result.update({
+                            "success": True,
+                            "storage_type": "nextcloud",
+                            "file_url": file_url,
+                            "file_path": remote_path,
+                            "uploaded_files": upload_result.get(
+                                "uploaded_files", []
+                            ),
+                            "upload_errors": upload_result.get("errors", [])
+                        })
+                        return result
+                    else:
+                        errors = upload_result.get('errors')
+                        logger.warning(
+                            f"⚠️  Nextcloud directory upload failed: {errors}"
+                        )
+                        # Nextcloud upload failed, mark as unavailable
+                        self.mark_nextcloud_unavailable()
                 else:
-                    logger.warning("⚠️  Nextcloud upload returned no URL")
-                    # Nextcloud upload failed, mark as unavailable
-                    self.mark_nextcloud_unavailable()
+                    # Upload single file
+                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
+
+                    logger.debug(f"Remote path: {remote_path}")
+                    logger.debug("Uploading file to Nextcloud...")
+
+                    file_url = self.nextcloud_storage.upload_file(source_path, remote_path)
+
+                    if file_url:
+                        logger.info(f"✅ File stored in Nextcloud: {file_url}")
+                        result.update({
+                            "success": True,
+                            "storage_type": "nextcloud",
+                            "file_url": file_url,
+                            "file_path": remote_path
+                        })
+                        return result
+                    else:
+                        logger.warning("⚠️  Nextcloud upload returned no URL")
+                        # Nextcloud upload failed, mark as unavailable
+                        self.mark_nextcloud_unavailable()
 
             except Exception as e:
                 logger.error(f"❌ Nextcloud upload failed: {e}")
