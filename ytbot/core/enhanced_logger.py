@@ -12,15 +12,16 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Callable
 from functools import wraps
 
-from .config import CONFIG
+from .config import get_config
 
 
 class YTBotLogger:
     """Enhanced logger with detailed diagnostics and performance tracking"""
 
     def __init__(self, name: str = 'ytbot'):
+        self.config = get_config()
         self.logger = logging.getLogger(name)
-        self.logger.setLevel(getattr(logging, CONFIG['log']['level']))
+        self.logger.setLevel(getattr(logging, self.config.log.level))
         self.name = name
         self.start_times: Dict[str, float] = {}
 
@@ -36,24 +37,24 @@ class YTBotLogger:
 
         # Console handler with colors
         console_handler = ColoredConsoleHandler()
-        console_handler.setLevel(getattr(logging, CONFIG['log']['level']))
+        console_handler.setLevel(getattr(logging, self.config.log.level))
         console_formatter = logging.Formatter(detailed_format)
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
 
         # File handler with rotation
         try:
-            log_dir = os.path.dirname(CONFIG['log']['file'])
+            log_dir = os.path.dirname(self.config.log.file)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir)
 
             file_handler = logging.handlers.RotatingFileHandler(
-                filename=CONFIG['log']['file'],
-                maxBytes=CONFIG['log']['max_bytes'],
-                backupCount=CONFIG['log']['backup_count'],
+                filename=self.config.log.file,
+                maxBytes=self.config.log.max_bytes,
+                backupCount=self.config.log.backup_count,
                 encoding='utf-8'
             )
-            file_handler.setLevel(getattr(logging, CONFIG['log']['level']))
+            file_handler.setLevel(getattr(logging, self.config.log.level))
             file_formatter = logging.Formatter(detailed_format)
             file_handler.setFormatter(file_formatter)
             self.logger.addHandler(file_handler)

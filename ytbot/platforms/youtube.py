@@ -7,13 +7,19 @@ Handles YouTube video and playlist downloads with support for various formats an
 import re
 import asyncio
 import tempfile
-import yt_dlp
+import json
+import os
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
-from .base import PlatformHandler, ContentInfo, ContentType, DownloadResult
+import yt_dlp
+
+from .base import PlatformHandler
 from ..core.logger import get_logger
-from ..core.config import CONFIG
+from ..core.config import get_config
+from ..core.types import ContentType, ContentInfo, DownloadResult, JSONDict
+from ..core.exceptions import YouTubeError, DownloadError
+from ..utils.async_utils import run_with_timeout
 
 logger = get_logger(__name__)
 
@@ -21,9 +27,48 @@ logger = get_logger(__name__)
 class YouTubeHandler(PlatformHandler):
     """YouTube platform handler for downloading videos and playlists"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("YouTube")
         self.supported_content_types = [ContentType.VIDEO, ContentType.AUDIO, ContentType.PLAYLIST]
+        self.config = get_config()
+
+    def _load_youtube_cookies(self) -> Optional[str]:
+        """
+        Load YouTube cookies from file.
+
+        Supports three methods (in order of priority):
+        1. Load from project root .youtube_cookies.txt file
+        2. Load from YOUTUBE_COOKIES_FILE environment variable
+        3. Load from YOUTUBE_COOKIES_JSON environment variable (Netscape format)
+
+        Returns:
+            Path to cookies file or None if not found
+        """
+        config = get_config()
+        youtube_config = config.youtube
+        cookies_file = youtube_config.cookies_file
+        cookies_json = youtube_config.cookies_json
+
+        default_cookie_file = '.youtube_cookies.txt'
+        if os.path.exists(default_cookie_file):
+            logger.info(f"Loaded YouTube cookies from default file: {default_cookie_file}")
+            return default_cookie_file
+
+        if cookies_file and os.path.exists(cookies_file):
+            logger.info(f"Loaded YouTube cookies from file: {cookies_file}")
+            return cookies_file
+
+        if cookies_json:
+            temp_file = os.path.join(tempfile.gettempdir(), 'youtube_cookies.txt')
+            try:
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    f.write(cookies_json)
+                logger.info(f"Created temporary YouTube cookies file: {temp_file}")
+                return temp_file
+            except Exception as e:
+                logger.error(f"Failed to create temporary cookies file: {e}")
+
+        return None
 
     def can_handle(self, url: str) -> bool:
         """Check if this handler can process the given URL"""
@@ -64,11 +109,17 @@ class YouTubeHandler(PlatformHandler):
     async def get_content_info(self, url: str) -> Optional[ContentInfo]:
         """Get information about the content without downloading"""
         try:
+            cookies_path = self._load_youtube_cookies()
+            
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': True,  # Don't download, just extract info
             }
+            
+            if cookies_path:
+                ydl_opts['cookiefile'] = cookies_path
+                logger.info(f"Using cookies file for content info: {cookies_path}")
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = await asyncio.to_thread(ydl.extract_info, url, download=False)
@@ -100,7 +151,7 @@ class YouTubeHandler(PlatformHandler):
         self,
         url: str,
         content_type: ContentType,
-        progress_callback=None,
+        progress_callback: Optional[Any] = None,
         format_id: Optional[str] = None
     ) -> DownloadResult:
         """
@@ -191,13 +242,18 @@ class YouTubeHandler(PlatformHandler):
             # for upload/storage. Cleanup should be handled by the caller.
             pass
 
-    def get_supported_formats(self, url: str) -> List[Dict[str, Any]]:
+    def get_supported_formats(self, url: str) -> List[JSONDict]:
         """Get available download formats for the content"""
         try:
+            cookies_path = self._load_youtube_cookies()
+            
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
             }
+            
+            if cookies_path:
+                ydl_opts['cookiefile'] = cookies_path
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -207,7 +263,7 @@ class YouTubeHandler(PlatformHandler):
             logger.error(f"Failed to get YouTube formats for {url}: {e}")
             return []
 
-    async def get_format_list(self, url: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    async def get_format_list(self, url: str) -> Tuple[JSONDict, List[JSONDict]]:
         """
         Get video info and available formats using yt-dlp command line.
 
@@ -229,14 +285,24 @@ class YouTubeHandler(PlatformHandler):
 
             logger.info(f"Getting format list for: {url}")
 
-            # Run command asynchronously
+            # Run command asynchronously with timeout
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await process.communicate()
+            # Add timeout to prevent hanging
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=self.config.download.timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                logger.error("yt-dlp format list command timed out")
+                return await self._get_format_list_fallback(url)
 
             if process.returncode != 0:
                 logger.error(f"yt-dlp command failed: {stderr.decode()}")
@@ -244,7 +310,6 @@ class YouTubeHandler(PlatformHandler):
                 return await self._get_format_list_fallback(url)
 
             # Parse JSON output
-            import json
             video_info = json.loads(stdout.decode())
             formats = video_info.get('formats', [])
 
@@ -258,7 +323,7 @@ class YouTubeHandler(PlatformHandler):
 
     async def _get_format_list_fallback(
         self, url: str
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    ) -> Tuple[JSONDict, List[JSONDict]]:
         """
         Fallback method to get formats using yt-dlp Python API.
 
@@ -269,11 +334,16 @@ class YouTubeHandler(PlatformHandler):
             Tuple of (video_info, formats_list)
         """
         try:
+            cookies_path = self._load_youtube_cookies()
+            
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extractor_args': ['youtube:player_client=tv_embedded'],
             }
+            
+            if cookies_path:
+                ydl_opts['cookiefile'] = cookies_path
 
             def extract_info():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -288,7 +358,7 @@ class YouTubeHandler(PlatformHandler):
             logger.error(f"Fallback format extraction failed: {e}")
             return {}, []
 
-    def select_best_audio_format(self, formats: List[Dict[str, Any]]) -> Optional[str]:
+    def select_best_audio_format(self, formats: List[JSONDict]) -> Optional[str]:
         """
         Select the best audio format.
 
@@ -331,7 +401,7 @@ class YouTubeHandler(PlatformHandler):
 
     def select_best_video_format(
         self,
-        formats: List[Dict[str, Any]],
+        formats: List[JSONDict],
         max_height: int = 1080
     ) -> Optional[str]:
         """
@@ -390,9 +460,9 @@ class YouTubeHandler(PlatformHandler):
         self,
         temp_dir: str,
         content_type: ContentType,
-        progress_callback=None,
+        progress_callback: Optional[Any] = None,
         format_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> JSONDict:
         """
         Setup yt-dlp options based on content type.
 
@@ -405,34 +475,35 @@ class YouTubeHandler(PlatformHandler):
         Returns:
             Dictionary of yt-dlp options
         """
-        base_opts = {
+        download_config = self.config.download
+
+        base_opts: JSONDict = {
             'outtmpl': str(Path(temp_dir) / '%(title).50s.%(ext)s'),
-            'quiet': CONFIG['download']['quiet'],
-            'no_warnings': CONFIG['download']['no_warnings'],
-            'retries': CONFIG['download']['retries'],
-            'fragment_retries': CONFIG['download']['fragment_retries'],
-            'timeout': CONFIG['download']['timeout'],
-            'socket_timeout': CONFIG['download']['socket_timeout'],
-            'http_headers': CONFIG['download']['http_headers'],
-            'ignoreerrors': CONFIG['download']['ignore_errors'],
-            'ignore_no_formats_error': CONFIG['download'].get(
-                'ignore_no_formats_error', True
-            ),
-            'allow_playlist_files': CONFIG['download'].get(
-                'allow_playlist_files', True
-            ),
-            'sleep_interval_requests': CONFIG['download'].get(
-                'sleep_interval_requests', 2
-            ),
-            'sleep_interval': CONFIG['download'].get('sleep_interval', 5),
-            'max_sleep_interval': CONFIG['download'].get('max_sleep_interval', 30),
-            'prefer_ffmpeg': CONFIG['download'].get('prefer_ffmpeg', True),
+            'quiet': download_config.quiet,
+            'no_warnings': download_config.no_warnings,
+            'retries': download_config.retries,
+            'fragment_retries': download_config.fragment_retries,
+            'timeout': download_config.timeout,
+            'socket_timeout': download_config.socket_timeout,
+            'http_headers': download_config.http_headers,
+            'ignoreerrors': download_config.ignore_errors,
+            'ignore_no_formats_error': download_config.ignore_no_formats_error,
+            'allow_playlist_files': download_config.allow_playlist_files,
+            'sleep_interval_requests': download_config.sleep_interval_requests,
+            'sleep_interval': download_config.sleep_interval,
+            'max_sleep_interval': download_config.max_sleep_interval,
+            'prefer_ffmpeg': download_config.prefer_ffmpeg,
         }
+
+        cookies_path = self._load_youtube_cookies()
+        if cookies_path:
+            base_opts['cookiefile'] = cookies_path
+            logger.info(f"Using cookies file for download: {cookies_path}")
 
         if progress_callback:
             loop = asyncio.get_running_loop()
 
-            def sync_progress_hook(d):
+            def sync_progress_hook(d: Dict[str, Any]) -> None:
                 try:
                     future = asyncio.run_coroutine_threadsafe(progress_callback(d), loop)
                     future.result(timeout=5)
@@ -449,18 +520,18 @@ class YouTubeHandler(PlatformHandler):
                     'format': format_id,
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
-                        'preferredcodec': CONFIG['download']['audio_codec'],
-                        'preferredquality': str(CONFIG['download']['audio_quality']),
+                        'preferredcodec': download_config.audio_codec,
+                        'preferredquality': str(download_config.audio_quality),
                     }],
                 })
             else:
                 # Use default format selection
                 base_opts.update({
-                    'format': CONFIG['download']['audio_format'],
+                    'format': download_config.audio_format,
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
-                        'preferredcodec': CONFIG['download']['audio_codec'],
-                        'preferredquality': str(CONFIG['download']['audio_quality']),
+                        'preferredcodec': download_config.audio_codec,
+                        'preferredquality': str(download_config.audio_quality),
                     }],
                 })
         else:
@@ -470,26 +541,26 @@ class YouTubeHandler(PlatformHandler):
                 # Format ID should be in format "video_id+audio_id"
                 base_opts.update({
                     'format': format_id,
-                    'merge_output_format': CONFIG['download'].get(
-                        'merge_output_format', 'mp4'
-                    ),
+                    'merge_output_format': download_config.merge_output_format,
                 })
             else:
                 # Use default format selection
                 base_opts.update({
-                    'format': CONFIG['download']['video_format'],
-                    'merge_output_format': CONFIG['download'].get(
-                        'merge_output_format', 'mp4'
-                    ),
+                    'format': download_config.video_format,
+                    'merge_output_format': download_config.merge_output_format,
                     'postprocessors': [{
                         'key': 'FFmpegVideoConvertor',
-                        'preferedformat': CONFIG['download']['video_output_format'],
+                        'preferedformat': download_config.video_output_format,
                     }],
                 })
 
         return base_opts
 
-    def _find_downloaded_file(self, temp_dir: str, content_type: ContentType) -> Optional[Path]:
+    def _find_downloaded_file(
+        self,
+        temp_dir: str,
+        content_type: ContentType
+    ) -> Optional[Path]:
         """Find the downloaded file in the temporary directory"""
         temp_path = Path(temp_dir)
 
@@ -501,16 +572,10 @@ class YouTubeHandler(PlatformHandler):
                     return files[0]
         else:
             # Look for video files
-            for ext in ['.mp4', '.mkv', '.webm']:
+            for ext in ['.mp4', '.mkv', '.webm', '.avi']:
                 files = list(temp_path.rglob(f'*{ext}'))
                 if files:
                     return files[0]
-
-        # Fallback: find any media file
-        for ext in ['.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.wav', '.ogg']:
-            files = list(temp_path.rglob(f'*{ext}'))
-            if files:
-                return files[0]
 
         return None
 
@@ -518,73 +583,8 @@ class YouTubeHandler(PlatformHandler):
         self,
         url: str,
         temp_dir: str,
-        original_opts: Dict[str, Any]
+        ydl_opts: JSONDict
     ) -> List[str]:
-        """
-        Download subtitles for a YouTube video.
-
-        Uses the same configuration parameters as the original download,
-        but adds --all-subs and --skip-download to download only subtitles.
-
-        Args:
-            url: YouTube video URL
-            temp_dir: Temporary directory for downloads
-            original_opts: Original yt-dlp options used for video/audio download
-
-        Returns:
-            List of downloaded subtitle file paths
-        """
-        try:
-            logger.info(f"Attempting to download subtitles for: {url}")
-
-            # Build subtitle download options based on original options
-            subtitle_opts = {
-                'outtmpl': str(Path(temp_dir) / '%(title).50s.%(ext)s'),
-                'quiet': original_opts.get('quiet', True),
-                'no_warnings': original_opts.get('no_warnings', True),
-                'retries': original_opts.get('retries', 3),
-                'fragment_retries': original_opts.get('fragment_retries', 3),
-                'timeout': original_opts.get('timeout', 30),
-                'socket_timeout': original_opts.get('socket_timeout', 30),
-                'http_headers': original_opts.get('http_headers', {}),
-                'ignoreerrors': original_opts.get('ignoreerrors', True),
-                'sleep_interval_requests': original_opts.get('sleep_interval_requests', 2),
-                'sleep_interval': original_opts.get('sleep_interval', 5),
-                'max_sleep_interval': original_opts.get('max_sleep_interval', 30),
-                # Subtitle-specific options
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': [
-                    'en', 'zh', 'zh-CN', 'zh-TW', 'ja', 'ko',
-                    'es', 'fr', 'de', 'ru', 'pt'
-                ],
-                'skip_download': True,  # Don't download video/audio
-            }
-
-            # Add extractor args if present in original options
-            if 'extractor_args' in original_opts:
-                subtitle_opts['extractor_args'] = original_opts['extractor_args']
-
-            downloaded_subtitles = []
-
-            with yt_dlp.YoutubeDL(subtitle_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-
-                if info:
-                    # Find downloaded subtitle files
-                    temp_path = Path(temp_dir)
-                    for ext in ['.srt', '.vtt', '.ttml', '.srv3', '.srv2', '.srv1', '.json3']:
-                        files = list(temp_path.rglob(f'*{ext}'))
-                        for f in files:
-                            downloaded_subtitles.append(str(f))
-
-            if downloaded_subtitles:
-                logger.info(f"Successfully downloaded {len(downloaded_subtitles)} subtitle files")
-            else:
-                logger.info("No subtitles available for this video")
-
-            return downloaded_subtitles
-
-        except Exception as e:
-            logger.warning(f"Failed to download subtitles: {e}")
-            return []
+        """Download subtitles for the video"""
+        # TODO: Implement subtitle download
+        return []

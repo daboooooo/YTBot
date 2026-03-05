@@ -126,7 +126,12 @@ class TwitterContentExtractor:
         """
         import json
         import time
-        from ytbot.core.config import TWITTER_COOKIES_FILE, TWITTER_COOKIES_JSON
+        from ytbot.core.config import get_config
+
+        config = get_config()
+        twitter_config = config.twitter
+        TWITTER_COOKIES_FILE = twitter_config.cookies_file
+        TWITTER_COOKIES_JSON = twitter_config.cookies_json
 
         cookies = []
 

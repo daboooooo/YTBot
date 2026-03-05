@@ -6,44 +6,9 @@ like YouTube, Twitter/X, Instagram, etc.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass
-from enum import Enum
+from typing import Optional, List, Dict, Any
 
-
-class ContentType(Enum):
-    """Supported content types"""
-    VIDEO = "video"
-    AUDIO = "audio"
-    IMAGE = "image"
-    TEXT = "text"
-    PLAYLIST = "playlist"
-
-
-@dataclass
-class ContentInfo:
-    """Information about downloadable content"""
-    url: str
-    title: str
-    description: Optional[str] = None
-    duration: Optional[int] = None  # seconds
-    content_type: ContentType = ContentType.VIDEO
-    thumbnail_url: Optional[str] = None
-    uploader: Optional[str] = None
-    upload_date: Optional[str] = None
-    file_size_estimate: Optional[int] = None  # bytes
-    formats: Optional[List[Dict[str, Any]]] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-
-@dataclass
-class DownloadResult:
-    """Result of a download operation"""
-    success: bool
-    file_path: Optional[str] = None
-    content_info: Optional[ContentInfo] = None
-    error_message: Optional[str] = None
-    cancelled: bool = False
+from ..core.types import ContentType, ContentInfo, DownloadResult, JSONDict
 
 
 class PlatformHandler(ABC):
@@ -54,8 +19,8 @@ class PlatformHandler(ABC):
     and implement the required methods.
     """
 
-    def __init__(self, name: str):
-        self.name = name
+    def __init__(self, name: str) -> None:
+        self.name: str = name
         self.supported_content_types: List[ContentType] = []
 
     @abstractmethod
@@ -89,7 +54,7 @@ class PlatformHandler(ABC):
         self,
         url: str,
         content_type: ContentType,
-        progress_callback=None,
+        progress_callback: Optional[Any] = None,
         format_id: Optional[str] = None
     ) -> DownloadResult:
         """
@@ -107,7 +72,7 @@ class PlatformHandler(ABC):
         pass
 
     @abstractmethod
-    def get_supported_formats(self, url: str) -> List[Dict[str, Any]]:
+    def get_supported_formats(self, url: str) -> List[JSONDict]:
         """
         Get available download formats for the content
 
@@ -143,10 +108,10 @@ class PlatformManager:
     Handles registration and routing of content to appropriate platform handlers
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.handlers: List[PlatformHandler] = []
 
-    def register_handler(self, handler: PlatformHandler):
+    def register_handler(self, handler: PlatformHandler) -> None:
         """Register a new platform handler"""
         self.handlers.append(handler)
 

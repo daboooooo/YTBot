@@ -641,8 +641,28 @@ class TelegramHandler:
                 text="🔍 正在获取内容信息..."
             )
 
+            # Log URL being processed
+            logger.info(f"🔗 Processing URL: {url}")
+
+            # Get platform handler to check platform type first
+            handler = self.download_service.platform_manager.get_handler(url)
+
+            if handler:
+                logger.info(f"✅ Link type identified: {handler.name}")
+            else:
+                logger.warning(f"⚠️ No handler found for URL: {url}")
+
             # Get content info
             content_info = await self.download_service.get_content_info(url)
+
+            if content_info:
+                logger.info("✅ Content info retrieved successfully")
+                logger.info("   - Title: %s", content_info.get('title', 'N/A'))
+                logger.info("   - Type: %s", content_info.get('content_type', 'N/A'))
+                logger.info("   - Duration: %s seconds", content_info.get('duration', 'N/A'))
+                logger.info("   - Uploader: %s", content_info.get('uploader', 'N/A'))
+            else:
+                logger.warning("⚠️ Failed to get content info for URL: %s", url)
 
             if not content_info:
                 await self.telegram_service.edit_message(
@@ -651,9 +671,6 @@ class TelegramHandler:
                     text="❌ 无法获取内容信息，请检查链接是否有效。"
                 )
                 return
-
-            # Get platform handler to check platform type
-            handler = self.download_service.platform_manager.get_handler(url)
 
             if handler and handler.name == "YouTube":
                 # For YouTube, ask user to select download type

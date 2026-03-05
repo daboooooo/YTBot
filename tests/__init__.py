@@ -1,0 +1,1 @@
+"""YTBot test suite"""

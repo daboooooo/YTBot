@@ -15,10 +15,11 @@ from dataclasses import dataclass, field
 import yt_dlp
 import requests
 
-from .config import CONFIG, validate_config
+from .config import get_config, validate_config
 from .enhanced_logger import get_logger, log_function_entry_exit
 
 logger = get_logger(__name__)
+config = get_config()
 
 
 class StartupPhase(Enum):
@@ -258,10 +259,10 @@ class StartupManager:
 
             # Log configuration summary
             logger.info("✅ Configuration loaded successfully")
-            logger.info(f"📊 Bot Version: {CONFIG['app']['version']}")
-            logger.info(f"📝 Log Level: {CONFIG['log']['level']}")
-            logger.info(f"💾 Local Storage: {CONFIG['local_storage']['path']}")
-            nc_url = CONFIG['nextcloud']['url'] or 'Not configured'
+            logger.info(f"📊 Bot Version: {config.app.version}")
+            logger.info(f"📝 Log Level: {config.log.level}")
+            logger.info(f"💾 Local Storage: {config.local_storage.path}")
+            nc_url = config.nextcloud.url or 'Not configured'
             logger.info(f"☁️  Nextcloud URL: {nc_url}")
 
             return True, "Configuration validated successfully", None
@@ -325,7 +326,7 @@ class StartupManager:
             logger.info(f"📌 Current yt-dlp version: {current_version}")
 
             # Check if version check is enabled
-            if not CONFIG['download']['check_yt_dlp_version']:
+            if not config.download.check_yt_dlp_version:
                 logger.info("⏭️  yt-dlp version check disabled in configuration")
                 return True, f"yt-dlp version check skipped (current: {current_version})", None
 
@@ -334,7 +335,7 @@ class StartupManager:
             try:
                 response = requests.get(
                     'https://pypi.org/pypi/yt-dlp/json',
-                    timeout=CONFIG['download']['version_check_timeout']
+                    timeout=config.download.version_check_timeout
                 )
                 response.raise_for_status()
                 latest_version = response.json()['info']['version']
@@ -445,7 +446,7 @@ class StartupManager:
 
         try:
             # Check if Nextcloud is configured
-            if not CONFIG['nextcloud']['url']:
+            if not config.nextcloud.url:
                 logger.info("⏭️  Nextcloud not configured, skipping")
                 return True, "Nextcloud not configured (optional)", None
 
@@ -457,8 +458,8 @@ class StartupManager:
 
             # Check Nextcloud availability
             if storage_service.nextcloud_available:
-                logger.info(f"✅ Nextcloud connected: {CONFIG['nextcloud']['url']}")
-                return True, f"Connected to Nextcloud at {CONFIG['nextcloud']['url']}", None
+                logger.info(f"✅ Nextcloud connected: {config.nextcloud.url}")
+                return True, f"Connected to Nextcloud at {config.nextcloud.url}", None
             else:
                 logger.warning("⚠️  Nextcloud connection failed, will use local storage")
                 # Not a critical error, can fall back to local storage

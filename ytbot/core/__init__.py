@@ -37,7 +37,7 @@ Example:
     >>> logger.info("Application started")
 """
 
-from .config import CONFIG, validate_config
+from .config import get_config, validate_config, CONFIG
 from .logger import get_logger, setup_exception_handler
 
-__all__ = ["CONFIG", "validate_config", "get_logger", "setup_exception_handler"]
+__all__ = ["get_config", "validate_config", "get_logger", "setup_exception_handler", "CONFIG"]

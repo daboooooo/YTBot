@@ -9,6 +9,8 @@ import time
 import socket
 from typing import Dict, Any, Optional, Callable
 
+from telegram.error import Conflict
+
 from ..core.logger import get_logger
 from ..services.telegram_service import TelegramService
 from ..storage.nextcloud_storage import NextcloudStorage
@@ -36,6 +38,8 @@ class ConnectionMonitor:
         self.nextcloud_storage: Optional[NextcloudStorage] = None
         self._reconnect_in_progress = False
         self._on_telegram_reconnect: Optional[Callable] = None
+        self._consecutive_conflict_errors = 0
+        self._max_conflict_errors = 3
 
     def set_services(
         self,
@@ -139,6 +143,7 @@ class ConnectionMonitor:
                 if not was_connected:
                     logger.info("✅ Telegram connection restored")
                 self.status["telegram"] = True
+                self._consecutive_conflict_errors = 0  # Reset on success
                 logger.debug("Telegram connection test successful")
             else:
                 self.status["telegram"] = False
@@ -147,6 +152,15 @@ class ConnectionMonitor:
                 # Attempt reconnection if network is available
                 if self.status["network"] and not self._reconnect_in_progress:
                     await self._attempt_telegram_reconnect()
+
+        except Conflict as ce:
+            self._consecutive_conflict_errors += 1
+            logger.error(f"❌ Conflict error during health check: {ce}")
+            self.status["telegram"] = False
+
+            # Attempt reconnection with conflict handling
+            if self.status["network"] and not self._reconnect_in_progress:
+                await self._attempt_telegram_reconnect()
 
         except Exception as e:
             logger.error(f"Telegram connection check error: {e}")
@@ -157,7 +171,11 @@ class ConnectionMonitor:
                 await self._attempt_telegram_reconnect()
 
     async def _attempt_telegram_reconnect(self):
-        """Attempt to reconnect to Telegram servers"""
+        """Attempt to reconnect to Telegram servers with Conflict error handling.
+
+        Note: This method does NOT start polling. Polling should be managed by
+        the main application (cli.py) to avoid multiple polling instances.
+        """
         if self._reconnect_in_progress:
             return
 
@@ -166,11 +184,15 @@ class ConnectionMonitor:
 
         try:
             if self.telegram_service:
-                success = await self.telegram_service.reconnect()
+                # Pass start_polling=False to avoid duplicate polling
+                # Polling is managed by the main application
+                success = await self.telegram_service.reconnect(start_polling=False)
 
                 if success:
-                    logger.info("✅ Telegram reconnection successful")
+                    logger.info("✅ Telegram reconnection successful (handlers re-registered)")
+                    logger.info("⏭️  Polling is managed by main application")
                     self.status["telegram"] = True
+                    self._consecutive_conflict_errors = 0  # Reset conflict counter
 
                     # Notify callback if set
                     if self._on_telegram_reconnect:
@@ -181,6 +203,26 @@ class ConnectionMonitor:
                 else:
                     logger.error("❌ Telegram reconnection failed")
                     self.status["telegram"] = False
+
+        except Conflict as ce:
+            self._consecutive_conflict_errors += 1
+            logger.error(f"❌ Conflict error during reconnection: {ce}")
+            logger.warning(
+                f"⚠️ Another bot instance may be running "
+                f"(conflict error {self._consecutive_conflict_errors}/"
+                f"{self._max_conflict_errors})"
+            )
+            self.status["telegram"] = False
+
+            # If too many conflict errors, stop trying to reconnect
+            if self._consecutive_conflict_errors >= self._max_conflict_errors:
+                logger.critical(
+                    "🚨 Too many Conflict errors. "
+                    "Another bot instance is likely running. "
+                    "Stopping reconnection attempts."
+                )
+                # Stop monitoring to prevent further conflicts
+                self.monitoring = False
 
         except Exception as e:
             logger.error(f"Error during Telegram reconnection: {e}")

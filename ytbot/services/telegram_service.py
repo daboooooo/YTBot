@@ -8,6 +8,7 @@ import asyncio
 from typing import Optional, Dict, Any, Callable, List
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
+from telegram.error import Conflict
 
 from ..core.config import CONFIG
 from ..core.enhanced_logger import get_logger, log_function_entry_exit
@@ -16,9 +17,21 @@ logger = get_logger(__name__)
 
 
 class TelegramService:
-    """Telegram bot service for handling bot communication"""
+    """Telegram bot service for handling bot communication with unified connection management."""
+
+    _instance: Optional['TelegramService'] = None
+    _instance_lock = asyncio.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
 
     def __init__(self):
+        if self._initialized:
+            return
+
         self.bot: Optional[Bot] = None
         self.application: Optional[Application] = None
         self.token = CONFIG['telegram']['token']
@@ -31,114 +44,203 @@ class TelegramService:
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
         self._reconnect_delay = 5  # seconds
+        self._polling_started = False
+        self._reconnect_lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
+        self._polling_lock = asyncio.Lock()
+        self._shutdown_event = asyncio.Event()
+        self._initialized = True
+        self._external_polling = False  # 标记是否有外部管理polling
+
+    @classmethod
+    async def get_instance(cls) -> 'TelegramService':
+        """Get or create the singleton instance."""
+        async with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
 
     @log_function_entry_exit(logger)
     async def connect(self) -> bool:
-        """Connect to Telegram servers with detailed logging"""
-        logger.info("📱 Starting Telegram connection...")
-        logger.debug(f"Bot token present: {bool(self.token)}")
+        """Connect to Telegram servers with detailed logging."""
+        async with self._connection_lock:
+            if self._connected:
+                logger.debug("Already connected to Telegram")
+                return True
 
-        try:
-            if not self.token:
-                logger.error("❌ Telegram bot token not configured")
+            logger.info("📱 Starting Telegram connection...")
+            logger.debug(f"Bot token present: {bool(self.token)}")
+
+            try:
+                if not self.token:
+                    logger.error("❌ Telegram bot token not configured")
+                    return False
+
+                logger.info("🔗 Connecting to Telegram servers...")
+                logger.debug(f"Token length: {len(self.token)} characters")
+
+                self.application = Application.builder().token(self.token).build()
+                self.bot = self.application.bot
+
+                # Test connection
+                logger.debug("Testing connection with get_me()...")
+                bot_info = await self.bot.get_me()
+                logger.info(f"✅ Connected to Telegram: @{bot_info.username}")
+                logger.info(f"🤖 Bot ID: {bot_info.id}")
+                logger.info(f"📛 Bot Name: {bot_info.first_name}")
+
+                self._connected = True
+                return True
+
+            except Conflict as ce:
+                logger.error(f"❌ Conflict error during connection: {ce}")
+                logger.error("Another bot instance is already running")
+                self._connected = False
                 return False
-
-            logger.info("🔗 Connecting to Telegram servers...")
-            logger.debug(f"Token length: {len(self.token)} characters")
-
-            self.application = Application.builder().token(self.token).build()
-            self.bot = self.application.bot
-
-            # Test connection
-            logger.debug("Testing connection with get_me()...")
-            bot_info = await self.bot.get_me()
-            logger.info(f"✅ Connected to Telegram: @{bot_info.username}")
-            logger.info(f"🤖 Bot ID: {bot_info.id}")
-            logger.info(f"📛 Bot Name: {bot_info.first_name}")
-
-            self._connected = True
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Telegram: {e}")
-            logger.exception("Telegram connection error details:")
-            self._connected = False
-            return False
+            except Exception as e:
+                logger.error(f"❌ Failed to connect to Telegram: {e}")
+                logger.exception("Telegram connection error details:")
+                self._connected = False
+                return False
 
     @log_function_entry_exit(logger)
     async def disconnect(self):
-        """Disconnect from Telegram servers with detailed logging"""
-        logger.info("📴 Starting Telegram disconnection...")
+        """Disconnect from Telegram servers with detailed logging."""
+        async with self._connection_lock:
+            logger.info("📴 Starting Telegram disconnection...")
 
-        try:
-            if self.application:
-                logger.info("🔄 Disconnecting from Telegram servers...")
-                app_state = getattr(self.application, 'running', 'unknown')
-                logger.debug(f"Application state: {app_state}")
+            try:
+                if self.application:
+                    logger.info("🔄 Disconnecting from Telegram servers...")
+                    app_state = getattr(self.application, 'running', 'unknown')
+                    logger.debug(f"Application state: {app_state}")
 
-                # Telegram doesn't require explicit disconnection
+                    # Stop polling if it was started
+                    if self._polling_started:
+                        try:
+                            logger.debug("Stopping updater polling...")
+                            if self.application.updater and self.application.updater.running:
+                                await self.application.updater.stop()
+                                logger.debug("Updater polling stopped")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error stopping updater: {e}")
+
+                        try:
+                            logger.debug("Stopping application...")
+                            await self.application.stop()
+                            logger.debug("Application stopped")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error stopping application: {e}")
+
+                        try:
+                            logger.debug("Shutting down application...")
+                            await self.application.shutdown()
+                            logger.debug("Application shutdown complete")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error shutting down application: {e}")
+
+                        self._polling_started = False
+
+                # Clear references
                 self.application = None
                 self.bot = None
                 self._connected = False
+                self._external_polling = False
+                self._shutdown_event.set()
 
                 logger.info("✅ Disconnected from Telegram servers")
-            else:
-                logger.debug("No active Telegram connection to disconnect")
 
-        except Exception as e:
-            logger.error(f"❌ Error disconnecting from Telegram: {e}")
-            logger.exception("Disconnection error details:")
+            except Exception as e:
+                logger.error(f"❌ Error disconnecting from Telegram: {e}")
+                logger.exception("Disconnection error details:")
 
     @log_function_entry_exit(logger)
-    async def reconnect(self) -> bool:
+    async def reconnect(self, start_polling: bool = False) -> bool:
         """
         Reconnect to Telegram servers with automatic retry logic.
+        Handles Conflict errors to prevent multiple bot instances.
+
+        Args:
+            start_polling: Whether to start polling after reconnection.
+                          Should be False if external code manages polling.
 
         Returns:
             bool: True if reconnection successful, False otherwise
         """
-        logger.info("🔄 Starting Telegram reconnection...")
+        # Use lock to prevent concurrent reconnection attempts
+        async with self._reconnect_lock:
+            logger.info(f"🔄 Starting Telegram reconnection... (start_polling={start_polling})")
 
-        # Disconnect first if still connected
-        if self._connected or self.application:
-            logger.info("📴 Disconnecting existing connection before reconnect...")
-            await self.disconnect()
-            await asyncio.sleep(1)
+            # Disconnect first if still connected
+            if self._connected or self.application:
+                logger.info("📴 Disconnecting existing connection before reconnect...")
+                await self.disconnect()
+                # Wait longer to ensure previous connection is fully terminated
+                await asyncio.sleep(5)
 
-        # Attempt reconnection with exponential backoff
-        for attempt in range(1, self._max_reconnect_attempts + 1):
-            self._reconnect_attempts = attempt
-            logger.info(f"🔄 Reconnection attempt {attempt}/{self._max_reconnect_attempts}")
+            # Attempt reconnection with exponential backoff
+            for attempt in range(1, self._max_reconnect_attempts + 1):
+                self._reconnect_attempts = attempt
+                logger.info(f"🔄 Reconnection attempt {attempt}/{self._max_reconnect_attempts}")
 
-            try:
-                # Try to connect
-                success = await self.connect()
+                try:
+                    # Try to connect
+                    success = await self.connect()
 
-                if success and self.application:
-                    logger.info("✅ Reconnection successful, re-registering handlers...")
+                    if success and self.application:
+                        logger.info("✅ Reconnection successful, re-registering handlers...")
 
-                    # Re-register all handlers
-                    await self._reregister_handlers()
+                        # Re-register all handlers
+                        await self._reregister_handlers()
 
-                    # Start polling
-                    await self.application.initialize()
-                    await self.application.start()
-                    await self.application.updater.start_polling()
+                        # Only start polling if requested and not already started
+                        if start_polling and not self._polling_started:
+                            try:
+                                async with self._polling_lock:
+                                    if not self._polling_started:  # Double-check
+                                        await self.application.initialize()
+                                        await self.application.start()
+                                        await self.application.updater.start_polling()
+                                        self._polling_started = True
+                                        logger.info("✅ Telegram polling started after reconnection")
+                            except Conflict as ce:
+                                logger.warning(f"⚠️ Conflict error during polling start: {ce}")
+                                logger.info(
+                                    "⏳ Another bot instance may be running, waiting before retry..."
+                                )
+                                # Force disconnect and wait longer
+                                await self.disconnect()
+                                await asyncio.sleep(10)
+                                continue
+                        else:
+                            logger.info("⏭️  Skipping polling start (managed externally)")
 
-                    logger.info("✅ Telegram reconnection complete, polling restarted")
-                    self._reconnect_attempts = 0
-                    return True
+                        logger.info("✅ Telegram reconnection complete")
+                        self._reconnect_attempts = 0
+                        return True
 
-            except Exception as e:
-                logger.error(f"❌ Reconnection attempt {attempt} failed: {e}")
+                except Conflict as ce:
+                    logger.warning(f"⚠️ Conflict error on attempt {attempt}: {ce}")
+                    logger.info(
+                        "⏳ Another bot instance may be running, "
+                        "waiting before retry..."
+                    )
+                    await self.disconnect()
+                    await asyncio.sleep(10)
+                    continue
+                except Exception as e:
+                    logger.error(f"❌ Reconnection attempt {attempt} failed: {e}")
 
-            # Wait before next attempt (exponential backoff)
-            delay = min(self._reconnect_delay * (2 ** (attempt - 1)), 60)
-            logger.info(f"⏳ Waiting {delay} seconds before next reconnection attempt...")
-            await asyncio.sleep(delay)
+                # Wait before next attempt (exponential backoff with jitter)
+                delay = min(self._reconnect_delay * (2 ** (attempt - 1)), 60)
+                # Add jitter to prevent thundering herd
+                import random
+                delay = delay + random.uniform(0, 2)
+                logger.info(f"⏳ Waiting {delay:.1f} seconds before next reconnection attempt...")
+                await asyncio.sleep(delay)
 
-        logger.error(f"❌ Failed to reconnect after {self._max_reconnect_attempts} attempts")
-        return False
+            logger.error(f"❌ Failed to reconnect after {self._max_reconnect_attempts} attempts")
+            return False
 
     async def _reregister_handlers(self):
         """Re-register all previously registered handlers after reconnection."""
@@ -181,7 +283,7 @@ class TelegramService:
                 logger.error(f"❌ Failed to re-register error handler: {e}")
 
         logger.info(
-            f"✅ Handlers re-registered: {len(self._command_handlers)} commands, "
+            f"✅ Handlers re-reregistered: {len(self._command_handlers)} commands, "
             f"{len(self._message_handlers)} message handlers, "
             f"{len(self._callback_handlers)} callback handlers, "
             f"{len(self._error_handlers)} error handlers"
@@ -202,6 +304,9 @@ class TelegramService:
             # Try to get bot info as a health check
             bot_info = await self.bot.get_me()
             return bot_info is not None
+        except Conflict:
+            logger.warning("Conflict error during health check - another instance running")
+            return False
         except Exception as e:
             logger.debug(f"Connection health check failed: {e}")
             return False
@@ -210,6 +315,11 @@ class TelegramService:
     def connected(self) -> bool:
         """Check if connected to Telegram"""
         return self._connected and self.bot is not None
+
+    @property
+    def is_polling(self) -> bool:
+        """Check if polling is active"""
+        return self._polling_started
 
     @log_function_entry_exit(logger)
     async def send_message(
@@ -403,36 +513,64 @@ class TelegramService:
     @log_function_entry_exit(logger)
     async def start_polling(self):
         """Start polling for updates with detailed logging"""
-        logger.info("🔄 Starting Telegram polling...")
+        async with self._polling_lock:
+            if self._polling_started:
+                logger.warning("⚠️ Polling already started, skipping")
+                return
 
-        if not self.application:
-            logger.error("❌ Telegram application not initialized")
-            return
+            if not self.application:
+                logger.error("❌ Telegram application not initialized")
+                return
 
-        try:
-            logger.info("🚀 Starting Telegram polling loop...")
-            await self.application.run_polling()
-            logger.info("✅ Telegram polling started successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to start Telegram polling: {e}")
-            logger.exception("Polling error details:")
+            try:
+                logger.info("🚀 Starting Telegram polling...")
+                await self.application.initialize()
+                await self.application.start()
+                await self.application.updater.start_polling()
+                self._polling_started = True
+                self._external_polling = True  # Mark that polling is managed externally
+                logger.info("✅ Telegram polling started successfully")
+            except Conflict as ce:
+                logger.error(f"❌ Conflict error starting polling: {ce}")
+                logger.error(
+                    "Another bot instance may be running. "
+                    "Please ensure only one instance is active."
+                )
+                self._polling_started = False
+                raise
+            except Exception as e:
+                logger.error(f"❌ Failed to start Telegram polling: {e}")
+                logger.exception("Polling error details:")
+                self._polling_started = False
 
     @log_function_entry_exit(logger)
     async def stop_polling(self):
         """Stop polling for updates with detailed logging"""
-        logger.info("🛑 Stopping Telegram polling...")
+        async with self._polling_lock:
+            logger.info("🛑 Stopping Telegram polling...")
 
-        if not self.application:
-            logger.debug("No Telegram application to stop polling")
-            return
+            if not self.application:
+                logger.debug("No Telegram application to stop polling")
+                return
 
-        try:
-            logger.debug("Calling application.stop()...")
-            await self.application.stop()
-            logger.info("✅ Telegram polling stopped successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to stop Telegram polling: {e}")
-            logger.exception("Stop polling error details:")
+            try:
+                logger.debug("Stopping updater...")
+                if self.application.updater and self.application.updater.running:
+                    await self.application.updater.stop()
+                    logger.debug("Updater stopped")
+
+                logger.debug("Calling application.stop()...")
+                await self.application.stop()
+
+                logger.debug("Shutting down application...")
+                await self.application.shutdown()
+
+                self._polling_started = False
+                self._external_polling = False
+                logger.info("✅ Telegram polling stopped successfully")
+            except Exception as e:
+                logger.error(f"❌ Failed to stop Telegram polling: {e}")
+                logger.exception("Stop polling error details:")
 
     @log_function_entry_exit(logger)
     def check_user_permission(self, chat_id: int) -> bool:
