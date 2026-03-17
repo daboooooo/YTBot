@@ -111,6 +111,9 @@ class TwitterContentExtractor:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self._playwright = None
+        self._using_shared_browser = False
+        self._login_checked = False
+        self._login_valid = False
 
     def _load_twitter_cookies(self) -> List[Dict[str, Any]]:
         """
@@ -325,14 +328,59 @@ class TwitterContentExtractor:
             
         return result
 
-    async def initialize_browser(self):
-        """Initialize Playwright browser with anti-detection measures"""
+    async def initialize_browser(self, force_new: bool = False):
+        """Initialize Playwright browser with anti-detection measures.
+        
+        Args:
+            force_new: If True, always create a new browser instance instead of using shared one
+        """
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError(
                 "Playwright not installed. "
                 "Install with: pip install playwright && playwright install chromium"
             )
 
+        if force_new:
+            await self._initialize_new_browser()
+            return
+
+        try:
+            from ytbot.core.browser_manager import get_browser_manager
+            manager = await get_browser_manager()
+            
+            if not manager.is_initialized:
+                initialized = await manager.initialize()
+                if not initialized:
+                    logger.warning(
+                        "Failed to initialize shared browser, "
+                        "falling back to new instance"
+                    )
+                    await self._initialize_new_browser()
+                    return
+            
+            cookies = self._load_twitter_cookies()
+            context = await manager.create_context(cookies=cookies)
+            
+            if context:
+                self.context = context
+                self._using_shared_browser = True
+                logger.info("Using shared browser for Twitter/X extraction")
+            else:
+                logger.warning(
+                    "Failed to create shared browser context, "
+                    "falling back to new instance"
+                )
+                await self._initialize_new_browser()
+                
+        except ImportError:
+            logger.warning("Browser manager not available, using standalone browser")
+            await self._initialize_new_browser()
+        except Exception as e:
+            logger.warning(f"Error using shared browser: {e}, falling back to new instance")
+            await self._initialize_new_browser()
+
+    async def _initialize_new_browser(self):
+        """Initialize a new standalone browser instance"""
         check_and_install_browser()
 
         if self.browser is None:
@@ -403,6 +451,12 @@ class TwitterContentExtractor:
 
     async def close_browser(self):
         """Close the browser instance and cleanup resources"""
+        if self._using_shared_browser:
+            logger.debug("Using shared browser, not closing context")
+            self.context = None
+            self._using_shared_browser = False
+            return
+            
         if self.browser:
             await self.browser.close()
             self.browser = None
@@ -1822,11 +1876,40 @@ class TwitterContentExtractor:
             login_status = await self._check_login_status(page)
             if not login_status.get('is_logged_in'):
                 error_msg = login_status.get('error_message', '登录状态检查失败')
-                logger.error(f"Login check failed: {error_msg}")
-                return {
-                    'success': False,
-                    'error': f"Twitter/X 登录失败: {error_msg}"
-                }
+                
+                if self._using_shared_browser and not self._login_checked:
+                    logger.warning(
+                        "Login failed with shared browser, retrying with new instance"
+                    )
+                    self._login_checked = True
+                    await self.close_browser()
+                    await self.initialize_browser(force_new=True)
+                    page = await self.context.new_page()
+                    await page.set_extra_http_headers({
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    })
+                    await page.goto(url, wait_until='domcontentloaded', timeout=90000)
+                    try:
+                        await page.wait_for_selector('article', timeout=15000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(5000)
+                    
+                    login_status = await self._check_login_status(page)
+                    if not login_status.get('is_logged_in'):
+                        retry_error = login_status.get('error_message')
+                        logger.error(f"Login check failed after retry: {retry_error}")
+                        return {
+                            'success': False,
+                            'error': f"Twitter/X 登录失败: {retry_error}"
+                        }
+                
+                if not login_status.get('is_logged_in'):
+                    logger.error(f"Login check failed: {error_msg}")
+                    return {
+                        'success': False,
+                        'error': f"Twitter/X 登录失败: {error_msg}"
+                    }
 
             # Expand long tweets
             logger.info("Checking for long tweet expansion...")
@@ -3285,6 +3368,7 @@ class TwitterHandler(PlatformHandler):
     ) -> Dict[str, Dict[str, Any]]:
         """
         Download images to local directory with metadata.
+        Uses parallel download with concurrency limit to avoid rate limiting.
 
         Args:
             image_urls: List of image URLs to download
@@ -3300,6 +3384,8 @@ class TwitterHandler(PlatformHandler):
                 - height: Image height (if available)
                 - format: Image format
         """
+        from ytbot.utils.async_utils import gather_with_concurrency
+
         local_images = {}
         metadata_map = {}
         if image_metadata:
@@ -3308,45 +3394,62 @@ class TwitterHandler(PlatformHandler):
                 if url:
                     metadata_map[url] = meta
 
-        async with aiohttp.ClientSession() as session:
-            for i, img_url in enumerate(image_urls):
-                try:
-                    timeout = aiohttp.ClientTimeout(total=30)
+        if not image_urls:
+            return local_images
+
+        async def download_single_image(img_url: str, index: int) -> Dict[str, Any]:
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession() as session:
                     async with session.get(img_url, timeout=timeout) as response:
                         if response.status == 200:
                             content = await response.read()
                             content_type = response.headers.get('Content-Type', '')
 
-                            # Detect extension from URL and content type
                             ext = self._detect_image_extension(img_url, content_type)
 
-                            # Use sequential naming: image_1.jpg, image_2.png, etc.
-                            local_filename = f'image_{i + 1}{ext}'
+                            local_filename = f'image_{index + 1}{ext}'
                             local_path = os.path.join(images_dir, local_filename)
 
                             with open(local_path, 'wb') as f:
                                 f.write(content)
 
-                            # Build result with metadata
                             file_size = len(content)
                             meta = metadata_map.get(img_url, {})
 
-                            local_images[img_url] = {
-                                'local_path': f'images/{local_filename}',
-                                'filename': local_filename,
-                                'size': file_size,
-                                'width': meta.get('width'),
-                                'height': meta.get('height'),
-                                'format': ext.lstrip('.'),
-                                'alt': meta.get('alt')
+                            result = {
+                                img_url: {
+                                    'local_path': f'images/{local_filename}',
+                                    'filename': local_filename,
+                                    'size': file_size,
+                                    'width': meta.get('width'),
+                                    'height': meta.get('height'),
+                                    'format': ext.lstrip('.'),
+                                    'alt': meta.get('alt')
+                                }
                             }
 
                             logger.info(
-                                f"Downloaded image {i + 1}/{len(image_urls)}: "
+                                f"Downloaded image {index + 1}/{len(image_urls)}: "
                                 f"{local_filename} ({file_size} bytes)"
                             )
-                except Exception as e:
-                    logger.warning(f"Failed to download image {img_url}: {e}")
+                            return result
+                        else:
+                            logger.warning(
+                                f"Image download failed with status {response.status}: "
+                                f"{img_url}"
+                            )
+            except Exception as e:
+                logger.warning(f"Failed to download image {img_url}: {e}")
+            return {}
+
+        results = await gather_with_concurrency(
+            3,
+            *[download_single_image(url, i) for i, url in enumerate(image_urls)]
+        )
+
+        for result in results:
+            local_images.update(result)
 
         return local_images
 
@@ -3411,31 +3514,30 @@ class TwitterHandler(PlatformHandler):
 
             logger.info(f"Starting video download: {video_url}")
 
-            # Download video
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
-                if info:
-                    # Get the actual downloaded file path
-                    filename = ydl.prepare_filename(info)
-                    logger.info(f"yt-dlp prepared filename: {filename}")
-                    logger.info(f"Output directory: {output_path}")
-                    logger.info(f"Directory contents: {os.listdir(output_path)}")
-                    if os.path.exists(filename):
-                        logger.info(f"Video downloaded successfully: {filename}")
-                        return filename
-                    else:
-                        # Try to find the file with actual extension
-                        base_path = filename.rsplit('.', 1)[0]
-                        for ext in ['.mp4', '.webm', '.mkv', '.mov']:
-                            alt_path = base_path + ext
-                            if os.path.exists(alt_path):
-                                logger.info(
-                                    f"Video downloaded successfully: {alt_path}"
-                                )
-                                return alt_path
+            # Run yt-dlp in thread pool to avoid blocking the event loop
+            def _sync_download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    if info:
+                        filename = ydl.prepare_filename(info)
+                        logger.info(f"yt-dlp prepared filename: {filename}")
+                        logger.info(f"Output directory: {output_path}")
+                        logger.info(f"Directory contents: {os.listdir(output_path)}")
+                        if os.path.exists(filename):
+                            logger.info(f"Video downloaded successfully: {filename}")
+                            return filename
+                        else:
+                            base_path = filename.rsplit('.', 1)[0]
+                            for ext in ['.mp4', '.webm', '.mkv', '.mov']:
+                                alt_path = base_path + ext
+                                if os.path.exists(alt_path):
+                                    logger.info(f"Video downloaded successfully: {alt_path}")
+                                    return alt_path
+                logger.error(f"Video download failed: {video_url}")
+                return None
 
-            logger.error(f"Video download failed: {video_url}")
-            return None
+            filename = await asyncio.to_thread(_sync_download)
+            return filename
 
         except Exception as e:
             error_msg = str(e)

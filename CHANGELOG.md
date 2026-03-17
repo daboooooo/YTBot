@@ -7,33 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Extensible architecture for platform handlers
-- Modular package structure following Python best practices
-- Professional CLI interface with comprehensive commands
-- Enhanced error handling and retry logic
-- Real-time monitoring and health checks
-- Connection monitoring for external services
-- Improved documentation and examples
-- Demo scripts for testing and development
-- Contributing guidelines and development setup
-- Comprehensive module docstrings for better code documentation
+## [2.5.0] - 2026-03-17
 
 ### Changed
-- Complete project restructure from flat files to modular packages
-- Improved configuration management with validation
-- Enhanced logging system with structured output
-- Better separation of concerns between modules
-- Updated storage service with unified interface
-- Improved Telegram bot command handling
-- Updated .gitignore to better exclude unnecessary files
+- **Twitter/X download performance optimization**
+  - Use shared browser instance to avoid browser startup overhead (~3-10s saved per download)
+  - Parallel image download with concurrency limit (3 concurrent connections) - avoids rate limiting
+  - Async yt-dlp execution using thread pool to avoid blocking event loop
+  - Added cookie refresh mechanism: automatically retry with new browser on login failure
+  - Graceful fallback to standalone browser if shared browser fails
 
-### Removed
-- Deprecated flat file structure
-- Old configuration management system
-- Legacy error handling approaches
-- Outdated test files
-- Redundant test files and demo scripts for cleaner codebase
+### Added
+- Login retry mechanism for Twitter/X - automatically retries with new browser instance on authentication failure
+
+### Fixed
+- Improved error handling for image download failures
 
 ## [2.0.0] - 2024-02-06
 

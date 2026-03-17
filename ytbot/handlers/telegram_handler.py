@@ -4,7 +4,7 @@ Telegram handler for YTBot
 Handles Telegram bot commands and message processing.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, filters
 
@@ -234,6 +234,11 @@ class TelegramHandler:
         if user_state == UserState.WAITING_TEXT_CONFIRMATION:
             # User is responding to text content save confirmation
             await self._handle_text_save_response(chat_id, message_text)
+            return
+
+        if user_state == UserState.WAITING_LARGE_FILE_CONFIRMATION:
+            # User is responding to large file download confirmation
+            await self._handle_large_file_confirmation_response(chat_id, message_text)
             return
 
         # Check if it's a URL we can handle
@@ -857,6 +862,10 @@ class TelegramHandler:
         if callback_data in ['save_text_yes', 'save_text_no']:
             await self._handle_save_text_callback(chat_id, callback_data, query)
 
+        # Handle large file download confirmation
+        if callback_data in ['confirm_download_yes', 'confirm_download_no']:
+            await self._handle_large_file_confirmation_callback(chat_id, callback_data, query)
+
     async def _handle_download_type_callback(
         self,
         chat_id: int,
@@ -1052,6 +1061,7 @@ class TelegramHandler:
             )
 
             format_id = None
+            file_size_estimate = None
             if handler.name == "YouTube":
                 # Get format list
                 video_info, formats = await handler.get_format_list(url)
@@ -1061,6 +1071,10 @@ class TelegramHandler:
                     audio_format = handler.select_best_audio_format(formats)
                     if audio_format:
                         format_id = audio_format
+                    # Get file size estimate
+                    file_size_estimate = self._get_file_size_estimate_from_formats(
+                        formats, audio_format
+                    )
                 else:
                     # Select best video and audio formats
                     video_format = handler.select_best_video_format(formats)
@@ -1070,6 +1084,27 @@ class TelegramHandler:
                         format_id = f"{video_format}+{audio_format}"
                     elif video_format:
                         format_id = video_format
+                    # Get file size estimate
+                    file_size_estimate = self._get_file_size_estimate_from_formats(
+                        formats, format_id
+                    )
+
+            # Check if file size exceeds 500MB and needs confirmation
+            LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB in bytes
+            is_large_file = (
+                handler.name == "YouTube"
+                and download_type == "video"
+                and file_size_estimate is not None
+                and file_size_estimate > LARGE_FILE_THRESHOLD
+            )
+            if is_large_file:
+                size_mb = file_size_estimate / (1024 * 1024)
+                logger.info(f"Large file detected: {size_mb:.1f} MB, requesting confirmation")
+                await self._ask_large_file_confirmation(
+                    chat_id, message_id, url, download_type,
+                    content_info, file_size_estimate, format_id
+                )
+                return
 
             # Create progress callback
             async def progress_callback(progress_data):
@@ -1261,6 +1296,244 @@ class TelegramHandler:
             message_id=message_id,
             text=message
         )
+
+    async def _handle_large_file_confirmation_response(
+        self, chat_id: int, message_text: str
+    ):
+        """Handle user response for large file download confirmation"""
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 会话已过期，请重新发送链接。"
+            )
+            return
+
+        text_lower = message_text.lower()
+
+        if any(word in text_lower for word in ['是', 'yes', 'y', '确认', '确定', 'continue']):
+            await self._proceed_with_large_file_download(chat_id, state_data)
+        elif any(word in text_lower for word in ['否', 'no', 'n', '取消', 'ignore', 'stop']):
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 已取消大文件下载。"
+            )
+        else:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text="❌ 无效的选择，请输入 '是' 或 '否'。"
+            )
+            return
+
+        self.state_manager.clear_state(chat_id)
+
+    async def _handle_large_file_confirmation_callback(
+        self, chat_id: int, callback_data: str, query
+    ):
+        """Handle large file confirmation from inline buttons"""
+        state_data = self.state_manager.get_state_data(chat_id)
+
+        if not state_data:
+            await query.edit_message_text(
+                "❌ 会话已过期，请重新发送链接。"
+            )
+            return
+
+        if callback_data == "confirm_download_yes":
+            await query.edit_message_text("⬇️ 正在下载大文件...")
+            await self._proceed_with_large_file_download(chat_id, state_data)
+        else:
+            await query.edit_message_text("❌ 已取消大文件下载。")
+
+        self.state_manager.clear_state(chat_id)
+
+    async def _ask_large_file_confirmation(
+        self,
+        chat_id: int,
+        message_id: int,
+        url: str,
+        download_type: str,
+        content_info: Optional[Dict[str, Any]],
+        file_size: int,
+        format_id: Optional[str]
+    ):
+        """Ask user to confirm large file download"""
+        self.state_manager.set_state(
+            chat_id,
+            UserState.WAITING_LARGE_FILE_CONFIRMATION,
+            {
+                'url': url,
+                'download_type': download_type,
+                'content_info': content_info,
+                'file_size': file_size,
+                'format_id': format_id,
+                'message_id': message_id
+            }
+        )
+
+        file_size_mb = file_size / (1024 * 1024)
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✅ 确认下载",
+                    callback_data="confirm_download_yes"
+                ),
+                InlineKeyboardButton(
+                    "❌ 取消",
+                    callback_data="confirm_download_no"
+                )
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message_text = (
+            f"⚠️ 警告：文件较大\n\n"
+            f"📹 视频: {content_info.get('title', 'Unknown')[:50]}...\n"
+            f"💾 预计大小: {file_size_mb:.1f} MB\n\n"
+            f"下载此视频可能需要较长时间，是否确认下载？"
+        )
+
+        await self.telegram_service.edit_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=message_text,
+            reply_markup=reply_markup
+        )
+
+    async def _proceed_with_large_file_download(
+        self, chat_id: int, state_data: Dict[str, Any]
+    ):
+        """Proceed with large file download after confirmation"""
+        url = state_data['url']
+        download_type = state_data['download_type']
+        content_info = state_data['content_info']
+        format_id = state_data['format_id']
+        message_id = state_data['message_id']
+
+        handler = self.download_service.platform_manager.get_handler(url)
+
+        if not handler:
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="❌ 无法处理此链接。"
+            )
+            return
+
+        await self.telegram_service.edit_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⬇️ 正在下载大文件..."
+        )
+
+        async def progress_callback(progress_data):
+            await self._update_download_progress(
+                chat_id, message_id, progress_data
+            )
+
+        download_result = await self.download_service.download_content(
+            url=url,
+            content_type=download_type,
+            progress_callback=progress_callback,
+            format_id=format_id
+        )
+
+        if download_result.success:
+            if download_result.content_info:
+                title = download_result.content_info.title
+            elif content_info:
+                title = content_info.get('title', 'Unknown')
+            else:
+                title = "Unknown"
+
+            storage_result = await self._store_downloaded_file(
+                download_result.file_path,
+                title,
+                download_type
+            )
+
+            if storage_result['success']:
+                await self._send_success_message(
+                    chat_id,
+                    message_id,
+                    content_info or {},
+                    storage_result,
+                    download_type
+                )
+            else:
+                await self.telegram_service.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="❌ 文件存储失败，请稍后重试。"
+                )
+        else:
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"❌ 下载失败: {download_result.error_message}"
+            )
+
+    def _get_file_size_estimate_from_formats(
+        self, formats: List[Dict[str, Any]], format_id: Optional[str]
+    ) -> Optional[int]:
+        """Get file size estimate from formats list"""
+        if not formats:
+            return None
+
+        size = None
+
+        if format_id:
+            format_id_str = str(format_id)
+
+            if '+' in format_id_str:
+                video_id, audio_id = format_id_str.split('+')
+                video_size = None
+                audio_size = None
+
+                for fmt in formats:
+                    fmt_id = str(fmt.get('format_id', ''))
+                    if fmt_id == video_id:
+                        video_size = (
+                            fmt.get('filesize')
+                            or fmt.get('filesize_estimate')
+                            or fmt.get('filesize_approx')
+                        )
+                    elif fmt_id == audio_id:
+                        audio_size = (
+                            fmt.get('filesize')
+                            or fmt.get('filesize_estimate')
+                            or fmt.get('filesize_approx')
+                        )
+
+                if video_size and audio_size:
+                    size = video_size + audio_size
+                elif video_size:
+                    size = video_size
+                else:
+                    size = audio_size
+            else:
+                for fmt in formats:
+                    if str(fmt.get('format_id', '')) == format_id_str:
+                        size = (
+                            fmt.get('filesize')
+                            or fmt.get('filesize_estimate')
+                            or fmt.get('filesize_approx')
+                        )
+                        break
+
+        if size is None:
+            for fmt in formats:
+                if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
+                    size = (
+                        fmt.get('filesize')
+                        or fmt.get('filesize_estimate')
+                        or fmt.get('filesize_approx')
+                    )
+                    if size:
+                        break
+
+        return size
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""

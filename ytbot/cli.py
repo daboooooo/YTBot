@@ -318,13 +318,17 @@ class YTBot:
 
         try:
             from datetime import datetime
+            import yt_dlp
 
             storage_info = "未知"
+            local_space_mb = 0
             if self.storage_service:
                 storage_info = (
                     'Nextcloud + 本地存储'
                     if self.storage_service.nextcloud_available else '仅本地存储'
                 )
+                if self.storage_service.local_storage:
+                    local_space_mb = self.storage_service.local_storage.get_available_space_mb()
 
             cache_info = ""
             if self.storage_service:
@@ -342,10 +346,12 @@ class YTBot:
 
             notification_message = (
                 f"🚀 **YTBot 启动成功**\n\n"
+                f"🤖 版本: {self.config.app.version}\n"
+                f"📦 yt-dlp: {yt_dlp.version.__version__}\n"
+                f"💾 存储: {storage_info} (可用: {local_space_mb:.1f} MB)\n"
                 f"⏰ 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"⏱️ 启动耗时: {startup_time:.2f} 秒\n"
                 f"🔒 进程 ID: {os.getpid()}\n"
-                f"💾 存储模式: {storage_info}"
                 f"{cache_info}\n\n"
                 f"✅ 机器人已准备就绪，等待接收消息..."
             )

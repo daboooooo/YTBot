@@ -18,8 +18,6 @@ from .base import PlatformHandler
 from ..core.logger import get_logger
 from ..core.config import get_config
 from ..core.types import ContentType, ContentInfo, DownloadResult, JSONDict
-from ..core.exceptions import YouTubeError, DownloadError
-from ..utils.async_utils import run_with_timeout
 
 logger = get_logger(__name__)
 
@@ -274,25 +272,21 @@ class YouTubeHandler(PlatformHandler):
             Tuple of (video_info, formats_list)
         """
         try:
-            # Use yt-dlp command to get format list with tv_embedded client
             cmd = [
                 'yt-dlp',
-                '--extractor-args', 'youtube:player_client=tv_embedded',
-                '--list-formats',
+                '--flat-playlist',
                 '--dump-json',
                 url
             ]
 
             logger.info(f"Getting format list for: {url}")
 
-            # Run command asynchronously with timeout
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            # Add timeout to prevent hanging
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -306,19 +300,29 @@ class YouTubeHandler(PlatformHandler):
 
             if process.returncode != 0:
                 logger.error(f"yt-dlp command failed: {stderr.decode()}")
-                # Fallback to Python API
                 return await self._get_format_list_fallback(url)
 
-            # Parse JSON output
-            video_info = json.loads(stdout.decode())
-            formats = video_info.get('formats', [])
+            output = stdout.decode().strip()
+            if not output:
+                logger.error("yt-dlp returned empty output")
+                return await self._get_format_list_fallback(url)
+
+            try:
+                video_info = json.loads(output)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse yt-dlp JSON output: {e}")
+                return await self._get_format_list_fallback(url)
+
+            if isinstance(video_info, list):
+                video_info = video_info[0] if video_info else {}
+
+            formats = video_info.get('formats', []) if isinstance(video_info, dict) else []
 
             logger.info(f"Found {len(formats)} formats for video")
             return video_info, formats
 
         except Exception as e:
             logger.error(f"Failed to get format list: {e}")
-            # Fallback to Python API
             return await self._get_format_list_fallback(url)
 
     async def _get_format_list_fallback(
@@ -335,13 +339,12 @@ class YouTubeHandler(PlatformHandler):
         """
         try:
             cookies_path = self._load_youtube_cookies()
-            
+
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extractor_args': ['youtube:player_client=tv_embedded'],
             }
-            
+
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
 
@@ -350,9 +353,16 @@ class YouTubeHandler(PlatformHandler):
                     return ydl.extract_info(url, download=False)
 
             info = await asyncio.to_thread(extract_info)
-            formats = info.get('formats', []) if info else []
 
-            return info or {}, formats
+            if info is None:
+                return {}, []
+
+            if isinstance(info, list):
+                info = info[0] if info else {}
+
+            formats = info.get('formats', []) if isinstance(info, dict) else []
+
+            return info, formats
 
         except Exception as e:
             logger.error(f"Fallback format extraction failed: {e}")

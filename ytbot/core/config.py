@@ -208,8 +208,8 @@ class LogConfig:
 @dataclass(frozen=True)
 class AppConfig:
     """Application configuration"""
-    name: str = "YouTube Download Bot"
-    version: str = "2.0.0"
+    name: str = "Youtube & Twitter (YT) Download Bot"
+    version: str = field(default_factory=lambda: __import__('ytbot').__version__)
     max_message_length: int = 4096
     max_concurrent_downloads: int = field(default_factory=lambda: get_env_int("MAX_CONCURRENT_DOWNLOADS", 5, min_value=1))
 
@@ -331,8 +331,7 @@ def get_config() -> BotConfig:
 
 
 def reload_config() -> BotConfig:
-    """
-    Reload configuration from environment variables.
+    """Reload configuration from environment variables.
     
     Returns:
         New BotConfig instance
