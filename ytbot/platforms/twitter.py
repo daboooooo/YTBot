@@ -630,7 +630,7 @@ class TwitterContentExtractor:
                         const text = el.textContent.trim();
                         const href = el.getAttribute('href') || '';
                         // Check if it looks like a username
-                        if (text && (text.startsWith('@') || href.match(/^\/[\w_]+$/))) {
+                        if (text && (text.startsWith('@') || href.match('/^\\\\/' + '[\\\\w_]+$'))) {
                             if (text.startsWith('@')) {
                                 author = text;
                             } else if (href) {
@@ -644,7 +644,7 @@ class TwitterContentExtractor:
 
                 // Fallback: extract from URL if available
                 if (!author) {
-                    const urlMatch = window.location.pathname.match(/\/(\w+)\/status\//);
+                    const urlMatch = window.location.pathname.match('/\\\\/(\\\\w+)\\\\/status\\\\/');
                     if (urlMatch) {
                         author = '@' + urlMatch[1];
                     }
@@ -1129,11 +1129,11 @@ class TwitterContentExtractor:
                         if (src.includes('youtube.com') || src.includes('youtu.be')) {
                             platform = 'youtube';
                             // Extract video ID
-                            const match = src.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
+                            const match = src.match('/(?:v=\\\\/)([a-zA-Z0-9_-]{11})/');
                             if (match) videoId = match[1];
                         } else if (src.includes('vimeo.com')) {
                             platform = 'vimeo';
-                            const match = src.match(/vimeo\.com\/(\d+)/);
+                            const match = src.match('/vimeo\\\\.com\\\\/(\\\\d+)/');
                             if (match) videoId = match[1];
                         } else if (src.includes('tiktok.com')) {
                             platform = 'tiktok';
@@ -1168,11 +1168,11 @@ class TwitterContentExtractor:
 
                         if (href.includes('youtube.com') || href.includes('youtu.be')) {
                             platform = 'youtube';
-                            const match = href.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
+                            const match = href.match('/(?:v=\\\\/)([a-zA-Z0-9_-]{11})/');
                             if (match) videoId = match[1];
                         } else if (href.includes('vimeo.com')) {
                             platform = 'vimeo';
-                            const match = href.match(/vimeo\.com\/(\d+)/);
+                            const match = href.match('/vimeo\\\\.com\\\\/(\\\\d+)/');
                             if (match) videoId = match[1];
                         }
 
@@ -1327,7 +1327,7 @@ class TwitterContentExtractor:
                 // 页面标题格式通常是: "标题内容 on X: \"内容\" / X" 或 "作者 on X: \"内容\" / X"
                 const pageTitle = document.title;
                 if (pageTitle && pageTitle.includes(' on X:')) {
-                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
+                    const titleMatch = pageTitle.match('/on X:\\\\s*"([^"]+)"/');
                     if (titleMatch && titleMatch[1]) {
                         articleTitle = titleMatch[1].trim();
                     }
@@ -2347,7 +2347,7 @@ class TwitterHandler(PlatformHandler):
         # - Spaces
         # - Square brackets for markers: [ ]
         allowed_pattern = (
-            r'[^\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9\s，。！？、：""''\[\]]'  # noqa: W605
+            r'[^\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9\s，。！？、：""''[]' + ']'
         )
         cleaned = re.sub(allowed_pattern, '', cleaned)
 
