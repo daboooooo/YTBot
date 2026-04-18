@@ -2059,7 +2059,8 @@ class TwitterHandler(PlatformHandler):
     def generate_telegram_preview(
         self,
         result: Dict[str, Any],
-        is_processing: bool = True
+        is_processing: bool = True,
+        processing_state: str = ""
     ) -> str:
         """
         生成友好的 Telegram 提示信息
@@ -2073,6 +2074,7 @@ class TwitterHandler(PlatformHandler):
         Args:
             result: scrape_tweet 返回的结果字典
             is_processing: 是否显示"正在处理"状态
+            processing_state: 增量更新时的处理状态（如 "正在保存..."），会替换原状态行
 
         Returns:
             格式化的 Telegram 消息文本
@@ -2080,7 +2082,6 @@ class TwitterHandler(PlatformHandler):
         if not result.get('success'):
             return "❌ 无法获取内容信息"
 
-        # 提取基本信息
         post_type = result.get('post_type', 'regular')
         is_thread = result.get('is_thread', False)
         author = result.get('author', '@unknown')
@@ -2092,7 +2093,6 @@ class TwitterHandler(PlatformHandler):
         thread_info = result.get('thread_info', {})
         thread_count = thread_info.get('thread_posts_count', 0)
 
-        # 确定内容类型标签
         if is_thread:
             type_emoji = "🧵"
             type_label = f"连续贴 ({thread_count}条)"
@@ -2109,23 +2109,19 @@ class TwitterHandler(PlatformHandler):
             type_emoji = "💬"
             type_label = "帖子"
 
-        # 构建内容预览
         content_preview = content[:100] if len(content) > 100 else content
         if len(content) > 100:
             content_preview += "..."
 
-        # 格式化时间
         time_str = ""
         if timestamp:
             try:
                 from datetime import datetime
-                # 尝试解析 ISO 格式时间
                 dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                 time_str = dt.strftime('%Y-%m-%d %H:%M')
             except (ValueError, TypeError):
                 time_str = timestamp[:16] if len(timestamp) > 16 else timestamp
 
-        # 构建消息
         lines = [
             "🐦 Twitter/X 内容",
             "",
@@ -2133,31 +2129,46 @@ class TwitterHandler(PlatformHandler):
             f"👤 作者: {author}",
         ]
 
-        # 添加标题（如果是长文）
         if post_type == 'article' and result.get('article_title'):
             lines.append(f"📰 标题: {result['article_title'][:80]}")
 
-        # 添加内容预览
         if content_preview:
             lines.append(f"📝 预览: {content_preview}")
 
-        # 添加时间
         if time_str:
             lines.append(f"⏰ 时间: {time_str}")
 
-        # 添加统计信息
         stats = []
         if result.get('external_links'):
             stats.append(f"{len(result['external_links'])} 个链接")
         if stats:
             lines.append(f"📊 包含: {' | '.join(stats)}")
 
-        # 添加处理状态
         if is_processing:
             lines.append("")
-            lines.append("⏳ 正在获取内容，请稍候...")
+            if processing_state:
+                lines.append(processing_state)
+            else:
+                lines.append("⏳ 正在获取内容，请稍候...")
 
         return "\n".join(lines)
+
+    def build_processing_state(
+        self,
+        result: Dict[str, Any],
+        state: str
+    ) -> str:
+        """
+        构建处理状态行，用于增量更新消息底部的处理状态。
+
+        Args:
+            result: scrape_tweet 返回的结果字典
+            state: 处理状态描述
+
+        Returns:
+            处理状态行文本
+        """
+        return f"⏳ {state}"
 
     async def fetch_link_preview(self, url: str) -> Dict[str, Optional[str]]:
         """

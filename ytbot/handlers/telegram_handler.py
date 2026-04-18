@@ -677,6 +677,33 @@ class TelegramHandler:
                 )
                 return
 
+            if content_info.get('error_detail') and content_info.get('title') == 'Unknown':
+                error_code = content_info.get('error_detail')
+                if handler and handler.name == "YouTube":
+                    error_message = handler.get_error_message(error_code)
+                else:
+                    error_messages = {
+                        "ERROR_SIGN_IN_REQUIRED": "🔐 需要登录或更新cookies",
+                        "ERROR_AGE_RESTRICTED": "🔞 年龄限制视频",
+                        "ERROR_COPYRIGHT": "©️ 版权限制",
+                        "ERROR_VIDEO_UNAVAILABLE": "❌ 视频不可用",
+                        "ERROR_VIDEO_PRIVATE": "🔒 私有视频",
+                        "ERROR_VIDEO_REMOVED": "🗑️ 视频已删除",
+                        "ERROR_GEO_RESTRICTED": "🌍 地区限制",
+                        "ERROR_RENTAL_PURCHASE": "💰 需要购买或租借",
+                        "ERROR_LOGIN_REQUIRED": "🔐 需要登录",
+                    }
+                    error_message = error_messages.get(
+                        error_code,
+                        "❌ 获取内容信息时发生错误"
+                    )
+                await self.telegram_service.edit_message(
+                    chat_id=chat_id,
+                    message_id=progress_message['message_id'],
+                    text=error_message
+                )
+                return
+
             if handler and handler.name == "YouTube":
                 # For YouTube, ask user to select download type
                 await self._ask_download_type(
@@ -717,19 +744,16 @@ class TelegramHandler:
             handler: Twitter handler instance
         """
         try:
-            # First, get content info to show preview
             from ..platforms.twitter import TwitterContentExtractor
 
             extractor = TwitterContentExtractor()
 
-            # Show initial message
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
                 message_id=message_id,
                 text="🔍 正在分析 Twitter/X 内容..."
             )
 
-            # Get content info
             result = await extractor.scrape_tweet(url)
 
             if not result.get('success'):
@@ -741,22 +765,17 @@ class TelegramHandler:
                 await extractor.close_browser()
                 return
 
-            # Generate friendly preview message
-            preview_text = handler.generate_telegram_preview(result, is_processing=True)
+            await extractor.close_browser()
 
-            # Update message with preview
+            preview_text = handler.generate_telegram_preview(result, is_processing=True)
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=preview_text
             )
 
-            # Close browser after getting info
-            await extractor.close_browser()
-
-            # Proceed with download
             await self._proceed_with_download(
-                chat_id, message_id, url, "text", None
+                chat_id, message_id, url, "text", result
             )
 
         except Exception as e:
@@ -1034,7 +1053,7 @@ class TelegramHandler:
             message_id: Message ID to update
             url: Video URL
             download_type: "audio" or "video"
-            content_info: Optional content info dictionary
+            content_info: Optional content info dictionary (for Twitter, contains scrape result)
         """
         try:
             handler = self.download_service.platform_manager.get_handler(url)
@@ -1047,17 +1066,28 @@ class TelegramHandler:
                 )
                 return
 
-            if handler.name == "Twitter/X":
+            is_twitter = handler.name == "Twitter/X"
+            twitter_result = content_info if is_twitter and content_info and content_info.get('success') else None
+
+            if is_twitter:
                 action_text = "正在获取推文"
+                if twitter_result:
+                    message_text = handler.generate_telegram_preview(
+                        twitter_result,
+                        is_processing=True,
+                        processing_state="⬇️ 正在保存到本地..."
+                    )
+                else:
+                    message_text = f"⬇️ {action_text}..."
             elif download_type == "audio":
-                action_text = "正在下载音频"
+                message_text = "⬇️ 正在下载音频..."
             else:
-                action_text = "正在下载视频"
+                message_text = "⬇️ 正在下载视频..."
 
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"⬇️ {action_text}..."
+                text=message_text
             )
 
             format_id = None
@@ -1271,25 +1301,37 @@ class TelegramHandler:
             message_id: Message ID to edit
             content_info: Content information dictionary
             storage_result: Storage result dictionary
-            download_type: "audio" or "video"
+            download_type: "audio", "video", or "text" (for Twitter)
         """
-        type_emoji = "🎵" if download_type == "audio" else "🎬"
-        type_name = "音频" if download_type == "audio" else "视频"
+        is_twitter = download_type == "text"
 
-        if storage_result['storage_type'] == 'nextcloud':
-            message = (
-                f"✅ {type_name}下载和上传完成！\n\n"
-                f"📁 文件: {content_info.get('title', 'Unknown')}\n"
-                f"{type_emoji} 类型: {type_name}\n"
-                f"🔗 访问链接: {storage_result['file_url']}"
-            )
+        if is_twitter and content_info.get('success'):
+            lines = [
+                "🐦 Twitter/X 内容",
+                "",
+                "✅ 已保存到本地",
+                f"📁 文件: {content_info.get('title', '推文内容')}",
+                f"💾 保存位置: {storage_result.get('file_path', '本地存储')}",
+            ]
+            message = "\n".join(lines)
         else:
-            message = (
-                f"⚠️ Nextcloud上传失败，文件已保存到本地存储\n\n"
-                f"📁 文件: {content_info.get('title', 'Unknown')}\n"
-                f"{type_emoji} 类型: {type_name}\n"
-                f"💾 本地路径: {storage_result['file_path']}"
-            )
+            type_emoji = "🎵" if download_type == "audio" else "🎬"
+            type_name = "音频" if download_type == "audio" else "视频"
+
+            if storage_result['storage_type'] == 'nextcloud':
+                message = (
+                    f"✅ {type_name}下载和上传完成！\n\n"
+                    f"📁 文件: {content_info.get('title', 'Unknown')}\n"
+                    f"{type_emoji} 类型: {type_name}\n"
+                    f"🔗 访问链接: {storage_result['file_url']}"
+                )
+            else:
+                message = (
+                    f"⚠️ Nextcloud上传失败，文件已保存到本地存储\n\n"
+                    f"📁 文件: {content_info.get('title', 'Unknown')}\n"
+                    f"{type_emoji} 类型: {type_name}\n"
+                    f"💾 本地路径: {storage_result['file_path']}"
+                )
 
         await self.telegram_service.edit_message(
             chat_id=chat_id,

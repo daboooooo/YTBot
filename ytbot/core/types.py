@@ -54,6 +54,7 @@ class ContentInfo:
     file_size_estimate: Optional[int] = None  # bytes
     formats: Optional[List[JSONDict]] = None
     metadata: Optional[JSONDict] = None
+    error_detail: Optional[str] = None
 
 
 @dataclass
