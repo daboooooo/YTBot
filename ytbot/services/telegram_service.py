@@ -5,6 +5,7 @@ Handles Telegram bot communication and message processing.
 """
 
 import asyncio
+import threading
 from typing import Optional, Dict, Any, Callable, List
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
@@ -20,13 +21,17 @@ class TelegramService:
     """Telegram bot service for handling bot communication with unified connection management."""
 
     _instance: Optional['TelegramService'] = None
-    _instance_lock = asyncio.Lock()
+    _instance_lock = threading.Lock()  # 改为 threading.Lock 用于 __new__
+    _async_lock = asyncio.Lock()      # 保留 asyncio.Lock 用于其他异步操作
 
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        # 使用 threading.Lock 保护实例创建（__new__ 是同步方法）
+        with cls._instance_lock:
+            if cls._instance is None:
+                instance = super().__new__(cls)
+                instance._initialized = False
+                cls._instance = instance
+            return cls._instance
 
     def __init__(self):
         if self._initialized:
@@ -55,7 +60,7 @@ class TelegramService:
     @classmethod
     async def get_instance(cls) -> 'TelegramService':
         """Get or create the singleton instance."""
-        async with cls._instance_lock:
+        async with cls._async_lock:
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance

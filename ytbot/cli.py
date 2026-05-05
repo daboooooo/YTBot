@@ -10,6 +10,7 @@ import os
 from typing import Dict, Any, Optional
 
 # Use new config system
+import ytbot
 from ytbot.core.config import get_config, reload_config, validate_config
 from ytbot.core.enhanced_logger import get_logger, setup_exception_handler, log_function_entry_exit
 from ytbot.core.startup_manager import StartupManager
@@ -446,7 +447,9 @@ async def main():
                 await bot.stop()
                 return 1
 
-        # Wait for shutdown signal
+        logger.info("✅ YTBot running (Telegram + background services)")
+        logger.info("   Press Ctrl+C to stop")
+
         await bot.wait_for_shutdown()
 
         logger.info("🛑 Shutdown signal received, stopping bot...")
@@ -532,7 +535,7 @@ Examples:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 2.0.0"
+        version=f"%(prog)s {ytbot.__version__}"
     )
 
     args = parser.parse_args()

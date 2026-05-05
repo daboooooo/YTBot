@@ -49,6 +49,61 @@ class StorageService:
         logger.info("🔄 Storage failover: Switching to local storage backend")
         self._nextcloud_available = False
 
+    def check_storage_quota(self, file_size_bytes: int) -> Dict[str, Any]:
+        """
+        Check if there's enough storage space before upload.
+
+        Args:
+            file_size_bytes: Size of file to upload in bytes
+
+        Returns:
+            Dictionary with 'ok' boolean and details
+        """
+        result = {"ok": True, "message": "", "available_space": 0}
+
+        # Check local storage quota
+        if CONFIG['local_storage']['enabled']:
+            try:
+                local_info = get_local_storage_info()
+                available_bytes = local_info.get('available_space_bytes', 0)
+
+                result["available_space"] = available_bytes
+
+                if file_size_bytes > available_bytes:
+                    result["ok"] = False
+                    result["message"] = (
+                        f"Insufficient local storage space. "
+                        f"Need: {file_size_bytes / 1024 / 1024:.1f}MB, "
+                        f"Available: {available_bytes / 1024 / 1024:.1f}MB"
+                    )
+                    result["storage_type"] = "local"
+                    return result
+
+            except Exception as e:
+                logger.warning(f"Could not check local storage quota: {e}")
+
+        # Check Nextcloud quota (if configured)
+        if self.nextcloud_available:
+            try:
+                nc_info = self.nextcloud_storage.get_storage_info()
+                nc_quota = nc_info.get('quota', {})
+                nc_available = nc_quota.get('available', 0)
+
+                if file_size_bytes > nc_available:
+                    result["ok"] = False
+                    result["message"] = (
+                        f"Insufficient Nextcloud quota. "
+                        f"Need: {file_size_bytes / 1024 / 1024:.1f}MB, "
+                        f"Available: {nc_available / 1024 / 1024:.1f}MB"
+                    )
+                    result["storage_type"] = "nextcloud"
+                    return result
+
+            except Exception as e:
+                logger.warning(f"Could not check Nextcloud quota: {e}")
+
+        return result
+
     @log_function_entry_exit(logger)
     async def store_file(
         self,
@@ -85,6 +140,11 @@ class StorageService:
             error_msg = f"Source file does not exist: {source_path}"
             logger.error(f"❌ {error_msg}")
             result["error"] = error_msg
+            result["error_code"] = "FILE_NOT_FOUND"
+            result["error_detail"] = {
+                "path": source_path,
+                "checked_at": datetime.now().isoformat()
+            }
             return result
 
         # Check if source is a directory
@@ -111,6 +171,26 @@ class StorageService:
                 logger.debug(f"File size: {file_size} bytes ({size_mb:.2f} MB)")
         except Exception as e:
             logger.warning(f"⚠️  Could not get file size: {e}")
+            file_size = 0
+
+        # Check storage quota before attempting upload
+        try:
+            # Use total_size for directories, file_size for single files
+            size_to_check = total_size if is_directory else file_size
+            if size_to_check > 0:
+                quota_check = self.check_storage_quota(size_to_check)
+
+                if not quota_check["ok"]:
+                    warning_msg = (
+                        f"⚠️  Storage quota exceeded: {quota_check['message']}"
+                    )
+                    logger.warning(warning_msg)
+                    result["warning"] = warning_msg
+                    result["quota_exceeded"] = True
+                    result["quota_details"] = quota_check
+                    # Don't fail completely - still attempt local storage as fallback
+        except Exception as e:
+            logger.warning(f"⚠️  Could not perform storage quota check: {e}")
 
         # Try Nextcloud first if available
         logger.info("🚀 Starting storage process...")

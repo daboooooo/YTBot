@@ -4,6 +4,7 @@ Setup script for YTBot
 
 from setuptools import setup, find_packages
 from pathlib import Path
+import os, re
 
 # Read the README file
 this_directory = Path(__file__).parent
@@ -15,9 +16,19 @@ if (this_directory / "requirements.txt").exists():
     with open(this_directory / "requirements.txt", "r") as f:
         requirements = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
+def get_version():
+    """Read version from ytbot/__init__.py"""
+    init_file = this_directory / "ytbot" / "__init__.py"
+    with open(init_file, "r") as f:
+        content = f.read()
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+    if match:
+        return match.group(1)
+    raise RuntimeError("Unable to find version string in __init__.py")
+
 setup(
     name="ytbot",
-    version="2.0.0",
+    version=get_version(),
     author="YTBot Team",
     author_email="ytbot@example.com",
     description="Multi-platform content download and management bot",

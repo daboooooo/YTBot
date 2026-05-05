@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable
 from functools import wraps
+import threading
 
 from .config import get_config
 
@@ -35,8 +36,8 @@ class YTBotLogger:
             "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s"
         )
 
-        # Console handler with colors
-        console_handler = ColoredConsoleHandler()
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(getattr(logging, self.config.log.level))
         console_formatter = logging.Formatter(detailed_format)
         console_handler.setFormatter(console_formatter)
@@ -265,29 +266,6 @@ class YTBotLogger:
         return f"[{bar}]"
 
 
-class ColoredConsoleHandler(logging.StreamHandler):
-    """Console handler with colored output for better readability"""
-
-    COLORS = {
-        'DEBUG': '\033[36m',     # Cyan
-        'INFO': '\033[32m',      # Green
-        'WARNING': '\033[33m',   # Yellow
-        'ERROR': '\033[31m',     # Red
-        'CRITICAL': '\033[35m',  # Magenta
-        'RESET': '\033[0m'       # Reset
-    }
-
-    def emit(self, record):
-        """Emit a log record with color formatting"""
-        # Add color to the levelname
-        if hasattr(record, 'levelname'):
-            color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-            reset = self.COLORS['RESET']
-            record.levelname = f"{color}{record.levelname}{reset}"
-
-        super().emit(record)
-
-
 def get_logger(name: Optional[str] = None) -> YTBotLogger:
     """Get an enhanced logger instance"""
     if name is None:
@@ -374,6 +352,3 @@ def log_function_entry_exit(logger: YTBotLogger = None):
 
     return decorator
 
-
-# Import threading at the end to avoid circular imports
-import threading

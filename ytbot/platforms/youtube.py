@@ -371,10 +371,17 @@ class YouTubeHandler(PlatformHandler):
                 )
 
         except Exception as e:
-            logger.error(f"Failed to download YouTube content: {e}")
+            error_msg = str(e)
+            logger.error(f"Failed to download YouTube content: {error_msg}")
+            
+            # Parse specific error for better messaging
+            parsed_error = self._parse_youtube_error(error_msg)
+            user_message = self.get_error_message(parsed_error)
+            
             return DownloadResult(
                 success=False,
-                error_message=str(e)
+                error_message=user_message,  # User-friendly message
+                error_detail=parsed_error    # Technical detail for debugging
             )
 
         finally:
@@ -382,22 +389,28 @@ class YouTubeHandler(PlatformHandler):
             # for upload/storage. Cleanup should be handled by the caller.
             pass
 
-    def get_supported_formats(self, url: str) -> List[JSONDict]:
+    async def get_supported_formats(self, url: str) -> List[JSONDict]:
         """Get available download formats for the content"""
         try:
             cookies_path = self._load_youtube_cookies()
-            
+
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
             }
-            
+
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                return info.get('formats', [])
+            def _extract_sync():
+                """Synchronous extraction wrapped for async execution"""
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    return info.get('formats', []) if info else []
+
+            formats = await asyncio.to_thread(_extract_sync)
+            logger.info(f"Found {len(formats)} formats for {url}")
+            return formats
 
         except Exception as e:
             logger.error(f"Failed to get YouTube formats for {url}: {e}")
