@@ -10,7 +10,7 @@ from webdav3.client import Client as NextcloudClient
 from typing import Optional, Dict, Any, List
 
 from ..core.config import CONFIG
-from ..core.logger import get_logger
+from ..core.enhanced_logger import get_logger
 
 logger = get_logger(__name__)
 

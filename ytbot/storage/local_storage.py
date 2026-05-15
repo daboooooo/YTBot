@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from ..core.config import CONFIG
-from ..core.logger import get_logger
+from ..core.enhanced_logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -148,6 +148,9 @@ class LocalStorageManager:
 
             html_file = html_files[0]
 
+            pdf_files = list(source_dir.glob("*.pdf"))
+            pdf_file = pdf_files[0] if pdf_files else None
+
             date_folder = datetime.now().strftime("%Y-%m")
             target_dir = self.storage_path / date_folder
             target_dir.mkdir(exist_ok=True)
@@ -175,6 +178,23 @@ class LocalStorageManager:
             # Update target_path to point to the HTML inside tweet directory
             target_path = html_target
 
+            # Copy PDF file (if exists)
+            has_pdf = False
+            if pdf_file:
+                pdf_target = tweet_dir / pdf_file.name
+
+                if pdf_target.exists():
+                    timestamp = datetime.now().strftime("%H%M%S")
+                    name_without_ext = pdf_file.stem
+                    pdf_target = tweet_dir / f"{name_without_ext}_{timestamp}.pdf"
+
+                try:
+                    shutil.copy2(pdf_file, pdf_target)
+                    has_pdf = True
+                    logger.info(f"PDF file copied: {pdf_target}")
+                except Exception as e:
+                    logger.warning(f"Failed to copy PDF file: {e}")
+
             # Copy images to tweet directory
             images_source = source_dir / "images"
             if images_source.exists():
@@ -197,10 +217,10 @@ class LocalStorageManager:
 
             has_images = images_source.exists()
             has_videos = videos_source.exists()
-            if has_images or has_videos:
+            if has_images or has_videos or has_pdf:
                 logger.info(
                     f"Directory saved to local storage: {target_path} "
-                    f"(images: {has_images}, videos: {has_videos})"
+                    f"(images: {has_images}, videos: {has_videos}, pdf: {has_pdf})"
                 )
             else:
                 logger.info(f"File saved to local storage: {target_path}")

@@ -85,7 +85,9 @@ class DownloadService:
         content_type: str = "video",
         progress_callback: Optional[Callable] = None,
         download_id: Optional[str] = None,
-        format_id: Optional[str] = None
+        format_id: Optional[str] = None,
+        handler=None,
+        pre_scraped_result: Optional[Dict[str, Any]] = None
     ) -> DownloadResult:
         """
         Download content from URL
@@ -96,6 +98,9 @@ class DownloadService:
             progress_callback: Optional progress callback function
             download_id: Optional download ID for tracking
             format_id: Optional specific format ID to download
+            handler: Optional pre-matched handler to avoid redundant matching
+            pre_scraped_result: Optional pre-scraped result to avoid
+                redundant browser access (for Twitter)
 
         Returns:
             DownloadResult: Result of the download operation
@@ -104,7 +109,9 @@ class DownloadService:
             download_id = f"{hash(url)}_{content_type}"
 
         try:
-            handler = self.platform_manager.get_handler(url)
+            # Use the already-matched handler if provided
+            if handler is None:
+                handler = self.platform_manager.get_handler(url)
             if not handler:
                 return DownloadResult(
                     success=False,
@@ -127,7 +134,8 @@ class DownloadService:
                 url=url,
                 content_type=content_type_enum,
                 progress_callback=progress_callback,
-                format_id=format_id
+                format_id=format_id,
+                pre_scraped_result=pre_scraped_result
             )
 
             if result.success:

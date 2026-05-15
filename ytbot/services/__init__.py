@@ -7,7 +7,7 @@ and provides a clean API for the bot to interact with.
 
 The service layer abstracts away the complexity of individual components and
 provides a unified interface for common operations like Telegram communication,
-file storage, and content downloading.
+file storage, content downloading, and PDF generation.
 
 Exported Components:
     TelegramService: class
@@ -25,6 +25,14 @@ Exported Components:
         Service that coordinates platform handlers and manages download operations.
         Supports URL validation, content information extraction, and downloading
         with progress callbacks and format selection.
+
+    PdfConverter: class
+        Service for converting HTML content to PDF. Supports multiple conversion
+        methods (Chrome headless, textutil) with automatic fallback.
+
+    PdfPreprocessor: class
+        Preprocesses HTML content for better PDF conversion, handling media
+        paths and video placeholders.
 
 Example:
     >>> from ytbot.services import TelegramService, StorageService, DownloadService
@@ -56,10 +64,42 @@ Example:
     ...     chat_id=123456,
     ...     text="Download completed!"
     ... )
+
+PDF Generation Example:
+    >>> from ytbot.services import PdfConverter, convert_html_to_pdf
+    >>>
+    >>> # Convert HTML file to PDF
+    >>> pdf_path = await convert_html_to_pdf(
+    ...     "content.html",
+    ...     "output.pdf"
+    ... )
+    >>>
+    >>> if pdf_path:
+    ...     print(f"PDF generated: {pdf_path}")
 """
 
 from .telegram_service import TelegramService
 from .storage_service import StorageService
 from .download_service import DownloadService
+from .pdf_converter import (
+    PdfConverter,
+    pdf_converter,
+    convert_html_to_pdf,
+    convert_html_content_to_pdf,
+    is_pdf_conversion_available
+)
+from .pdf_preprocessor import PdfPreprocessor, pdf_preprocessor, preprocess_for_pdf
 
-__all__ = ["TelegramService", "StorageService", "DownloadService"]
+__all__ = [
+    "TelegramService",
+    "StorageService",
+    "DownloadService",
+    "PdfConverter",
+    "pdf_converter",
+    "convert_html_to_pdf",
+    "convert_html_content_to_pdf",
+    "is_pdf_conversion_available",
+    "PdfPreprocessor",
+    "pdf_preprocessor",
+    "preprocess_for_pdf",
+]

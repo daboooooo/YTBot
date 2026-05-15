@@ -292,7 +292,8 @@ class YouTubeHandler(PlatformHandler):
         url: str,
         content_type: ContentType,
         progress_callback: Optional[Any] = None,
-        format_id: Optional[str] = None
+        format_id: Optional[str] = None,
+        pre_scraped_result: Optional[Any] = None
     ) -> DownloadResult:
         """
         Download content from YouTube.

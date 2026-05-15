@@ -9,7 +9,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, filters
 
 from ..core.config import CONFIG
-from ..core.logger import get_logger
+from ..core.enhanced_logger import get_logger
 from ..core.user_state import UserStateManager, UserState
 from ..services.telegram_service import TelegramService
 from ..services.storage_service import StorageService
@@ -211,6 +211,16 @@ class TelegramHandler:
         chat_id = update.effective_chat.id
         message_text = update.message.text.strip()
 
+        logger.info("=" * 50)
+        logger.info("📩 Received Telegram message")
+        logger.info("   Chat ID: %s", chat_id)
+        logger.info("   Message length: %d chars", len(message_text))
+        logger.info(
+            "   Content: %s",
+            message_text[:200] if len(message_text) > 200 else message_text
+        )
+        logger.info("=" * 50)
+
         if not self.telegram_service.check_user_permission(chat_id):
             await self.telegram_service.send_message(
                 chat_id=chat_id,
@@ -242,9 +252,26 @@ class TelegramHandler:
             return
 
         # Check if it's a URL we can handle
-        if not self.download_service.can_handle_url(message_text):
+        is_url = self._is_url(message_text)
+
+        # Match handler only once and reuse the result
+        handler = self.download_service.platform_manager.get_handler(message_text)
+        can_handle = handler is not None
+
+        logger.info("🔍 URL analysis results:")
+        logger.info("   Is URL: %s", is_url)
+        logger.info("   Can handle: %s", can_handle)
+
+        if can_handle:
+            logger.info("   Handler: %s", handler.name)
+        elif is_url:
+            supported = self.download_service.get_supported_platforms()
+            logger.info("   Supported platforms: %s", supported)
+            logger.info("   Result: URL is valid but no matching handler")
+
+        if not can_handle:
             # Check if the message looks like a URL
-            if self._is_url(message_text):
+            if is_url:
                 # Ask user if they want to save the content
                 await self._ask_save_unsupported_content(chat_id, message_text)
             else:
@@ -252,8 +279,8 @@ class TelegramHandler:
                 await self._ask_save_text_content(chat_id, message_text)
             return
 
-        # Handle the download request
-        await self._handle_download_request(chat_id, message_text)
+        # Handle the download request, passing the already-matched handler
+        await self._handle_download_request(chat_id, message_text, handler)
 
     def _is_url(self, text: str) -> bool:
         """Check if text is a URL"""
@@ -637,7 +664,12 @@ class TelegramHandler:
                 text=f"❌ 保存失败：{str(e)}"
             )
 
-    async def _handle_download_request(self, chat_id: int, url: str):
+    async def _handle_download_request(
+        self,
+        chat_id: int,
+        url: str,
+        handler=None
+    ):
         """Handle a download request from user"""
         try:
             # Send initial message
@@ -647,15 +679,16 @@ class TelegramHandler:
             )
 
             # Log URL being processed
-            logger.info(f"🔗 Processing URL: {url}")
+            logger.info("🔗 Processing URL: %s", url)
 
-            # Get platform handler to check platform type first
-            handler = self.download_service.platform_manager.get_handler(url)
+            # Use the already-matched handler if provided
+            if handler is None:
+                handler = self.download_service.platform_manager.get_handler(url)
 
             if handler:
-                logger.info(f"✅ Link type identified: {handler.name}")
+                logger.info("✅ Link type identified: %s", handler.name)
             else:
-                logger.warning(f"⚠️ No handler found for URL: {url}")
+                logger.warning("⚠️ No handler found for URL: %s", url)
 
             # Get content info
             content_info = await self.download_service.get_content_info(url)
@@ -712,7 +745,11 @@ class TelegramHandler:
             elif handler and handler.name == "Twitter/X":
                 # For Twitter/X, show friendly preview and download as text content
                 await self._handle_twitter_download(
-                    chat_id, progress_message['message_id'], url, handler
+                    chat_id,
+                    progress_message['message_id'],
+                    url,
+                    handler,
+                    content_info=content_info
                 )
             else:
                 # For other platforms, download as video by default
@@ -732,7 +769,8 @@ class TelegramHandler:
         chat_id: int,
         message_id: int,
         url: str,
-        handler
+        handler,
+        content_info: Optional[Dict[str, Any]] = None
     ):
         """
         Handle Twitter/X download with friendly preview message.
@@ -742,30 +780,35 @@ class TelegramHandler:
             message_id: Message ID to update
             url: Twitter/X URL
             handler: Twitter handler instance
+            content_info: Optional pre-fetched content info to avoid re-scraping
         """
         try:
-            from ..platforms.twitter import TwitterContentExtractor
-
-            extractor = TwitterContentExtractor()
-
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
                 message_id=message_id,
                 text="🔍 正在分析 Twitter/X 内容..."
             )
 
-            result = await extractor.scrape_tweet(url)
+            # Reuse content_info if available to avoid redundant browser access
+            if content_info and content_info.get('success'):
+                result = content_info
+                logger.info("♻️ Reusing pre-fetched content info (skipped redundant scrape)")
+            else:
+                from ..platforms.twitter import TwitterContentExtractor
 
-            if not result.get('success'):
-                await self.telegram_service.edit_message(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text="❌ 无法获取推文内容，请检查链接是否有效。"
-                )
+                extractor = TwitterContentExtractor()
+                result = await extractor.scrape_tweet(url)
+
+                if not result.get('success'):
+                    await self.telegram_service.edit_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="❌ 无法获取推文内容，请检查链接是否有效。"
+                    )
+                    await extractor.close_browser()
+                    return
+
                 await extractor.close_browser()
-                return
-
-            await extractor.close_browser()
 
             preview_text = handler.generate_telegram_preview(result, is_processing=True)
             await self.telegram_service.edit_message(
@@ -775,7 +818,7 @@ class TelegramHandler:
             )
 
             await self._proceed_with_download(
-                chat_id, message_id, url, "text", result
+                chat_id, message_id, url, "text", result, handler=handler
             )
 
         except Exception as e:
@@ -1043,7 +1086,8 @@ class TelegramHandler:
         message_id: int,
         url: str,
         download_type: str,
-        content_info: Optional[Dict[str, Any]] = None
+        content_info: Optional[Dict[str, Any]] = None,
+        handler=None
     ):
         """
         Proceed with the actual download.
@@ -1054,9 +1098,12 @@ class TelegramHandler:
             url: Video URL
             download_type: "audio" or "video"
             content_info: Optional content info dictionary (for Twitter, contains scrape result)
+            handler: Optional pre-matched handler to avoid redundant matching
         """
         try:
-            handler = self.download_service.platform_manager.get_handler(url)
+            # Use the already-matched handler if provided
+            if handler is None:
+                handler = self.download_service.platform_manager.get_handler(url)
 
             if not handler:
                 await self.telegram_service.edit_message(
@@ -1142,12 +1189,20 @@ class TelegramHandler:
                     chat_id, message_id, progress_data
                 )
 
-            # Download content
+            # Download content, passing handler and pre-scraped result
+            is_twitter = handler.name == "Twitter/X" if handler else False
+            twitter_result = (
+                content_info if is_twitter and content_info
+                and content_info.get('success') else None
+            )
+
             download_result = await self.download_service.download_content(
                 url=url,
                 content_type=download_type,
                 progress_callback=progress_callback,
-                format_id=format_id
+                format_id=format_id,
+                handler=handler,
+                pre_scraped_result=twitter_result
             )
 
             if download_result.success:

@@ -18,8 +18,9 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from ytbot.platforms.base import PlatformHandler, ContentInfo, ContentType, DownloadResult
-from ytbot.core.logger import get_logger
+from ytbot.core.enhanced_logger import get_logger
 from ytbot.services.storage_service import StorageService
+from ytbot.services.pdf_converter import pdf_converter
 
 # Try to import aiohttp for link preview
 aiohttp = None
@@ -466,6 +467,88 @@ class TwitterContentExtractor:
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
+
+    async def _switch_to_original_language(self, page) -> bool:
+        """
+        Ensure tweet content is displayed in its original language.
+
+        X/Twitter auto-translates tweets when the user's locale
+        differs from the tweet's language. This method detects
+        auto-translation and clicks 'View original' to restore
+        the original text, ensuring we always get the authentic
+        content rather than a machine translation.
+
+        Returns:
+            bool - Whether the original language was restored
+        """
+        try:
+            translation_indicator = await page.query_selector(
+                '[data-testid="translation"]'
+            )
+
+            if not translation_indicator:
+                logger.debug("No auto-translation detected on page")
+                return False
+
+            logger.info(
+                "Auto-translation detected, "
+                "switching to original language"
+            )
+
+            view_original_selectors = [
+                '[data-testid="translation"] a',
+                '[data-testid="translation"] [role="button"]',
+                '[data-testid="translation"] span[role="button"]',
+            ]
+
+            for selector in view_original_selectors:
+                btn = await page.query_selector(selector)
+                if btn:
+                    try:
+                        await btn.click()
+                        await page.wait_for_timeout(1500)
+                        logger.info(
+                            "Switched to original language successfully"
+                        )
+                        return True
+                    except Exception:
+                        continue
+
+            hidden = await page.evaluate("""
+                () => {
+                    const translations = document.querySelectorAll(
+                        '[data-testid="translation"]'
+                    );
+                    translations.forEach(el => {
+                        el.style.display = 'none';
+                    });
+
+                    const tweetText = document.querySelector(
+                        '[data-testid="tweetText"]'
+                    );
+                    if (tweetText) {
+                        const langSpans = tweetText.querySelectorAll(
+                            'span[lang]'
+                        );
+                        langSpans.forEach(span => {
+                            span.style.display = '';
+                        });
+                    }
+
+                    return translations.length > 0;
+                }
+            """)
+
+            if hidden:
+                logger.info("Hidden translation overlay via JavaScript")
+                return True
+
+            logger.debug("No translation found, keeping current content")
+            return False
+
+        except Exception as e:
+            logger.debug(f"Error switching to original language: {e}")
+            return False
 
     async def expand_long_tweet(self, page) -> bool:
         """Click 'Show more' button to expand long tweets"""
@@ -1542,6 +1625,136 @@ class TwitterContentExtractor:
                 html = html.replace(/<a[^>]*analytics[^>]*>.*?<\\/a>/gi, '');
                 html = html.replace(/<a[^>]*premium_sign_up[^>]*>.*?<\\/a>/gi, '');
 
+                const contentParts = [];
+                const firstArticle = (
+                    document.querySelector('article[data-testid="tweet"]')
+                    || document.querySelector('article')
+                );
+                const scope = firstArticle || document;
+
+                function cleanText(t) {
+                    t = t.replace(/[\\d,]+\\s*查看/g, '');
+                    t = t.replace(/[\\d,]+\\s*views/gi, '');
+                    t = t.replace(/想发布自己的文章？/g, '');
+                    t = t.replace(/升级为 Premium/g, '');
+                    t = t.replace(/[\\d,]+\\s*回复/g, '');
+                    t = t.replace(/[\\d,]+\\s*转帖/g, '');
+                    t = t.replace(/[\\d,]+\\s*喜欢/g, '');
+                    t = t.replace(/[\\d,]+\\s*书签/g, '');
+                    t = t.replace(/分享帖子/g, '');
+                    t = t.replace(/查看 \\d+ 条回复/g, '');
+                    t = t.replace(/[\\d,]+\\.?\\d*\\s*万/g, '');
+                    t = t.replace(/上午\\d+:\\d+\\s*·\\s*\\d+年\\d+月\\d+日/g, '');
+                    t = t.replace(/下午\\d+:\\d+\\s*·\\s*\\d+年\\d+月\\d+日/g, '');
+                    t = t.replace(/\\d+:\\d+\\s*[AP]M\\s*·\\s*\\w+\\s*\\d+,\\s*\\d+/g, '');
+                    t = t.replace(/^[^\\u4e00-\\u9fa5a-zA-Z\\[!"]+/, '');
+                    t = t.replace(/[·•]\\s*$/g, '');
+                    t = t.replace(/\\s+/g, ' ').trim();
+                    return t;
+                }
+
+                function cleanHtml(h) {
+                    h = h.replace(/<svg[^>]*>.*?<\\/svg>/gi, '');
+                    h = h.replace(/<button[^>]*data-testid="reply"[^>]*>.*?<\\/button>/gi, '');
+                    h = h.replace(/<button[^>]*data-testid="retweet"[^>]*>.*?<\\/button>/gi, '');
+                    h = h.replace(/<button[^>]*data-testid="like"[^>]*>.*?<\\/button>/gi, '');
+                    h = h.replace(/<button[^>]*data-testid="bookmark"[^>]*>.*?<\\/button>/gi, '');
+                    h = h.replace(/<a[^>]*analytics[^>]*>.*?<\\/a>/gi, '');
+                    h = h.replace(/<a[^>]*premium_sign_up[^>]*>.*?<\\/a>/gi, '');
+                    return h;
+                }
+
+                const richTextView = document.querySelector(
+                    '[data-testid="twitterArticleRichTextView"]'
+                );
+
+                if (richTextView) {
+                    const langDivs = richTextView.querySelectorAll('div[lang]');
+                    langDivs.forEach(el => {
+                        const lang = el.getAttribute('lang') || '';
+                        const t = cleanText(el.textContent.trim());
+                        const h = cleanHtml(el.innerHTML);
+                        if (t) {
+                            contentParts.push({
+                                lang: lang, text: t, html: h
+                            });
+                        }
+                    });
+
+                    if (contentParts.length > 0) {
+                        const zhPart = contentParts.find(p =>
+                            p.lang.startsWith('zh')
+                            || /[\\u4e00-\\u9fff]/.test(p.text)
+                        );
+                        if (zhPart) {
+                            text = zhPart.text;
+                            html = zhPart.html;
+                        } else {
+                            text = contentParts[0].text;
+                            html = contentParts[0].html;
+                        }
+                    }
+
+                    const fullText = cleanText(
+                        richTextView.textContent.trim()
+                    );
+                    if (fullText && fullText.length > text.length) {
+                        text = fullText;
+                    }
+                    const fullHtml = cleanHtml(richTextView.innerHTML);
+                    if (fullHtml && fullHtml.length > html.length) {
+                        html = fullHtml;
+                    }
+                } else {
+                    const tweetTexts = scope.querySelectorAll(
+                        '[data-testid="tweetText"]'
+                    );
+                    tweetTexts.forEach(el => {
+                        const lang = el.getAttribute('lang') || '';
+                        const t = cleanText(el.textContent.trim());
+                        const h = cleanHtml(el.innerHTML);
+                        if (t) {
+                            contentParts.push({
+                                lang: lang, text: t, html: h
+                            });
+                        }
+                    });
+
+                    const translations = scope.querySelectorAll(
+                        '[data-testid="translation"]'
+                    );
+                    translations.forEach(el => {
+                        const transText = el.querySelector(
+                            '[data-testid="tweetText"]'
+                        );
+                        if (transText) {
+                            const lang = (
+                                transText.getAttribute('lang') || ''
+                            );
+                            const t = cleanText(
+                                transText.textContent.trim()
+                            );
+                            const h = cleanHtml(transText.innerHTML);
+                            if (t) {
+                                contentParts.push({
+                                    lang: lang, text: t, html: h
+                                });
+                            }
+                        }
+                    });
+
+                    if (contentParts.length >= 1) {
+                        const zhPart = contentParts.find(p =>
+                            p.lang.startsWith('zh')
+                            || /[\\u4e00-\\u9fff]/.test(p.text)
+                        );
+                        if (zhPart) {
+                            text = zhPart.text;
+                            html = zhPart.html;
+                        }
+                    }
+                }
+
                 return {
                     text: text,
                     html: html,
@@ -1549,7 +1762,8 @@ class TwitterContentExtractor:
                     codeBlocks: codeBlocks,
                     images: images,
                     embeddedContent: embeddedContent,
-                    articleTitle: articleTitle
+                    articleTitle: articleTitle,
+                    contentParts: contentParts
                 };
             }
         """, base_url)
@@ -1661,18 +1875,52 @@ class TwitterContentExtractor:
                     }
 
                     // 提取内容
-                    const contentSelectors = [
-                        '[data-testid="tweetText"]',
-                        'div[lang]',
-                        '[role="link"] div[dir="auto"]'
-                    ];
+                    const allTweetTexts = post.querySelectorAll('[data-testid="tweetText"]');
+                    const contentParts = [];
+                    allTweetTexts.forEach(el => {
+                        const lang = el.getAttribute('lang') || '';
+                        const t = el.textContent.trim();
+                        const h = el.innerHTML;
+                        if (t) {
+                            contentParts.push({ lang: lang, text: t, html: h });
+                        }
+                    });
+                    const translations = post.querySelectorAll('[data-testid="translation"]');
+                    translations.forEach(el => {
+                        const transText = el.querySelector('[data-testid="tweetText"]');
+                        if (transText) {
+                            const lang = transText.getAttribute('lang') || '';
+                            const t = transText.textContent.trim();
+                            const h = transText.innerHTML;
+                            if (t) {
+                                contentParts.push({
+                                    lang: lang, text: t, html: h
+                                });
+                            }
+                        }
+                    });
 
-                    for (const selector of contentSelectors) {
-                        const contentEl = post.querySelector(selector);
-                        if (contentEl) {
-                            postData.content = contentEl.textContent.trim();
-                            postData.html = contentEl.innerHTML;
-                            break;
+                    if (contentParts.length > 0) {
+                        postData.content_parts = contentParts;
+                        const zhPart = contentParts.find(p =>
+                            p.lang.startsWith('zh')
+                            || /[\\u4e00-\\u9fff]/.test(p.text)
+                        );
+                        const primaryPart = zhPart || contentParts[0];
+                        postData.content = primaryPart.text;
+                        postData.html = primaryPart.html;
+                    } else {
+                        const contentSelectors = [
+                            'div[lang]',
+                            '[role="link"] div[dir="auto"]'
+                        ];
+                        for (const selector of contentSelectors) {
+                            const contentEl = post.querySelector(selector);
+                            if (contentEl) {
+                                postData.content = contentEl.textContent.trim();
+                                postData.html = contentEl.innerHTML;
+                                break;
+                            }
                         }
                     }
 
@@ -1718,6 +1966,24 @@ class TwitterContentExtractor:
                         .replace(/查看 \\d+ 条回复/g, '')
                         .replace(/\\s+/g, ' ')
                         .trim();
+
+                    if (postData.content_parts) {
+                        postData.content_parts = postData.content_parts.map(p => ({
+                            lang: p.lang,
+                            text: p.text
+                                .replace(/[\\d,]+\\s*查看/g, '')
+                                .replace(/[\\d,]+\\s*views/gi, '')
+                                .replace(/[\\d,]+\\s*回复/g, '')
+                                .replace(/[\\d,]+\\s*转帖/g, '')
+                                .replace(/[\\d,]+\\s*喜欢/g, '')
+                                .replace(/[\\d,]+\\s*书签/g, '')
+                                .replace(/分享帖子/g, '')
+                                .replace(/查看 \\d+ 条回复/g, '')
+                                .replace(/\\s+/g, ' ')
+                                .trim(),
+                            html: p.html
+                        }));
+                    }
 
                     return postData;
                 }
@@ -1988,6 +2254,7 @@ class TwitterContentExtractor:
                 'has_video': content.get('has_video', False),
                 'video_urls': content.get('video_urls', []),
                 'embedded_videos': content.get('embedded_videos', []),
+                'content_parts': content.get('contentParts', []),
                 'author': author,
                 'timestamp': timestamp,
                 # 连续贴相关信息
@@ -2496,16 +2763,29 @@ class TwitterHandler(PlatformHandler):
         url: str,
         content_type: ContentType,
         progress_callback=None,
-        format_id: str | None = None
+        format_id: str | None = None,
+        pre_scraped_result: Optional[Dict[str, Any]] = None
     ) -> DownloadResult:
         """Download content from Twitter/X"""
         try:
-            logger.info(f"Downloading Twitter content: {url} ({content_type.value})")
+            logger.info(
+                "Downloading Twitter content: %s (%s)",
+                url,
+                content_type.value
+            )
 
             if progress_callback:
                 await progress_callback({"status": "fetching", "progress": 20})
 
-            result = await self.extractor.scrape_tweet(url)
+            # Reuse pre-scraped result if available to avoid redundant
+            # browser access
+            if pre_scraped_result and pre_scraped_result.get('success'):
+                result = pre_scraped_result
+                logger.info(
+                    "♻️ Reusing pre-scraped result (skipped redundant scrape)"
+                )
+            else:
+                result = await self.extractor.scrape_tweet(url)
 
             if not result.get('success'):
                 err_msg = result.get('error', 'Failed to scrape tweet')
@@ -2589,6 +2869,38 @@ class TwitterHandler(PlatformHandler):
 
             logger.info(f"Saved tweet content to temporary file: {temp_file}")
 
+            # Generate PDF alongside HTML
+            pdf_file = None
+            if pdf_converter.is_available():
+                try:
+                    pdf_filename = filename.replace('.html', '.pdf')
+                    pdf_file = os.path.join(temp_dir, pdf_filename)
+
+                    video_thumbnails = (
+                        self._generate_video_thumbnails_mapping(local_videos)
+                    )
+
+                    pdf_result = await pdf_converter.convert_html_to_pdf(
+                        temp_file,
+                        pdf_file,
+                        preprocess=True,
+                        video_thumbnails=video_thumbnails
+                    )
+
+                    if pdf_result and os.path.exists(pdf_result):
+                        file_size = os.path.getsize(pdf_result)
+                        logger.info(
+                            f"PDF generated: {pdf_result} ({file_size} bytes)"
+                        )
+                    else:
+                        logger.warning("PDF generation returned empty result")
+                        pdf_file = None
+                except Exception as e:
+                    logger.error(f"PDF generation failed: {e}")
+                    pdf_file = None
+            else:
+                logger.warning("PDF converter not available, skipping PDF generation")
+
             if progress_callback:
                 await progress_callback({"status": "completed", "progress": 100})
 
@@ -2666,6 +2978,37 @@ class TwitterHandler(PlatformHandler):
                 error_message=str(e)
             )
 
+    def _generate_video_thumbnails_mapping(
+        self,
+        local_videos: List[str]
+    ) -> Dict[str, str]:
+        """Generate thumbnail paths for videos"""
+        from pathlib import Path as PathLib
+
+        thumbnails = {}
+
+        for video_path in local_videos:
+            if not video_path or not os.path.exists(video_path):
+                continue
+
+            video_path_obj = PathLib(video_path)
+
+            possible_thumbnails = [
+                video_path_obj.with_suffix('.jpg'),
+                video_path_obj.with_suffix('.png'),
+                video_path_obj.with_suffix('.thumb.jpg'),
+                video_path_obj.with_suffix('.thumb.png'),
+                video_path_obj.parent / 'thumbnails' / f'{video_path_obj.stem}.jpg',
+                video_path_obj.parent / 'thumbnails' / f'{video_path_obj.stem}.png',
+            ]
+
+            for thumb in possible_thumbnails:
+                if thumb.exists():
+                    thumbnails[video_path] = str(thumb)
+                    break
+
+        return thumbnails
+
     def _generate_html(
         self,
         result: Dict[str, Any],
@@ -2739,7 +3082,45 @@ class TwitterHandler(PlatformHandler):
     </div>'''
 
         # Build content HTML
-        if html_content:
+        content_parts = result.get('content_parts', [])
+        is_article = (post_type == 'article')
+
+        if is_article and html_content:
+            clean_content = self._clean_html_content(
+                html_content, local_images
+            )
+        elif content_parts and len(content_parts) > 1:
+            clean_content = ''
+            for part in content_parts:
+                lang = part.get('lang', '')
+                part_text = part.get('text', '')
+                is_zh = (lang.startswith('zh')
+                         or any('\u4e00' <= c <= '\u9fff'
+                                for c in part_text))
+                lang_label = '中文' if is_zh else 'English'
+                lang_class = 'bilingual-zh' if is_zh else 'bilingual-en'
+                part_html = part.get('html', '')
+                if part_html:
+                    clean_part = self._clean_html_content(
+                        part_html, local_images
+                    )
+                else:
+                    clean_part = f'<p>{part_text}</p>'
+                clean_content += (
+                    f'<div class="bilingual-block {lang_class}">'
+                    f'<span class="lang-label">{lang_label}</span>'
+                    f'{clean_part}</div>\n'
+                )
+        elif content_parts and len(content_parts) == 1:
+            part = content_parts[0]
+            part_html = part.get('html', '')
+            if part_html:
+                clean_content = self._clean_html_content(
+                    part_html, local_images
+                )
+            else:
+                clean_content = f'<p>{part.get("text", content)}</p>'
+        elif html_content:
             clean_content = self._clean_html_content(html_content, local_images)
         else:
             clean_content = f'<p>{content}</p>'
@@ -2782,9 +3163,36 @@ class TwitterHandler(PlatformHandler):
 
                     thread_html += '                </div>\n'
                     thread_html += (
-                        f'                <div class="thread-post-content">\n'
-                        f'                    <p>{post_content}</p>\n'
+                        '                <div class="thread-post-content">\n'
                     )
+
+                    post_content_parts = post.get('content_parts', [])
+                    if post_content_parts and len(post_content_parts) > 1:
+                        for part in post_content_parts:
+                            p_lang = part.get('lang', '')
+                            p_text = part.get('text', '')
+                            p_is_zh = (p_lang.startswith('zh')
+                                       or any('\u4e00' <= c <= '\u9fff'
+                                              for c in p_text))
+                            p_label = '中文' if p_is_zh else 'English'
+                            p_class = ('bilingual-zh' if p_is_zh
+                                       else 'bilingual-en')
+                            p_html = part.get('html', '')
+                            if p_html:
+                                clean_p = self._clean_html_content(
+                                    p_html, local_images
+                                )
+                            else:
+                                clean_p = f'<p>{p_text}</p>'
+                            thread_html += (
+                                f'                    <div class="bilingual-block {p_class}">'
+                                f'<span class="lang-label">{p_label}</span>'
+                                f'{clean_p}</div>\n'
+                            )
+                    else:
+                        thread_html += (
+                            f'                    <p>{post_content}</p>\n'
+                        )
 
                     # Add images for this thread post
                     if post_images:
@@ -3158,6 +3566,44 @@ class TwitterHandler(PlatformHandler):
         }}
         .thread-post-content p {{
             margin: 0 0 12px 0;
+        }}
+        .bilingual-block {{
+            margin-bottom: 16px;
+            padding: 12px 16px;
+            border-radius: 8px;
+            position: relative;
+        }}
+        .bilingual-zh {{
+            background: #fef7f0;
+            border-left: 3px solid #f77f00;
+        }}
+        .bilingual-en {{
+            background: #f0f4ff;
+            border-left: 3px solid #1d9bf0;
+        }}
+        .lang-label {{
+            display: inline-block;
+            font-size: 0.75em;
+            font-weight: 600;
+            padding: 1px 8px;
+            border-radius: 10px;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .bilingual-zh .lang-label {{
+            background: #f77f00;
+            color: #fff;
+        }}
+        .bilingual-en .lang-label {{
+            background: #1d9bf0;
+            color: #fff;
+        }}
+        .bilingual-block p {{
+            margin: 0 0 8px 0;
+        }}
+        .bilingual-block p:last-child {{
+            margin-bottom: 0;
         }}
         .thread-post-images {{
             display: grid;

@@ -6,9 +6,12 @@ like YouTube, Twitter/X, Instagram, etc.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 
 from ..core.types import ContentType, ContentInfo, DownloadResult, JSONDict
+from ..core.enhanced_logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class PlatformHandler(ABC):
@@ -55,7 +58,8 @@ class PlatformHandler(ABC):
         url: str,
         content_type: ContentType,
         progress_callback: Optional[Any] = None,
-        format_id: Optional[str] = None
+        format_id: Optional[str] = None,
+        pre_scraped_result: Optional[Any] = None
     ) -> DownloadResult:
         """
         Download content from the platform
@@ -65,6 +69,8 @@ class PlatformHandler(ABC):
             content_type: The type of content to download
             progress_callback: Optional callback for progress updates
             format_id: Optional specific format ID to download
+            pre_scraped_result: Optional pre-scraped result to avoid
+                redundant data fetching
 
         Returns:
             DownloadResult: Result of the download operation
@@ -125,9 +131,20 @@ class PlatformManager:
         Returns:
             PlatformHandler: The handler that can process this URL, or None
         """
+        logger.info("🔍 Matching URL to platform handler...")
+        logger.info("   URL: %s", url[:100] if len(url) > 100 else url)
+
         for handler in self.handlers:
-            if handler.can_handle(url):
+            can_handle = handler.can_handle(url)
+            logger.info(
+                "   %-15s → %s",
+                handler.name,
+                "✅ MATCH" if can_handle else "❌ no match"
+            )
+            if can_handle:
                 return handler
+
+        logger.info("   Result: No matching handler found")
         return None
 
     def get_supported_platforms(self) -> List[str]:
