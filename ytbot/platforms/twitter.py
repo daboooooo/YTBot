@@ -12,10 +12,12 @@ Implements complete Twitter/X content extraction with:
 
 import asyncio
 import re
+import shutil
 import tempfile
 import os
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 from ytbot.platforms.base import PlatformHandler, ContentInfo, ContentType, DownloadResult
 from ytbot.core.enhanced_logger import get_logger
@@ -115,6 +117,13 @@ class TwitterContentExtractor:
         self._using_shared_browser = False
         self._login_checked = False
         self._login_valid = False
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
+    @staticmethod
+    def _clean_tweet_url(url: str) -> str:
+        parsed = urlparse(url)
+        clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+        return clean
 
     def _load_twitter_cookies(self) -> List[Dict[str, Any]]:
         """
@@ -143,16 +152,27 @@ class TwitterContentExtractor:
         default_cookie_file = '.twitter_cookies.json'
         if os.path.exists(default_cookie_file):
             try:
-                with open(default_cookie_file, 'r', encoding='utf-8') as f:
-                    cookie_data = json.load(f)
-                    if isinstance(cookie_data, list):
-                        cookies = cookie_data
-                        logger.info(
-                            f"Loaded {len(cookies)} cookies from default file: "
-                            f"{default_cookie_file}"
-                        )
-                    else:
-                        logger.warning("Invalid cookie file format")
+                with open(default_cookie_file, 'r', encoding='utf-8-sig') as f:
+                    raw = f.read()
+                json_start = raw.find('[')
+                if json_start < 0:
+                    json_start = raw.find('{')
+                if json_start > 0:
+                    logger.warning(
+                        f"Skipping {json_start} bytes of non-JSON prefix in {default_cookie_file}"
+                    )
+                    raw = raw[json_start:]
+                elif json_start < 0:
+                    raw = ''
+                cookie_data = json.loads(raw) if raw else []
+                if isinstance(cookie_data, list):
+                    cookies = cookie_data
+                    logger.info(
+                        f"Loaded {len(cookies)} cookies from default file: "
+                        f"{default_cookie_file}"
+                    )
+                else:
+                    logger.warning("Invalid cookie file format")
             except Exception as e:
                 logger.error(f"Failed to load cookies from default file: {e}")
 
@@ -287,15 +307,17 @@ class TwitterContentExtractor:
                 // 4. 检查页面标题
                 const pageTitle = document.title;
                 const isErrorPage = pageTitle.includes('错误') || 
-                                   pageTitle.includes('Error') || 
-                                   pageTitle === '' ||
+                                   pageTitle.includes('Error') ||
                                    pageTitle === 'X';
+                const isEmptyPage = pageTitle === '';
                 
                 // 5. 检查是否有内容区域
                 const contentArea = document.querySelector('[data-testid="primaryColumn"]');
                 const hasContent = contentArea && contentArea.innerText.length > 100;
                 
                 // 判断逻辑
+                // 空页面标题可能是加载未完成，不直接判定为错误页面
+                // 只有在有明确错误标识时才判定为未登录
                 const isLoggedIn = userAvatar || (hasContent && !hasLoginPrompt && !isErrorPage);
                 
                 let errorMessage = '';
@@ -304,6 +326,8 @@ class TwitterContentExtractor:
                         errorMessage = '需要登录才能查看此内容，请更新 cookies';
                     } else if (isErrorPage) {
                         errorMessage = '页面加载错误，可能需要重新登录';
+                    } else if (isEmptyPage && !hasContent) {
+                        errorMessage = '页面未正常加载，可能需要重新登录';
                     } else {
                         errorMessage = '无法确认登录状态';
                     }
@@ -328,6 +352,106 @@ class TwitterContentExtractor:
             logger.info("Twitter/X login status: OK")
             
         return result
+
+    async def _wait_for_content(self, page, timeout: int = 15000):
+        logger.info("Waiting for page content to load...")
+        try:
+            await page.wait_for_selector('article', timeout=timeout)
+        except Exception:
+            logger.warning(
+                "Timeout waiting for article element, continuing anyway"
+            )
+        await page.wait_for_timeout(5000)
+
+    async def _retry_without_cookies(self, page, url: str):
+        logger.info("Retrying without cookies (anonymous access)")
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+        await self.close_browser()
+
+        pw = None
+        try:
+            from playwright.async_api import async_playwright
+            pw = await async_playwright().start()
+            self.browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                ]
+            )
+            user_agent = (
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/131.0.0.0 Safari/537.36'
+            )
+            self.context = await self.browser.new_context(
+                user_agent=user_agent,
+                viewport={'width': 1920, 'height': 1080},
+                timezone_id='Asia/Shanghai',
+                locale='zh-CN,zh;q=0.9,en;q=0.8',
+            )
+            await self.context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-CN', 'zh', 'en-US', 'en'],
+                });
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'MacIntel',
+                });
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function(){},
+                    csi: function(){},
+                    app: {},
+                };
+            """)
+            self._using_shared_browser = False
+            self._playwright = pw
+
+            new_page = await self.context.new_page()
+            await new_page.set_extra_http_headers({
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            })
+
+            resp = await new_page.goto(
+                url, wait_until='domcontentloaded', timeout=90000
+            )
+            status = resp.status if resp else 'no response'
+            logger.info(f"Anonymous access returned: {status}")
+
+            if status == 200:
+                await self._wait_for_content(new_page)
+                login_status = await self._check_login_status(new_page)
+                if login_status.get('has_content'):
+                    logger.info(
+                        "Anonymous access succeeded, "
+                        "cookies were invalid"
+                    )
+                    return new_page
+                else:
+                    logger.warning(
+                        "Anonymous access returned 200 but no content"
+                    )
+            else:
+                logger.warning(
+                    f"Anonymous access also failed: {status}"
+                )
+
+            return new_page
+
+        except Exception as e:
+            logger.error(f"Error during anonymous retry: {e}")
+            raise
 
     async def initialize_browser(self, force_new: bool = False):
         """Initialize Playwright browser with anti-detection measures.
@@ -412,7 +536,7 @@ class TwitterContentExtractor:
             # Create context with realistic settings
             user_agent = (
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
             )
             self.context = await self.browser.new_context(
                 user_agent=user_agent,
@@ -437,27 +561,78 @@ class TwitterContentExtractor:
 
                 Object.defineProperty(navigator, 'plugins', {
                     get: () => ({
-                        length: 3,
-                        0: { filename: 'internal-pdf-viewer' },
-                        1: { filename: 'adsfk-plugin' },
-                        2: { filename: 'internal-nacl-plugin' },
+                        length: 5,
+                        0: { filename: 'internal-pdf-viewer',
+                             name: 'Chrome PDF Plugin',
+                             description: 'Portable Document Format' },
+                        1: { filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+                             name: 'Chrome PDF Viewer',
+                             description: '' },
+                        2: { filename: 'internal-nacl-plugin',
+                             name: 'Native Client',
+                             description: '' },
+                        3: { filename: 'widevinecdmadapter',
+                             name: 'Widevine Content Decryption Module',
+                             description: 'Enables Widevine licenses for DRM content' },
+                        4: { filename: 'oehmokhphbnpkaceddhaklhamklcpgec',
+                             name: 'CryptoTokenExtension',
+                             description: 'CryptoToken Extension' },
                         refresh: () => {},
                     }),
                 });
 
                 Object.defineProperty(navigator, 'languages', {
-                    get: () => ['zh-CN', 'zh', 'en'],
+                    get: () => ['zh-CN', 'zh', 'en-US', 'en'],
                 });
+
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'MacIntel',
+                });
+
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 8,
+                });
+
+                Object.defineProperty(navigator, 'deviceMemory', {
+                    get: () => 8,
+                });
+
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {},
+                };
+
+                Object.defineProperty(navigator, 'connection', {
+                    get: () => ({
+                        effectiveType: '4g',
+                        rtt: 50,
+                        downlink: 10,
+                        saveData: false,
+                    }),
+                });
+
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
             """)
 
     async def close_browser(self):
         """Close the browser instance and cleanup resources"""
         if self._using_shared_browser:
-            logger.debug("Using shared browser, not closing context")
+            # Properly close the shared browser context to prevent memory leak
+            from ..core.browser_manager import BrowserManager
+            browser_mgr = await BrowserManager.get_instance()
+            if self.context:
+                await browser_mgr.close_context(self.context)
             self.context = None
             self._using_shared_browser = False
             return
-            
+
         if self.browser:
             await self.browser.close()
             self.browser = None
@@ -467,6 +642,21 @@ class TwitterContentExtractor:
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
+
+        # Close the shared HTTP session
+        await self.close_http_session()
+
+    async def get_http_session(self) -> 'aiohttp.ClientSession':
+        """Get or create a reusable aiohttp ClientSession."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
+
+    async def close_http_session(self):
+        """Close the reusable aiohttp ClientSession."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
 
     async def _switch_to_original_language(self, page) -> bool:
         """
@@ -713,7 +903,10 @@ class TwitterContentExtractor:
                         const text = el.textContent.trim();
                         const href = el.getAttribute('href') || '';
                         // Check if it looks like a username
-                        if (text && (text.startsWith('@') || href.match('/^\\\\/' + '[\\\\w_]+$'))) {
+                        if (text && (
+                            text.startsWith('@') ||
+                            href.match('/^\\\\/' + '[\\\\w_]+$')
+                        )) {
                             if (text.startsWith('@')) {
                                 author = text;
                             } else if (href) {
@@ -727,7 +920,9 @@ class TwitterContentExtractor:
 
                 // Fallback: extract from URL if available
                 if (!author) {
-                    const urlMatch = window.location.pathname.match('/\\\\/(\\\\w+)\\\\/status\\\\/');
+                    const urlMatch = window.location.pathname.match(
+                        '/\\\\/(\\\\w+)\\\\/status\\\\/'
+                    );
                     if (urlMatch) {
                         author = '@' + urlMatch[1];
                     }
@@ -783,37 +978,91 @@ class TwitterContentExtractor:
         """
         result = await page.evaluate("""
             () => {
-                // Check for article title - 扩展选择器列表
-                const articleTitleSelectors = [
-                    '[data-testid="articleTitle"]',
-                    '[data-testid="tweetTitle"]',
-                    'article h2',
-                    'article h1',
-                    '[role="article"] h2',
-                    '[role="article"] h1',
-                    'div[data-testid="cellInnerDiv"] h2',
-                    'div[data-testid="cellInnerDiv"] h1',
-                    // 长文页面特定的标题选择器
-                    '[data-testid="primaryColumn"] h2',
-                    '[data-testid="primaryColumn"] h1',
-                    'div[role="main"] h2',
-                    'div[role="main"] h1'
-                ];
-
                 let articleTitle = '';
-                for (const selector of articleTitleSelectors) {
-                    const element = document.querySelector(selector);
-                    if (element) {
-                        const text = element.textContent.trim();
-                        // 长文标题通常较长，且不应与推文内容完全相同
-                        // 检查是否是真正的article标题（不是普通推文）
-                        if (text && text.length > 50 && text.length < 500) {
-                            // 验证这个标题是否是article特有的（不是普通推文）
-                            // 通过检查是否有article特有的结构
-                            const hasArticleSpecificStructure = document.querySelector(
-                                '[data-testid="tweetArticle"], [data-testid="longTweet"]'
-                            );
-                            if (hasArticleSpecificStructure) {
+
+                // 优先从页面标题中提取（最可靠的方式）
+                // 英文格式: "(1) 作者 on X: "标题内容" / X"
+                // 中文格式: "(1) X 上的 作者："标题内容" / X"
+                // 注意：中文使用全角引号 ""，英文使用半角引号 ""
+                const pageTitle = document.title;
+                let pageTitleContent = '';
+
+                // 英文格式匹配 (on X: "...")
+                if (pageTitle && pageTitle.includes(' on X:')) {
+                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
+                    if (titleMatch && titleMatch[1]) {
+                        pageTitleContent = titleMatch[1].trim();
+                    }
+                }
+
+                // 中文格式匹配 (X 上的 作者："...")
+                if (!pageTitleContent && pageTitle &&
+                    pageTitle.includes('X 上的')) {
+                    const titleMatch = pageTitle.match(
+                        /X 上的[^：]+[：:]["\u201c]([^\u201d"]+)[\u201d"]/
+                    );
+                    if (titleMatch && titleMatch[1]) {
+                        pageTitleContent = titleMatch[1].trim();
+                    }
+                }
+
+                // 通用格式匹配（支持全角和半角引号）
+                if (!pageTitleContent && pageTitle) {
+                    const titleMatch = pageTitle.match(
+                        /[：:]["\u201c]([^\u201d"]+)[\u201d"]/
+                    );
+                    if (titleMatch && titleMatch[1] &&
+                        titleMatch[1].length > 5) {
+                        pageTitleContent = titleMatch[1].trim();
+                    }
+                }
+
+                if (pageTitleContent) {
+                    // 从完整内容中提取标题部分
+                    // 优先按句号/感叹号/问号分割，取第一句作为标题
+                    const sentenceEnd = pageTitleContent.search(/[。！？]/);
+                    if (sentenceEnd > 0) {
+                        articleTitle = pageTitleContent.substring(0, sentenceEnd + 1);
+                    } else {
+                        // 没有句号分隔时，尝试按逗号分割（中文标题常用逗号）
+                        const commaEnd = pageTitleContent.search(/[,，]/);
+                        if (commaEnd > 0 && commaEnd <= 100) {
+                            articleTitle = pageTitleContent.substring(0, commaEnd);
+                        } else {
+                            // 没有合适的标点分隔时，尝试按空格分割
+                            const spaceIdx = pageTitleContent.indexOf(' ', 10);
+                            if (spaceIdx > 10) {
+                                articleTitle = pageTitleContent.substring(0, spaceIdx);
+                            } else {
+                                // 直接使用完整内容作为标题
+                                articleTitle = pageTitleContent;
+                            }
+                        }
+                    }
+                }
+
+                // 如果从页面标题没有提取到，尝试从 DOM 元素提取
+                if (!articleTitle) {
+                    const articleTitleSelectors = [
+                        '[data-testid="articleTitle"]',
+                        '[data-testid="tweetTitle"]',
+                        'article h2',
+                        'article h1',
+                        '[role="article"] h2',
+                        '[role="article"] h1',
+                        'div[data-testid="cellInnerDiv"] h2',
+                        'div[data-testid="cellInnerDiv"] h1',
+                    ];
+
+                    const placeholders = ['Article', 'Post', 'Conversation',
+                        '文章', '帖子', '对话'];
+
+                    for (const selector of articleTitleSelectors) {
+                        const element = document.querySelector(selector);
+                        if (element) {
+                            const text = element.textContent.trim();
+                            if (text && text.length > 0 && text.length < 500
+                                && !placeholders.includes(text)) {
                                 articleTitle = text;
                                 break;
                             }
@@ -822,35 +1071,16 @@ class TwitterContentExtractor:
                 }
 
                 // Check for article-specific page structure
-                const articleStructureSelectors = [
-                    'article',
-                    '[data-testid="tweetArticle"]',
-                    '[data-testid="longTweet"]',
-                    'div[data-testid="cellInnerDiv"] article',
-                    // 长文页面可能有特定的结构
-                    '[data-testid="primaryColumn"] article'
-                ];
-
-                let hasArticleStructure = false;
-                for (const selector of articleStructureSelectors) {
-                    if (document.querySelector(selector)) {
-                        hasArticleStructure = true;
-                        break;
-                    }
-                }
+                const hasRichTextView = !!document.querySelector(
+                    '[data-testid="twitterArticleRichTextView"]'
+                );
+                let hasArticleStructure = !!document.querySelector('article');
 
                 // Check for "Article" badge/label in the page
-                // 长文页面顶部通常有 "Article" 标签
                 let hasArticleLabel = false;
-                const articleLabelSelectors = [
-                    'span:contains("Article")',
-                    'div:contains("Article")',
-                    '[data-testid="articleLabel"]'
-                ];
-                // 检查页面中是否有 "Article" 文本（不区分大小写）
                 const pageText = document.body.innerText.toLowerCase();
-                if (pageText.includes('article') || 
-                    pageText.includes('文章') || 
+                if (pageText.includes('article') ||
+                    pageText.includes('文章') ||
                     document.title.toLowerCase().includes('article')) {
                     hasArticleLabel = true;
                 }
@@ -860,8 +1090,6 @@ class TwitterContentExtractor:
                     '[data-testid="tweetText"]',
                     'article [lang]',
                     '[data-testid="tweet"] div[dir="auto"]',
-                    // 长文内容选择器
-                    '[data-testid="primaryColumn"] article div[lang]',
                     'article div[data-testid="tweetText"]'
                 ];
 
@@ -882,10 +1110,11 @@ class TwitterContentExtractor:
 
                 // Determine post type
                 // It's an article if:
-                // 1. Has article title, OR
-                // 2. Has article structure AND long content, OR
-                // 3. Has "Article" label in page, OR
-                // 4. Has "Show more" button (indicates long-form content)
+                // 1. Has article title from page title, OR
+                // 2. Has rich text view (twitterArticleRichTextView), OR
+                // 3. Has article structure AND long content, OR
+                // 4. Has "Article" label in page, OR
+                // 5. Has "Show more" button (indicates long-form content)
                 let hasShowMore = !!document.querySelector(
                     '[data-testid="tweet-text-show-more-link"]'
                 );
@@ -902,6 +1131,7 @@ class TwitterContentExtractor:
 
                 let postType = 'regular';
                 const isArticle = articleTitle ||
+                    hasRichTextView ||
                     (hasArticleStructure && isLongContent) ||
                     hasArticleLabel ||
                     (hasShowMore && isLongContent);
@@ -915,7 +1145,8 @@ class TwitterContentExtractor:
                     content_length: contentLength,
                     has_article_structure: hasArticleStructure,
                     has_article_label: hasArticleLabel,
-                    has_show_more: hasShowMore
+                    has_show_more: hasShowMore,
+                    has_rich_text_view: hasRichTextView
                 };
             }
         """)
@@ -923,7 +1154,8 @@ class TwitterContentExtractor:
         logger.info(
             f"Detected post type: {result.get('post_type')} "
             f"(content length: {result.get('content_length')}, "
-            f"has title: {bool(result.get('article_title'))})"
+            f"has title: {bool(result.get('article_title'))}, "
+            f"has rich text view: {result.get('has_rich_text_view')})"
         )
 
         return result
@@ -1405,32 +1637,75 @@ class TwitterContentExtractor:
 
                 // Extract article title if present
                 let articleTitle = '';
-                
+                let pageTitleContent = '';  // 完整的页面标题内容（标题+正文）
+
                 // 首先尝试从页面标题中提取（对于长文页面）
-                // 页面标题格式通常是: "标题内容 on X: \"内容\" / X" 或 "作者 on X: \"内容\" / X"
+                // 英文格式: "(1) 作者 on X: "标题内容" / X"
+                // 中文格式: "(1) X 上的 作者："标题内容" / X"
+                // 注意：中文使用全角引号 ""，英文使用半角引号 ""
                 const pageTitle = document.title;
+
+                // 英文格式匹配 (on X: "...")
                 if (pageTitle && pageTitle.includes(' on X:')) {
-                    const titleMatch = pageTitle.match('/on X:\\\\s*"([^"]+)"/');
+                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
                     if (titleMatch && titleMatch[1]) {
-                        articleTitle = titleMatch[1].trim();
+                        pageTitleContent = titleMatch[1].trim();
                     }
                 }
-                
+
+                // 中文格式匹配 (X 上的 作者："..." 或 X 上的 作者："...")
+                if (!pageTitleContent && pageTitle && pageTitle.includes('X 上的')) {
+                    const titleMatch = pageTitle.match(/X 上的[^：]+[：:]["\u201c]([^\u201d"]+)[\u201d"]/);
+                    if (titleMatch && titleMatch[1]) {
+                        pageTitleContent = titleMatch[1].trim();
+                    }
+                }
+
+                // 通用格式匹配（尝试匹配引号中的内容，支持全角和半角引号）
+                if (!pageTitleContent && pageTitle) {
+                    const titleMatch = pageTitle.match(/[：:]["\u201c]([^\u201d"]+)[\u201d"]/);
+                    if (titleMatch && titleMatch[1] && titleMatch[1].length > 5) {
+                        pageTitleContent = titleMatch[1].trim();
+                    }
+                }
+
+                if (pageTitleContent) {
+                    // 从完整内容中提取标题部分
+                    // 优先按句号/感叹号/问号分割，取第一句作为标题
+                    const sentenceEnd = pageTitleContent.search(/[。！？]/);
+                    if (sentenceEnd > 0) {
+                        articleTitle = pageTitleContent.substring(0, sentenceEnd + 1);
+                    } else {
+                        // 没有句号分隔时，尝试按逗号分割（中文标题常用逗号）
+                        const commaEnd = pageTitleContent.search(/[,，]/);
+                        if (commaEnd > 0 && commaEnd <= 100) {
+                            articleTitle = pageTitleContent.substring(0, commaEnd);
+                        } else {
+                            // 没有合适的标点分隔时，尝试按空格分割
+                            const spaceIdx = pageTitleContent.indexOf(' ', 10);
+                            if (spaceIdx > 10) {
+                                articleTitle = pageTitleContent.substring(0, spaceIdx);
+                            } else {
+                                // 直接使用完整内容作为标题
+                                articleTitle = pageTitleContent;
+                            }
+                        }
+                    }
+                }
+
                 // 如果从页面标题没有提取到，尝试从页面元素中提取
                 if (!articleTitle) {
                     const titleSelectors = [
                         '[data-testid="articleTitle"]',
                         '[data-testid="tweetTitle"]',
-                        // 长文页面特定的选择器
-                        '[data-testid="primaryColumn"] h2',
-                        '[data-testid="primaryColumn"] h1',
-                        'div[role="main"] h2',
-                        'div[role="main"] h1',
                         // 通用选择器
                         'article h2',
                         'article h1',
                         '[role="article"] h2',
                         '[role="article"] h1',
+                        // 长文页面特定的选择器（放在通用之后，避免匹配到 "Article"/"Post" 等占位符）
+                        'div[data-testid="cellInnerDiv"] h2',
+                        'div[data-testid="cellInnerDiv"] h1',
                         // 第一个 article 中的大文本
                         'article:first-of-type div[dir="auto"]'
                     ];
@@ -1438,8 +1713,11 @@ class TwitterContentExtractor:
                         const el = document.querySelector(selector);
                         if (el) {
                             const text = el.textContent.trim();
-                            // 放宽长度限制，长文标题可能较长
-                            if (text && text.length > 0 && text.length < 500) {
+                            // 过滤掉占位符文本（如 "Article", "Post", "Conversation" 等）
+                            const placeholders = ['Article', 'Post', 'Conversation',
+                                '文章', '帖子', '对话'];
+                            if (text && text.length > 0 && text.length < 500
+                                && !placeholders.includes(text)) {
                                 articleTitle = text;
                                 break;
                             }
@@ -1669,6 +1947,13 @@ class TwitterContentExtractor:
                 );
 
                 if (richTextView) {
+                    const richFullText = cleanText(
+                        richTextView.textContent.trim()
+                    );
+                    const richFullHtml = cleanHtml(
+                        richTextView.innerHTML
+                    );
+
                     const langDivs = richTextView.querySelectorAll('div[lang]');
                     langDivs.forEach(el => {
                         const lang = el.getAttribute('lang') || '';
@@ -1681,7 +1966,12 @@ class TwitterContentExtractor:
                         }
                     });
 
-                    if (contentParts.length > 0) {
+                    // 优先使用 richTextView 的完整文本
+                    // div[lang] 在匿名模式下可能不包含完整内容
+                    if (richFullText && richFullText.length > 0) {
+                        text = richFullText;
+                        html = richFullHtml;
+                    } else if (contentParts.length > 0) {
                         const zhPart = contentParts.find(p =>
                             p.lang.startsWith('zh')
                             || /[\\u4e00-\\u9fff]/.test(p.text)
@@ -1695,15 +1985,32 @@ class TwitterContentExtractor:
                         }
                     }
 
-                    const fullText = cleanText(
-                        richTextView.textContent.trim()
-                    );
-                    if (fullText && fullText.length > text.length) {
-                        text = fullText;
+                    // 如果 lang divs 有更长的中文内容，优先使用
+                    if (contentParts.length > 0 && text) {
+                        const zhPart = contentParts.find(p =>
+                            p.lang.startsWith('zh')
+                            || /[\\u4e00-\\u9fff]/.test(p.text)
+                        );
+                        if (zhPart && zhPart.text.length > text.length) {
+                            text = zhPart.text;
+                            html = zhPart.html;
+                        }
                     }
-                    const fullHtml = cleanHtml(richTextView.innerHTML);
-                    if (fullHtml && fullHtml.length > html.length) {
-                        html = fullHtml;
+
+                    // 如果从 richTextView 提取的内容主要是英文，但页面标题中有中文内容，
+                    // 则使用 pageTitleContent 作为内容（它来自 document.title，包含中文原文）
+                    if (pageTitleContent && /[\\u4e00-\\u9fff]/.test(pageTitleContent) && text) {
+                        const zhChars = (text.match(/[\\u4e00-\\u9fff]/g) || []).length;
+                        const totalChars = text.length || 1;
+                        const zhRatio = zhChars / totalChars;
+                        if (zhRatio < 0.2) {
+                            // 使用 pageTitleContent，但去除已提取的标题部分
+                            if (articleTitle && pageTitleContent.startsWith(articleTitle)) {
+                                text = pageTitleContent.substring(articleTitle.length).trim();
+                            } else {
+                                text = pageTitleContent;
+                            }
+                        }
                     }
                 } else {
                     const tweetTexts = scope.querySelectorAll(
@@ -1753,7 +2060,37 @@ class TwitterContentExtractor:
                             html = zhPart.html;
                         }
                     }
+
+                    // 如果提取到的内容主要是英文，但页面标题中有中文内容，
+                    // 则从页面标题中提取中文原文（X 会自动翻译推文，但标题保留原文）
+                    // 判断"主要是英文"：中文字符占比低于 20%
+                    if (pageTitleContent && /[\\u4e00-\\u9fff]/.test(pageTitleContent)) {
+                        const zhChars = (text.match(/[\\u4e00-\\u9fff]/g) || []).length;
+                        const totalChars = text.length || 1;
+                        const zhRatio = zhChars / totalChars;
+                        if (zhRatio < 0.2) {
+                            // 使用 pageTitleContent，但去除已提取的标题部分
+                            if (articleTitle && pageTitleContent.startsWith(articleTitle)) {
+                                text = pageTitleContent.substring(articleTitle.length).trim();
+                            } else {
+                                text = pageTitleContent;
+                            }
+                        }
+                    }
                 }
+
+                // 如果内容中包含标题，去除标题及其前面的噪声
+                if (articleTitle && text.includes(articleTitle)) {
+                    const titleIdx = text.indexOf(articleTitle);
+                    if (titleIdx >= 0 && titleIdx < 200) {
+                        text = text.substring(
+                            titleIdx + articleTitle.length
+                        ).trim();
+                    }
+                }
+
+                // 清理内容开头的数字噪声（如浏览量、点赞数等）
+                text = text.replace(/^[\d,.\s]+/, '');
 
                 return {
                     text: text,
@@ -2111,6 +2448,10 @@ class TwitterContentExtractor:
         """
         await self.initialize_browser()
 
+        clean_url = self._clean_tweet_url(url)
+        if clean_url != url:
+            logger.info(f"Cleaned URL: {clean_url} (removed tracking params)")
+
         page = await self.context.new_page()
 
         try:
@@ -2119,62 +2460,50 @@ class TwitterContentExtractor:
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             })
 
-            logger.info(f"Accessing tweet: {url}")
+            logger.info(f"Accessing tweet: {clean_url}")
 
             # Navigate to page
-            response = await page.goto(url, wait_until='domcontentloaded', timeout=90000)
+            response = await page.goto(
+                clean_url, wait_until='domcontentloaded', timeout=90000
+            )
 
-            if response.status not in [200, 304]:
-                logger.warning(f"Page returned status {response.status}")
+            initial_status = response.status
 
-            # Wait for page content to load
-            # 对于长文页面，等待 article 元素而不是 tweetText
-            logger.info("Waiting for page content to load...")
-            try:
-                await page.wait_for_selector('article', timeout=15000)
-            except Exception:
-                logger.warning("Timeout waiting for article element, continuing anyway")
-
-            # 额外等待让 JavaScript 渲染完成（对于长文页面需要更长时间）
-            await page.wait_for_timeout(5000)
-
-            # 检查登录状态（在页面完全加载后检查）
-            login_status = await self._check_login_status(page)
-            if not login_status.get('is_logged_in'):
-                error_msg = login_status.get('error_message', '登录状态检查失败')
-                
-                if self._using_shared_browser and not self._login_checked:
+            if initial_status == 200:
+                # Good response, wait for content
+                await self._wait_for_content(page)
+                login_status = await self._check_login_status(page)
+                if login_status.get('is_logged_in') or login_status.get('has_content'):
+                    logger.info("Page loaded successfully with cookies")
+                else:
                     logger.warning(
-                        "Login failed with shared browser, retrying with new instance"
+                        "200 but no content, "
+                        "retrying without cookies"
                     )
-                    self._login_checked = True
-                    await self.close_browser()
-                    await self.initialize_browser(force_new=True)
-                    page = await self.context.new_page()
-                    await page.set_extra_http_headers({
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    })
-                    await page.goto(url, wait_until='domcontentloaded', timeout=90000)
-                    try:
-                        await page.wait_for_selector('article', timeout=15000)
-                    except Exception:
-                        pass
-                    await page.wait_for_timeout(5000)
-                    
-                    login_status = await self._check_login_status(page)
-                    if not login_status.get('is_logged_in'):
-                        retry_error = login_status.get('error_message')
-                        logger.error(f"Login check failed after retry: {retry_error}")
-                        return {
-                            'success': False,
-                            'error': f"Twitter/X 登录失败: {retry_error}"
-                        }
-                
-                if not login_status.get('is_logged_in'):
-                    logger.error(f"Login check failed: {error_msg}")
+                    page = await self._retry_without_cookies(
+                        page, clean_url
+                    )
+            elif initial_status == 403:
+                # 403 with cookies likely means cookies are invalid
+                # X returns 403 for invalid auth instead of anonymous access
+                logger.warning(
+                    "Page returned 403, "
+                    "cookies may be invalid, retrying without cookies"
+                )
+                page = await self._retry_without_cookies(
+                    page, clean_url
+                )
+            else:
+                logger.warning(f"Page returned status {initial_status}")
+                await self._wait_for_content(page)
+                login_status = await self._check_login_status(page)
+                if not login_status.get('is_logged_in') and not login_status.get('has_content'):
                     return {
                         'success': False,
-                        'error': f"Twitter/X 登录失败: {error_msg}"
+                        'error': (
+                            f"页面加载失败 (HTTP {initial_status})，"
+                            "可能需要更新 cookies"
+                        )
                     }
 
             # Expand long tweets
@@ -2323,6 +2652,20 @@ class TwitterHandler(PlatformHandler):
         self.extractor = TwitterContentExtractor()
         self.storage_service = StorageService()
 
+    def _parse_twitter_error(self, error_msg: str) -> str:
+        error_lower = error_msg.lower()
+        if '登录失败' in error_msg or '重新登录' in error_msg:
+            return "ERROR_LOGIN_FAILED"
+        if 'rate limit' in error_lower or '速率限制' in error_msg:
+            return "ERROR_RATE_LIMITED"
+        if 'not found' in error_lower or '不存在' in error_msg:
+            return "ERROR_TWEET_NOT_FOUND"
+        if 'suspended' in error_lower or '封禁' in error_msg:
+            return "ERROR_ACCOUNT_SUSPENDED"
+        if 'protected' in error_lower or '私密' in error_msg:
+            return "ERROR_TWEET_PROTECTED"
+        return "ERROR_TWITTER_UNKNOWN"
+
     def generate_telegram_preview(
         self,
         result: Dict[str, Any],
@@ -2347,7 +2690,19 @@ class TwitterHandler(PlatformHandler):
             格式化的 Telegram 消息文本
         """
         if not result.get('success'):
-            return "❌ 无法获取内容信息"
+            error_msg = result.get('error', '')
+            error_code = self._parse_twitter_error(error_msg)
+            twitter_error_messages = {
+                "ERROR_LOGIN_FAILED": "🔐 Twitter/X 登录失败，可能需要重新登录",
+                "ERROR_RATE_LIMITED": "⏳ Twitter/X 请求过于频繁，请稍后重试",
+                "ERROR_TWEET_NOT_FOUND": "❌ 推文不存在或已被删除",
+                "ERROR_ACCOUNT_SUSPENDED": "🚫 账号已被封禁",
+                "ERROR_TWEET_PROTECTED": "🔒 推文来自私密账号，无法访问",
+            }
+            return twitter_error_messages.get(
+                error_code,
+                "❌ 无法获取内容信息"
+            )
 
         post_type = result.get('post_type', 'regular')
         is_thread = result.get('is_thread', False)
@@ -2453,71 +2808,71 @@ class TwitterHandler(PlatformHandler):
 
         try:
             timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers={
-                    'User-Agent': (
-                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    ),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                }) as response:
-                    if response.status != 200:
-                        logger.warning(f"Failed to fetch link preview: HTTP {response.status}")
-                        return {'title': None, 'description': None, 'image': None}
+            session = await self.get_http_session()
+            async with session.get(url, timeout=timeout, headers={
+                'User-Agent': (
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            }) as response:
+                if response.status != 200:
+                    logger.warning(f"Failed to fetch link preview: HTTP {response.status}")
+                    return {'title': None, 'description': None, 'image': None}
 
-                    html = await response.text()
+                html = await response.text()
 
-                    # Parse Open Graph tags
-                    result = {'title': None, 'description': None, 'image': None}
+                # Parse Open Graph tags
+                result = {'title': None, 'description': None, 'image': None}
 
-                    # og:title
-                    title_pat = (
-                        r'<meta[^>]*property=["\']og:title["\'][^>]*'
-                        r'content=["\']([^"\']+)["\']'
+                # og:title
+                title_pat = (
+                    r'<meta[^>]*property=["\']og:title["\'][^>]*'
+                    r'content=["\']([^"\']+)["\']'
+                )
+                title_match = re.search(title_pat, html, re.IGNORECASE)
+                if not title_match:
+                    title_pat2 = (
+                        r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                        r'property=["\']og:title["\']'
                     )
-                    title_match = re.search(title_pat, html, re.IGNORECASE)
-                    if not title_match:
-                        title_pat2 = (
-                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
-                            r'property=["\']og:title["\']'
-                        )
-                        title_match = re.search(title_pat2, html, re.IGNORECASE)
-                    if title_match:
-                        result['title'] = title_match.group(1).strip()
+                    title_match = re.search(title_pat2, html, re.IGNORECASE)
+                if title_match:
+                    result['title'] = title_match.group(1).strip()
 
-                    # og:description
-                    desc_pat = (
-                        r'<meta[^>]*property=["\']og:description["\'][^>]*'
-                        r'content=["\']([^"\']+)["\']'
+                # og:description
+                desc_pat = (
+                    r'<meta[^>]*property=["\']og:description["\'][^>]*'
+                    r'content=["\']([^"\']+)["\']'
+                )
+                desc_match = re.search(desc_pat, html, re.IGNORECASE)
+                if not desc_match:
+                    desc_pat2 = (
+                        r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                        r'property=["\']og:description["\']'
                     )
-                    desc_match = re.search(desc_pat, html, re.IGNORECASE)
-                    if not desc_match:
-                        desc_pat2 = (
-                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
-                            r'property=["\']og:description["\']'
-                        )
-                        desc_match = re.search(desc_pat2, html, re.IGNORECASE)
-                    if desc_match:
-                        result['description'] = desc_match.group(1).strip()
+                    desc_match = re.search(desc_pat2, html, re.IGNORECASE)
+                if desc_match:
+                    result['description'] = desc_match.group(1).strip()
 
-                    # og:image
-                    img_pat = (
-                        r'<meta[^>]*property=["\']og:image["\'][^>]*'
-                        r'content=["\']([^"\']+)["\']'
+                # og:image
+                img_pat = (
+                    r'<meta[^>]*property=["\']og:image["\'][^>]*'
+                    r'content=["\']([^"\']+)["\']'
+                )
+                image_match = re.search(img_pat, html, re.IGNORECASE)
+                if not image_match:
+                    img_pat2 = (
+                        r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
+                        r'property=["\']og:image["\']'
                     )
-                    image_match = re.search(img_pat, html, re.IGNORECASE)
-                    if not image_match:
-                        img_pat2 = (
-                            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*'
-                            r'property=["\']og:image["\']'
-                        )
-                        image_match = re.search(img_pat2, html, re.IGNORECASE)
-                    if image_match:
-                        result['image'] = image_match.group(1).strip()
+                    image_match = re.search(img_pat2, html, re.IGNORECASE)
+                if image_match:
+                    result['image'] = image_match.group(1).strip()
 
-                    has_title = result['title'] is not None
-                    logger.info(f"Fetched link preview for {url}: title={has_title}")
-                    return result
+                has_title = result['title'] is not None
+                logger.info(f"Fetched link preview for {url}: title={has_title}")
+                return result
 
         except asyncio.TimeoutError:
             logger.warning(f"Timeout fetching link preview for {url}")
@@ -2551,14 +2906,53 @@ class TwitterHandler(PlatformHandler):
         """
         # 清理 article_title，去除常见的占位符
         cleaned_article_title = article_title.strip() if article_title else ""
-        
+
         # 如果 article_title 是常见的占位符，则忽略它
         placeholder_titles = ['Article', 'Post', "Today's News", '']
         if cleaned_article_title in placeholder_titles:
             cleaned_article_title = ""
-        
+
         if post_type == 'article' and cleaned_article_title:
             return self.clean_title(cleaned_article_title)
+
+        # For article type without explicit title, extract from content
+        if post_type == 'article' and content and content.strip():
+            # 尝试从内容中提取标题
+            # 内容格式可能是: "标题，副标题 正文内容" 或 "标题。正文内容"
+            content_text = content.strip()
+            # 先按句号分割
+            delimiters = r'[。！？]'
+            sentences = re.split(delimiters, content_text, maxsplit=1)
+            first_sentence = sentences[0].strip() if sentences else ""
+
+            if first_sentence and len(first_sentence) <= 100:
+                title = first_sentence
+            elif first_sentence and len(first_sentence) > 100:
+                # 第一句太长，尝试按逗号分割
+                comma_parts = re.split(r'[,，]', first_sentence, maxsplit=1)
+                if len(comma_parts) > 1 and 4 <= len(comma_parts[0]) <= 100:
+                    title = comma_parts[0]
+                else:
+                    # 尝试按空格分割（标题和正文之间通常有空格）
+                    parts = content_text.split(None, 1)
+                    if len(parts) > 1 and 4 <= len(parts[0]) <= 100:
+                        title = parts[0]
+                    else:
+                        title = content_text[:80]
+            else:
+                title = content_text[:80]
+
+            # Add markers
+            markers = []
+            if has_video:
+                markers.append("[含视频]")
+            if external_links:
+                markers.append("[含链接]")
+
+            if markers:
+                title = f"{' '.join(markers)} {title}"
+
+            return self.clean_title(title)
 
         # For regular posts
         title = ""
@@ -2570,14 +2964,14 @@ class TwitterHandler(PlatformHandler):
             first_sentence = sentences[0].strip() if sentences else ""
 
             if first_sentence:
-                # Limit to 30 characters
-                if len(first_sentence) > 30:
-                    title = first_sentence[:30]
+                # Limit to 80 characters
+                if len(first_sentence) > 80:
+                    title = first_sentence[:80]
                 else:
                     title = first_sentence
             else:
-                # If no sentence delimiter found, take first 30 chars
-                title = content.strip()[:30]
+                # If no sentence delimiter found, take first 80 chars
+                title = content.strip()[:80]
         else:
             # Empty content, use {@author} - {date} format
             date_str = datetime.now().strftime('%Y-%m-%d')
@@ -2602,7 +2996,7 @@ class TwitterHandler(PlatformHandler):
         - Remove newlines and extra spaces
         - Keep Chinese/English characters, numbers, common punctuation
         - Remove emoji and special symbols
-        - Max 50 characters, add ellipsis if truncated
+        - Max 100 characters, add ellipsis if truncated
 
         Args:
             title: Raw title string
@@ -2621,19 +3015,23 @@ class TwitterHandler(PlatformHandler):
         # - Chinese characters (\u4e00-\u9fff)
         # - English letters (a-zA-Z)
         # - Numbers (0-9)
-        # - Common punctuation: ，。！？、：""''
+        # - Common punctuation: ，。！？、：""''…—
+        # - Technical/financial symbols: +-%$@#/
         # - Spaces
         # - Square brackets for markers: [ ]
         allowed_pattern = (
-            r'[^\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9\s，。！？、：""''[]' + ']'
+            r'[^\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9\s'
+            r'，。！？、：""''…—'
+            r'+\-％%$@#/'
+            r'\[\]]'
         )
         cleaned = re.sub(allowed_pattern, '', cleaned)
 
         # Normalize spaces again
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
 
-        # Truncate to 50 characters and add ellipsis if needed
-        max_length = 50
+        # Truncate to 100 characters and add ellipsis if needed
+        max_length = 100
         if len(cleaned) > max_length:
             cleaned = cleaned[:max_length - 1] + "…"
 
@@ -2683,8 +3081,13 @@ class TwitterHandler(PlatformHandler):
             result = await self.extractor.scrape_tweet(url)
 
             if not result.get('success'):
-                logger.error(f"Failed to scrape tweet: {result.get('error')}")
-                return None
+                error_msg = result.get('error', 'Unknown error')
+                logger.error(f"Failed to scrape tweet: {error_msg}")
+                return ContentInfo(
+                    url=url,
+                    title='Unknown',
+                    error_detail=self._parse_twitter_error(error_msg)
+                )
 
             # Determine content type based on media
             content_type = ContentType.TEXT
@@ -2968,11 +3371,16 @@ class TwitterHandler(PlatformHandler):
                 success=True,
                 file_path=temp_dir,
                 content_info=content_info,
-                error_message=None
+                error_message=None,
+                temp_dir=temp_dir
             )
 
         except Exception as e:
             logger.error(f"Failed to download Twitter content: {e}")
+            # Clean up temp_dir on failure
+            temp_dir = locals().get('temp_dir')
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
             return DownloadResult(
                 success=False,
                 error_message=str(e)
@@ -3751,6 +4159,327 @@ class TwitterHandler(PlatformHandler):
             color: #536471;
             font-size: 0.85em;
         }}
+        @media (max-width: 600px) {{
+            body {{
+                padding: 12px 16px;
+                line-height: 1.9;
+            }}
+            .header {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+                border-bottom: 1px solid #e1e8ed;
+            }}
+            .header h1 {{
+                font-size: 1.4em;
+                margin: 0 0 12px 0;
+                line-height: 1.35;
+            }}
+            .meta {{
+                font-size: 0.85em;
+            }}
+            .meta p {{
+                margin: 2px 0;
+            }}
+            .content {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+            }}
+            .content p {{
+                margin: 0 0 1.1em 0;
+            }}
+            .content h2 {{
+                font-size: 1.2em;
+                margin: 1.3em 0 0.7em 0;
+                padding-left: 10px;
+                border-left: 3px solid #1d9bf0;
+            }}
+            .content h3 {{
+                font-size: 1.1em;
+                margin: 1em 0 0.5em 0;
+                padding-left: 8px;
+                border-left: 2px solid #00ba7c;
+            }}
+            .content pre {{
+                padding: 12px;
+                border-radius: 4px;
+                margin: 12px 0;
+            }}
+            .content pre code {{
+                font-size: 0.85em;
+            }}
+            .content img {{
+                border-radius: 6px;
+                margin: 12px 0;
+            }}
+            .thread-section {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+            }}
+            .thread-post {{
+                border-radius: 6px;
+                padding: 14px;
+                border-left: 3px solid #1d9bf0;
+            }}
+            .thread-post-header {{
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 10px;
+            }}
+            .thread-post-images {{
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }}
+            .bilingual-block {{
+                margin-bottom: 12px;
+                padding: 10px 12px;
+                border-radius: 4px;
+            }}
+            .media-section {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+            }}
+            .images-grid {{
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }}
+            .image-item img {{
+                border-radius: 6px;
+            }}
+            .link-card {{
+                flex-direction: column;
+                padding: 14px;
+                border-radius: 6px;
+            }}
+            .link-image {{
+                width: 100%;
+                height: auto;
+                max-height: 180px;
+                border-radius: 4px;
+            }}
+            .links-section {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+            }}
+            .footer {{
+                padding: 16px;
+            }}
+        }}
+        @media print {{
+            @page {{
+                size: A4;
+                margin: 2cm;
+            }}
+            body {{
+                font-family: 'Noto Serif', Georgia, 'Times New Roman', serif;
+                font-size: 16px;
+                line-height: 1.9;
+                color: #000;
+                background: #fff;
+                padding: 0;
+                max-width: none;
+            }}
+            .header {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0 0 16px 0;
+                margin-bottom: 20px;
+                box-shadow: none;
+                border-bottom: 2px solid #000;
+            }}
+            .article-header {{
+                border-left: 3px solid #000;
+            }}
+            .regular-header {{
+                border-left: 3px solid #000;
+            }}
+            .post-type-badge {{
+                border-radius: 0;
+                background: #000;
+                color: #fff;
+            }}
+            .header h1 {{
+                font-size: 1.5em;
+                color: #000;
+            }}
+            .meta {{
+                color: #333;
+            }}
+            .meta a {{
+                color: #333;
+            }}
+            .content {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0;
+                margin-bottom: 20px;
+                box-shadow: none;
+                font-size: 1em;
+            }}
+            .content h2 {{
+                color: #000;
+                padding-left: 10px;
+                border-left: 3px solid #000;
+                page-break-after: avoid;
+            }}
+            .content h3 {{
+                color: #000;
+                page-break-after: avoid;
+            }}
+            .content a {{
+                color: #000;
+                text-decoration: none;
+            }}
+            .content a[href^="http"]:after {{
+                content: " (" attr(href) ")";
+                font-size: 0.8em;
+                color: #555;
+            }}
+            .content img {{
+                max-width: 100% !important;
+                page-break-inside: avoid;
+                border-radius: 0;
+            }}
+            .content pre {{
+                background: #222;
+                color: #ccc;
+                border-radius: 0;
+                border: 1px solid #000;
+                page-break-inside: avoid;
+            }}
+            .content pre code {{
+                font-family: 'Courier New', Courier, monospace;
+                font-size: 14px;
+            }}
+            .content code {{
+                background: #f0f0f0;
+                border-radius: 0;
+            }}
+            .thread-section {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0;
+                margin-bottom: 20px;
+                box-shadow: none;
+                border-top: 2px solid #000;
+                padding-top: 16px;
+            }}
+            .thread-section h2 {{
+                color: #000;
+                border-bottom: 1px solid #000;
+            }}
+            .thread-post {{
+                background: #fff;
+                border-radius: 0;
+                border-left: 3px solid #000;
+                page-break-inside: avoid;
+            }}
+            .thread-post-number {{
+                background: #000;
+                color: #fff;
+                border-radius: 0;
+            }}
+            .thread-post-author {{
+                color: #000;
+            }}
+            .bilingual-block {{
+                border-radius: 0;
+                padding: 8px 12px;
+                page-break-inside: avoid;
+            }}
+            .bilingual-zh {{
+                background: #f5f5f5;
+                border-left: 3px solid #333;
+            }}
+            .bilingual-en {{
+                background: #f8f8f8;
+                border-left: 3px solid #666;
+            }}
+            .bilingual-zh .lang-label {{
+                background: #333;
+                color: #fff;
+                border-radius: 0;
+            }}
+            .bilingual-en .lang-label {{
+                background: #666;
+                color: #fff;
+                border-radius: 0;
+            }}
+            .media-section {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0;
+                margin-bottom: 20px;
+                box-shadow: none;
+                border-top: 2px solid #000;
+                padding-top: 16px;
+            }}
+            .media-section h2 {{
+                border-bottom: 1px solid #000;
+            }}
+            .images-grid {{
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }}
+            .image-item img {{
+                border-radius: 0;
+                page-break-inside: avoid;
+            }}
+            .videos-section, .embedded-videos-section {{
+                page-break-inside: avoid;
+            }}
+            .video-item video {{
+                border-radius: 0;
+            }}
+            .video-embed {{
+                border-radius: 0;
+            }}
+            .links-section {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0;
+                margin-bottom: 20px;
+                box-shadow: none;
+                border-top: 2px solid #000;
+                padding-top: 16px;
+            }}
+            .links-section h2 {{
+                border-bottom: 1px solid #000;
+            }}
+            .link-card {{
+                border: 1px solid #333;
+                border-radius: 0;
+                page-break-inside: avoid;
+            }}
+            .link-card:hover {{
+                background-color: #fff;
+            }}
+            .link-image {{
+                border-radius: 0;
+            }}
+            .link-title {{
+                color: #000;
+            }}
+            .link-description {{
+                color: #333;
+            }}
+            .link-url {{
+                color: #333;
+            }}
+            .footer {{
+                border-top: 1px solid #ccc;
+                color: #666;
+            }}
+        }}
     </style>
 </head>
 <body>
@@ -3857,45 +4586,45 @@ class TwitterHandler(PlatformHandler):
         async def download_single_image(img_url: str, index: int) -> Dict[str, Any]:
             try:
                 timeout = aiohttp.ClientTimeout(total=30)
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(img_url, timeout=timeout) as response:
-                        if response.status == 200:
-                            content = await response.read()
-                            content_type = response.headers.get('Content-Type', '')
+                session = await self.get_http_session()
+                async with session.get(img_url, timeout=timeout) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        content_type = response.headers.get('Content-Type', '')
 
-                            ext = self._detect_image_extension(img_url, content_type)
+                        ext = self._detect_image_extension(img_url, content_type)
 
-                            local_filename = f'image_{index + 1}{ext}'
-                            local_path = os.path.join(images_dir, local_filename)
+                        local_filename = f'image_{index + 1}{ext}'
+                        local_path = os.path.join(images_dir, local_filename)
 
-                            with open(local_path, 'wb') as f:
-                                f.write(content)
+                        with open(local_path, 'wb') as f:
+                            f.write(content)
 
-                            file_size = len(content)
-                            meta = metadata_map.get(img_url, {})
+                        file_size = len(content)
+                        meta = metadata_map.get(img_url, {})
 
-                            result = {
-                                img_url: {
-                                    'local_path': f'images/{local_filename}',
-                                    'filename': local_filename,
-                                    'size': file_size,
-                                    'width': meta.get('width'),
-                                    'height': meta.get('height'),
-                                    'format': ext.lstrip('.'),
-                                    'alt': meta.get('alt')
-                                }
+                        result = {
+                            img_url: {
+                                'local_path': f'images/{local_filename}',
+                                'filename': local_filename,
+                                'size': file_size,
+                                'width': meta.get('width'),
+                                'height': meta.get('height'),
+                                'format': ext.lstrip('.'),
+                                'alt': meta.get('alt')
                             }
+                        }
 
-                            logger.info(
-                                f"Downloaded image {index + 1}/{len(image_urls)}: "
-                                f"{local_filename} ({file_size} bytes)"
-                            )
-                            return result
-                        else:
-                            logger.warning(
-                                f"Image download failed with status {response.status}: "
-                                f"{img_url}"
-                            )
+                        logger.info(
+                            f"Downloaded image {index + 1}/{len(image_urls)}: "
+                            f"{local_filename} ({file_size} bytes)"
+                        )
+                        return result
+                    else:
+                        logger.warning(
+                            f"Image download failed with status {response.status}: "
+                            f"{img_url}"
+                        )
             except Exception as e:
                 logger.warning(f"Failed to download image {img_url}: {e}")
             return {}

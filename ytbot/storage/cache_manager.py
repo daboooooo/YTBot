@@ -26,6 +26,8 @@ class CacheManager:
     in a JSON file for later retry processing.
     """
 
+    MAX_CACHE_QUEUE_SIZE = 1000
+
     def __init__(self, cache_dir: Optional[str] = None):
         """
         Initialize cache manager
@@ -147,6 +149,15 @@ class CacheManager:
 
                 # Add to queue
                 self._cache_queue.append(entry)
+
+                # Enforce max queue size to prevent unbounded growth
+                if len(self._cache_queue) > self.MAX_CACHE_QUEUE_SIZE:
+                    removed = self._cache_queue[:len(self._cache_queue) - self.MAX_CACHE_QUEUE_SIZE]
+                    self._cache_queue = self._cache_queue[len(self._cache_queue) - self.MAX_CACHE_QUEUE_SIZE:]
+                    logger.warning(
+                        f"Cache queue exceeded {self.MAX_CACHE_QUEUE_SIZE}, "
+                        f"removed {len(removed)} oldest entries"
+                    )
 
                 # Persist to disk
                 if self._save_queue():

@@ -6,6 +6,7 @@ Handles YouTube video and playlist downloads with support for various formats an
 
 import re
 import asyncio
+import shutil
 import tempfile
 import json
 import os
@@ -368,17 +369,22 @@ class YouTubeHandler(PlatformHandler):
                 return DownloadResult(
                     success=True,
                     file_path=str(file_path),
-                    content_info=content_info
+                    content_info=content_info,
+                    temp_dir=temp_dir
                 )
 
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Failed to download YouTube content: {error_msg}")
-            
+
+            # Clean up temp_dir on failure since no file needs to be preserved
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
             # Parse specific error for better messaging
             parsed_error = self._parse_youtube_error(error_msg)
             user_message = self.get_error_message(parsed_error)
-            
+
             return DownloadResult(
                 success=False,
                 error_message=user_message,  # User-friendly message

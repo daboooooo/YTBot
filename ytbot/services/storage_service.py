@@ -5,7 +5,9 @@ Provides unified interface for local and cloud storage backends.
 """
 
 import os
+import shutil
 import asyncio
+from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -283,15 +285,34 @@ class StorageService:
                 if local_path:
                     logger.info(f"✅ File stored locally: {local_path}")
 
+                    # For directory content, cache the parent directory
+                    # so that retry can upload the entire directory
+                    # (including images/videos), not just the HTML file
+                    cache_file_path = local_path
+                    cache_filename = filename
+                    cache_metadata = {
+                        "original_source": source_path,
+                        "timestamp": datetime.now().isoformat()
+                    }
+
+                    if is_directory:
+                        # local_path is the HTML file inside the tweet dir
+                        # Cache the parent directory instead
+                        cache_dir_path = str(Path(local_path).parent)
+                        cache_file_path = cache_dir_path
+                        # Use directory name as filename for remote path
+                        cache_filename = Path(cache_dir_path).name
+                        cache_metadata["is_directory"] = True
+                        logger.info(
+                            f"📁 Caching directory for retry: {cache_dir_path}"
+                        )
+
                     # Add to cache queue for later retry
                     cache_added = self.cache_manager.add_to_cache(
-                        file_path=local_path,
-                        filename=filename,
+                        file_path=cache_file_path,
+                        filename=cache_filename,
                         content_type=content_type,
-                        metadata={
-                            "original_source": source_path,
-                            "timestamp": datetime.now().isoformat()
-                        }
+                        metadata=cache_metadata
                     )
 
                     if cache_added:
@@ -456,21 +477,23 @@ class StorageService:
             file_path = cache_entry.get('file_path')
             filename = cache_entry.get('filename')
             content_type = cache_entry.get('content_type', 'media')
+            metadata = cache_entry.get('metadata', {})
+            is_directory = metadata.get('is_directory', False)
 
             result["files_processed"] += 1
 
             logger.info(
                 f"📤 Retrying file {result['files_processed']}/{len(cache_queue)}: "
-                f"{filename}"
+                f"{filename} ({'directory' if is_directory else 'file'})"
             )
 
-            # Check if file still exists
+            # Check if file/directory still exists
             if not file_path or not os.path.exists(file_path):
-                logger.warning(f"⚠️  Cached file no longer exists: {file_path}")
+                logger.warning(f"⚠️  Cached path no longer exists: {file_path}")
                 # Remove from cache
                 self.cache_manager.remove_from_cache(file_path)
                 result["files_failed"] += 1
-                result["errors"].append(f"File not found: {filename}")
+                result["errors"].append(f"Path not found: {filename}")
                 continue
 
             try:
@@ -480,32 +503,84 @@ class StorageService:
                     remote_dir = f'/{remote_dir}'
 
                 media_type_dir = content_type.capitalize()
-                remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
 
-                logger.debug(f"Uploading to: {remote_path}")
+                if is_directory:
+                    # Upload entire directory (including images/videos)
+                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
+                    logger.debug(f"Uploading directory to: {remote_path}")
 
-                # Upload to Nextcloud
-                file_url = self.nextcloud_storage.upload_file(file_path, remote_path)
+                    upload_result = self.nextcloud_storage.upload_directory(
+                        file_path, remote_path
+                    )
 
-                if file_url:
-                    logger.info(f"✅ Successfully uploaded: {file_url}")
+                    if upload_result.get("success"):
+                        file_url = upload_result.get("file_url")
+                        logger.info(
+                            f"✅ Successfully uploaded directory: {file_url}"
+                        )
 
-                    # Remove from cache queue
-                    self.cache_manager.remove_from_cache(file_path)
+                        # Remove from cache queue
+                        self.cache_manager.remove_from_cache(file_path)
 
-                    # Optionally delete local file after successful upload
-                    if CONFIG.get('local_storage', {}).get('delete_after_upload', False):
-                        try:
-                            os.remove(file_path)
-                            logger.debug(f"Deleted local cache file: {file_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to delete local cache file: {e}")
+                        # Optionally delete local directory after upload
+                        if CONFIG.get('local_storage', {}).get(
+                            'delete_after_upload', False
+                        ):
+                            try:
+                                shutil.rmtree(file_path)
+                                logger.debug(
+                                    f"Deleted local cache directory: {file_path}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to delete local cache dir: {e}"
+                                )
 
-                    result["files_uploaded"] += 1
+                        result["files_uploaded"] += 1
+                    else:
+                        errors = upload_result.get('errors', [])
+                        logger.warning(
+                            f"⚠️  Directory upload failed for: {filename}, "
+                            f"errors: {errors}"
+                        )
+                        result["files_failed"] += 1
+                        result["errors"].append(
+                            f"Directory upload failed: {filename}"
+                        )
                 else:
-                    logger.warning(f"⚠️  Upload failed for: {filename}")
-                    result["files_failed"] += 1
-                    result["errors"].append(f"Upload failed: {filename}")
+                    # Upload single file
+                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
+                    logger.debug(f"Uploading to: {remote_path}")
+
+                    file_url = self.nextcloud_storage.upload_file(
+                        file_path, remote_path
+                    )
+
+                    if file_url:
+                        logger.info(f"✅ Successfully uploaded: {file_url}")
+
+                        # Remove from cache queue
+                        self.cache_manager.remove_from_cache(file_path)
+
+                        # Optionally delete local file after upload
+                        if CONFIG.get('local_storage', {}).get(
+                            'delete_after_upload', False
+                        ):
+                            try:
+                                os.remove(file_path)
+                                logger.debug(
+                                    f"Deleted local cache file: {file_path}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to delete local cache file: {e}"
+                                )
+
+                        result["files_uploaded"] += 1
+                    else:
+                        logger.warning(f"⚠️  Upload failed for: {filename}")
+                        result["files_failed"] += 1
+                        result["errors"].append(f"Upload failed: {filename}")
 
             except Exception as e:
                 logger.error(f"❌ Error uploading cached file {filename}: {e}")

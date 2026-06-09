@@ -4,6 +4,8 @@ Telegram handler for YTBot
 Handles Telegram bot commands and message processing.
 """
 
+import os
+import shutil
 from typing import Dict, Any, Optional, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, filters
@@ -32,10 +34,8 @@ class TelegramHandler:
         self.download_service = download_service
         self.user_states: Dict[int, Dict[str, Any]] = {}
 
-        # Initialize user state manager
-        self.state_manager = UserStateManager(
-            timeout=CONFIG['monitor']['user_state_timeout']
-        )
+        # UserStateManager will be set by cli.py to share the same instance
+        self.state_manager: UserStateManager = UserStateManager()
 
     def setup_handlers(self):
         """Set up Telegram command and message handlers"""
@@ -714,6 +714,18 @@ class TelegramHandler:
                 error_code = content_info.get('error_detail')
                 if handler and handler.name == "YouTube":
                     error_message = handler.get_error_message(error_code)
+                elif handler and handler.name == "Twitter/X":
+                    twitter_error_messages = {
+                        "ERROR_LOGIN_FAILED": "🔐 Twitter/X 登录失败，可能需要重新登录",
+                        "ERROR_RATE_LIMITED": "⏳ Twitter/X 请求过于频繁，请稍后重试",
+                        "ERROR_TWEET_NOT_FOUND": "❌ 推文不存在或已被删除",
+                        "ERROR_ACCOUNT_SUSPENDED": "🚫 账号已被封禁",
+                        "ERROR_TWEET_PROTECTED": "🔒 推文来自私密账号，无法访问",
+                    }
+                    error_message = twitter_error_messages.get(
+                        error_code,
+                        "❌ 获取推文内容时发生错误"
+                    )
                 else:
                     error_messages = {
                         "ERROR_SIGN_IN_REQUIRED": "🔐 需要登录或更新cookies",
@@ -800,10 +812,25 @@ class TelegramHandler:
                 result = await extractor.scrape_tweet(url)
 
                 if not result.get('success'):
+                    error_msg = result.get('error', '')
+                    twitter_error_messages = {
+                        "ERROR_LOGIN_FAILED": "🔐 Twitter/X 登录失败，可能需要重新登录",
+                        "ERROR_RATE_LIMITED": "⏳ Twitter/X 请求过于频繁，请稍后重试",
+                        "ERROR_TWEET_NOT_FOUND": "❌ 推文不存在或已被删除",
+                        "ERROR_ACCOUNT_SUSPENDED": "🚫 账号已被封禁",
+                        "ERROR_TWEET_PROTECTED": "🔒 推文来自私密账号，无法访问",
+                    }
+                    error_code = handler._parse_twitter_error(
+                        error_msg
+                    )
+                    error_text = twitter_error_messages.get(
+                        error_code,
+                        "❌ 无法获取推文内容，请检查链接是否有效。"
+                    )
                     await self.telegram_service.edit_message(
                         chat_id=chat_id,
                         message_id=message_id,
-                        text="❌ 无法获取推文内容，请检查链接是否有效。"
+                        text=error_text
                     )
                     await extractor.close_browser()
                     return
@@ -1214,11 +1241,18 @@ class TelegramHandler:
                 else:
                     title = "Unknown"
 
+                # Determine actual content type for storage
+                # For Twitter, download_type is "text" but the actual
+                # content may contain video or images
+                actual_download_type = download_type
+                if download_result.content_info and download_result.content_info.content_type:
+                    actual_download_type = download_result.content_info.content_type.value
+
                 # Store the file
                 storage_result = await self._store_downloaded_file(
                     download_result.file_path,
                     title,
-                    download_type
+                    actual_download_type
                 )
 
                 if storage_result['success']:
@@ -1227,7 +1261,8 @@ class TelegramHandler:
                         message_id,
                         content_info or {},
                         storage_result,
-                        download_type
+                        actual_download_type,
+                        is_twitter=is_twitter
                     )
                 else:
                     await self.telegram_service.edit_message(
@@ -1249,6 +1284,15 @@ class TelegramHandler:
                 message_id=message_id,
                 text=f"❌ 下载过程中发生错误: {str(e)}"
             )
+        finally:
+            # Clean up temp directory after storage is complete
+            if download_result and download_result.temp_dir:
+                try:
+                    if os.path.exists(download_result.temp_dir):
+                        shutil.rmtree(download_result.temp_dir, ignore_errors=True)
+                        logger.debug(f"Cleaned up temp dir: {download_result.temp_dir}")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to clean up temp dir: {cleanup_err}")
 
     async def _update_download_progress(
         self,
@@ -1346,7 +1390,8 @@ class TelegramHandler:
         message_id: int,
         content_info: Dict[str, Any],
         storage_result: Dict[str, Any],
-        download_type: str = "video"
+        download_type: str = "video",
+        is_twitter: bool = False
     ):
         """
         Send success message to user.
@@ -1356,10 +1401,9 @@ class TelegramHandler:
             message_id: Message ID to edit
             content_info: Content information dictionary
             storage_result: Storage result dictionary
-            download_type: "audio", "video", or "text" (for Twitter)
+            download_type: "audio", "video", "image", or "text"
+            is_twitter: Whether this is a Twitter/X download
         """
-        is_twitter = download_type == "text"
-
         if is_twitter and content_info.get('success'):
             lines = [
                 "🐦 Twitter/X 内容",
@@ -1529,47 +1573,58 @@ class TelegramHandler:
                 chat_id, message_id, progress_data
             )
 
-        download_result = await self.download_service.download_content(
-            url=url,
-            content_type=download_type,
-            progress_callback=progress_callback,
-            format_id=format_id
-        )
-
-        if download_result.success:
-            if download_result.content_info:
-                title = download_result.content_info.title
-            elif content_info:
-                title = content_info.get('title', 'Unknown')
-            else:
-                title = "Unknown"
-
-            storage_result = await self._store_downloaded_file(
-                download_result.file_path,
-                title,
-                download_type
+        download_result = None
+        try:
+            download_result = await self.download_service.download_content(
+                url=url,
+                content_type=download_type,
+                progress_callback=progress_callback,
+                format_id=format_id
             )
 
-            if storage_result['success']:
-                await self._send_success_message(
-                    chat_id,
-                    message_id,
-                    content_info or {},
-                    storage_result,
+            if download_result.success:
+                if download_result.content_info:
+                    title = download_result.content_info.title
+                elif content_info:
+                    title = content_info.get('title', 'Unknown')
+                else:
+                    title = "Unknown"
+
+                storage_result = await self._store_downloaded_file(
+                    download_result.file_path,
+                    title,
                     download_type
                 )
+
+                if storage_result['success']:
+                    await self._send_success_message(
+                        chat_id,
+                        message_id,
+                        content_info or {},
+                        storage_result,
+                        download_type
+                    )
+                else:
+                    await self.telegram_service.edit_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="❌ 文件存储失败，请稍后重试。"
+                    )
             else:
                 await self.telegram_service.edit_message(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="❌ 文件存储失败，请稍后重试。"
+                    text=f"❌ 下载失败: {download_result.error_message}"
                 )
-        else:
-            await self.telegram_service.edit_message(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"❌ 下载失败: {download_result.error_message}"
-            )
+        finally:
+            # Clean up temp directory after storage is complete
+            if download_result and download_result.temp_dir:
+                try:
+                    if os.path.exists(download_result.temp_dir):
+                        shutil.rmtree(download_result.temp_dir, ignore_errors=True)
+                        logger.debug(f"Cleaned up temp dir: {download_result.temp_dir}")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to clean up temp dir: {cleanup_err}")
 
     def _get_file_size_estimate_from_formats(
         self, formats: List[Dict[str, Any]], format_id: Optional[str]

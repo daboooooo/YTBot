@@ -64,7 +64,7 @@ class DownloadService:
         try:
             content_info = await handler.get_content_info(url)
             if content_info:
-                return {
+                result = {
                     "url": content_info.url,
                     "title": content_info.title,
                     "description": content_info.description,
@@ -74,6 +74,9 @@ class DownloadService:
                     "uploader": content_info.uploader,
                     "upload_date": content_info.upload_date,
                 }
+                if content_info.error_detail:
+                    result["error_detail"] = content_info.error_detail
+                return result
             return None
         except Exception as e:
             logger.error(f"Failed to get content info for {url}: {e}")

@@ -281,59 +281,29 @@ class PdfPreprocessor:
         '''.format(thumb=escaped_thumbnail, title=escaped_title, url=escaped_url)
 
     def _add_print_styles(self, html: str) -> str:
-        """Add print-optimized styles"""
+        """Add PDF-specific print styles (supplements @media print in main HTML)"""
 
         print_css = '''
         <style>
             @media print {
-                @page {
-                    size: A4;
-                    margin: 2cm;
-                }
-
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    font-size: 12pt;
-                    line-height: 1.6;
-                    color: #333;
-                }
-
-                img {
-                    max-width: 100% !important;
-                    page-break-inside: avoid;
-                }
-
                 .pdf-video-placeholder,
                 .pdf-youtube-placeholder {
                     page-break-inside: avoid;
-                    border: 1px solid #ccc;
+                    border: 1px solid #333;
+                    border-radius: 0;
                     margin: 16px 0;
+                    background: #fff;
                 }
 
-                a {
-                    color: #333;
-                    text-decoration: none;
+                .pdf-video-placeholder img,
+                .pdf-youtube-placeholder img {
+                    border-radius: 0;
                 }
 
-                a[href^="http"]:after {
-                    content: " (" attr(href) ")";
-                    font-size: 0.8em;
-                    color: #666;
-                }
-
-                .header {
-                    border-bottom: 2px solid #333;
-                    padding-bottom: 16px;
-                    margin-bottom: 24px;
-                }
-
-                .media-section,
-                .thread-section {
-                    margin-top: 24px;
-                }
-
-                h1, h2, h3 {
-                    page-break-after: avoid;
+                .pdf-embedded-video {
+                    page-break-inside: avoid;
+                    border: 1px solid #333;
+                    border-radius: 0;
                 }
             }
         </style>

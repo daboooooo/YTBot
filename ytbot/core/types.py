@@ -65,6 +65,7 @@ class DownloadResult:
     content_info: Optional[ContentInfo] = None
     error_message: Optional[str] = None
     cancelled: bool = False
+    temp_dir: Optional[str] = None
 
 
 @dataclass
