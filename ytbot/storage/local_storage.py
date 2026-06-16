@@ -142,11 +142,7 @@ class LocalStorageManager:
         """Save a directory (with images) to local storage"""
         try:
             html_files = list(source_dir.glob("*.html"))
-            if not html_files:
-                logger.error(f"No HTML file found in directory: {source_dir}")
-                return None
-
-            html_file = html_files[0]
+            html_file = html_files[0] if html_files else None
 
             pdf_files = list(source_dir.glob("*.pdf"))
             pdf_file = pdf_files[0] if pdf_files else None
@@ -155,28 +151,20 @@ class LocalStorageManager:
             target_dir = self.storage_path / date_folder
             target_dir.mkdir(exist_ok=True)
 
-            name, ext = os.path.splitext(filename)
-            if not ext:
-                ext = ".html"
-                filename = name + ext
-
-            target_path = target_dir / filename
-
-            if target_path.exists():
+            # filename is the directory name (no extension)
+            # Create a directory for this content's files
+            tweet_dir = target_dir / filename
+            if tweet_dir.exists():
                 timestamp = datetime.now().strftime("%H%M%S")
-                target_path = target_dir / f"{name}_{timestamp}{ext}"
-
-            # Create a directory for this tweet's files
-            # Use the filename (without extension) as directory name
-            tweet_dir = target_path.parent / target_path.stem
+                tweet_dir = target_dir / f"{filename}_{timestamp}"
             tweet_dir.mkdir(exist_ok=True)
 
-            # Copy HTML file into the tweet directory
-            html_target = tweet_dir / target_path.name
-            shutil.copy2(html_file, html_target)
-
-            # Update target_path to point to the HTML inside tweet directory
-            target_path = html_target
+            # Copy HTML file into the content directory
+            target_path = None
+            if html_file:
+                html_target = tweet_dir / html_file.name
+                shutil.copy2(html_file, html_target)
+                target_path = html_target
 
             # Copy PDF file (if exists)
             has_pdf = False
@@ -219,13 +207,20 @@ class LocalStorageManager:
             has_videos = videos_source.exists()
             if has_images or has_videos or has_pdf:
                 logger.info(
-                    f"Directory saved to local storage: {target_path} "
-                    f"(images: {has_images}, videos: {has_videos}, pdf: {has_pdf})"
+                    f"Directory saved to local storage: {tweet_dir} "
+                    f"(images: {has_images}, videos: {has_videos}, "
+                    f"pdf: {has_pdf})"
                 )
             else:
-                logger.info(f"File saved to local storage: {target_path}")
+                logger.info(
+                    f"Directory saved to local storage: {tweet_dir}"
+                )
 
-            return str(target_path)
+            # Return the content directory path (for cache and reference)
+            # If HTML exists, return HTML path for backward compatibility
+            if target_path:
+                return str(target_path)
+            return str(tweet_dir)
 
         except Exception as e:
             logger.error(f"Failed to save directory: {e}")
@@ -256,7 +251,9 @@ class LocalStorageManager:
 
                 try:
                     # Get file modification time
-                    file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                    file_mtime = datetime.fromtimestamp(
+                        file_path.stat().st_mtime
+                    )
 
                     # Delete if expired
                     if file_mtime < cutoff_date:
@@ -268,16 +265,45 @@ class LocalStorageManager:
                         cleanup_stats["files_removed"] += 1
                         cleanup_stats["space_freed_mb"] += file_size_mb
 
-                        logger.debug(f"Deleted expired file: {file_path} "
-                                   f"({file_size_mb:.1f}MB)")
+                        logger.debug(
+                            f"Deleted expired file: {file_path} "
+                            f"({file_size_mb:.1f}MB)"
+                        )
 
                 except Exception as e:
-                    cleanup_stats["errors"].append(f"Failed to delete {file_path}: {str(e)}")
-                    logger.error(f"Failed to delete file: {file_path}, error: {e}")
+                    cleanup_stats["errors"].append(
+                        f"Failed to delete {file_path}: {str(e)}"
+                    )
+                    logger.error(
+                        f"Failed to delete file: {file_path}, error: {e}"
+                    )
 
-            logger.info(f"Local storage cleanup completed: "
-                       f"{cleanup_stats['files_removed']} files removed, "
-                       f"{cleanup_stats['space_freed_mb']:.1f}MB freed")
+            # Remove empty directories left after file cleanup
+            dirs_removed = 0
+            for dir_path in sorted(
+                self.storage_path.rglob('*'), reverse=True
+            ):
+                if dir_path.is_dir():
+                    try:
+                        if not any(dir_path.iterdir()):
+                            dir_path.rmdir()
+                            dirs_removed += 1
+                            logger.debug(
+                                f"Removed empty directory: {dir_path}"
+                            )
+                    except Exception as e:
+                        logger.debug(
+                            f"Could not remove directory {dir_path}: {e}"
+                        )
+
+            if dirs_removed:
+                logger.info(f"Removed {dirs_removed} empty directories")
+
+            logger.info(
+                f"Local storage cleanup completed: "
+                f"{cleanup_stats['files_removed']} files removed, "
+                f"{cleanup_stats['space_freed_mb']:.1f}MB freed"
+            )
 
         except Exception as e:
             cleanup_stats["errors"].append(f"Cleanup failed: {str(e)}")

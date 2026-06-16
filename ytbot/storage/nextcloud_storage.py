@@ -7,7 +7,7 @@ Provides Nextcloud WebDAV integration for cloud storage.
 import os
 import time
 from webdav3.client import Client as NextcloudClient
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from ..core.config import CONFIG
 from ..core.enhanced_logger import get_logger
@@ -96,8 +96,10 @@ class NextcloudStorage:
                 if self._verify_upload(remote_path, local_path):
                     # Build file URL
                     base_url = CONFIG['nextcloud']['url'].rstrip('/')
-                    file_url = (f"{base_url}/remote.php/dav/files/"
-                               f"{CONFIG['nextcloud']['username']}{remote_path}")
+                    file_url = (
+                        f"{base_url}/remote.php/dav/files/"
+                        f"{CONFIG['nextcloud']['username']}{remote_path}"
+                    )
                     logger.info(f"File uploaded successfully: {file_url}")
                     return file_url
                 else:
@@ -126,7 +128,8 @@ class NextcloudStorage:
             remote_dir: Remote directory path in Nextcloud
 
         Returns:
-            dict: Upload result with 'success', 'file_url', 'uploaded_files', 'errors'
+            dict: Upload result with 'success', 'file_url',
+                  'uploaded_files', 'errors'
         """
         result = {
             "success": False,
@@ -150,17 +153,13 @@ class NextcloudStorage:
             # Ensure remote directory exists
             self._ensure_directory_exists(remote_dir)
 
-            # Find HTML file (main file)
+            # Find HTML file for building file_url (optional)
             html_files = [f for f in os.listdir(local_dir) if f.endswith('.html')]
-            if not html_files:
-                error_msg = f"No HTML file found in directory: {local_dir}"
-                logger.error(error_msg)
-                result["errors"].append(error_msg)
-                return result
+            main_html = html_files[0] if html_files else None
 
-            main_html = html_files[0]
             uploaded_files = []
             errors = []
+            total_files = 0
 
             # Walk through directory and upload all files
             for root, dirs, files in os.walk(local_dir):
@@ -176,6 +175,7 @@ class NextcloudStorage:
 
                 # Upload files in current directory
                 for file in files:
+                    total_files += 1
                     local_file_path = os.path.join(root, file)
                     if rel_root:
                         remote_file_path = f"{remote_dir}/{rel_root}/{file}"
@@ -183,7 +183,10 @@ class NextcloudStorage:
                         remote_file_path = f"{remote_dir}/{file}"
 
                     try:
-                        logger.info(f"Uploading: {local_file_path} -> {remote_file_path}")
+                        logger.info(
+                            f"Uploading: {local_file_path} -> "
+                            f"{remote_file_path}"
+                        )
                         self.client.upload_sync(
                             remote_path=remote_file_path,
                             local_path=local_file_path
@@ -195,23 +198,40 @@ class NextcloudStorage:
                         logger.error(error_msg)
                         errors.append(error_msg)
 
-            # Build main HTML file URL
+            # Build file URL - use Nextcloud web UI browse URL
             base_url = CONFIG['nextcloud']['url'].rstrip('/')
-            main_html_remote = f"{remote_dir}/{main_html}"
-            file_url = (f"{base_url}/remote.php/dav/files/"
-                       f"{CONFIG['nextcloud']['username']}{main_html_remote}")
+            file_url = (
+                f"{base_url}/apps/files/?dir="
+                f"{remote_dir}"
+            )
+
+            # Success: all files uploaded, or at least the majority
+            # (allow some non-critical files to fail)
+            upload_ratio = (
+                len(uploaded_files) / total_files if total_files > 0 else 0
+            )
+            is_success = upload_ratio >= 0.8 or (
+                main_html and main_html in [
+                    os.path.basename(f) for f in uploaded_files
+                ]
+            )
 
             result.update({
-                "success": len(errors) == 0 or main_html in [os.path.basename(f) for f in uploaded_files],
+                "success": is_success,
                 "file_url": file_url,
                 "uploaded_files": uploaded_files,
                 "errors": errors
             })
 
             if errors:
-                logger.warning(f"Directory upload completed with {len(errors)} errors")
+                logger.warning(
+                    f"Directory upload completed with {len(errors)} "
+                    f"errors ({len(uploaded_files)}/{total_files} files)"
+                )
             else:
-                logger.info(f"Directory upload completed successfully: {file_url}")
+                logger.info(
+                    f"Directory upload completed successfully: {file_url}"
+                )
 
             return result
 
@@ -270,8 +290,10 @@ class NextcloudStorage:
             # Optionally verify file size
             if CONFIG['nextcloud']['verify_file_size']:
                 local_size = os.path.getsize(local_path)
-                logger.debug(f"Upload verification passed: {remote_path}, "
-                           f"local size: {local_size} bytes")
+                logger.debug(
+                    f"Upload verification passed: {remote_path}, "
+                    f"local size: {local_size} bytes"
+                )
 
             return True
 

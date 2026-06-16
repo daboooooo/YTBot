@@ -126,3 +126,5 @@ dev/
 # twitter cookies
 .twitter_cookies.json
 
+docs/
+.superpower/

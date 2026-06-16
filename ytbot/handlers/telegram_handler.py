@@ -1368,11 +1368,9 @@ class TelegramHandler:
         import os
 
         if os.path.isdir(file_path):
-            html_files = [f for f in os.listdir(file_path) if f.endswith('.html')]
-            if html_files:
-                ext = ".html"
-            else:
-                ext = ""
+            # For directories, use title directly as directory name
+            # (no extension needed - the directory contains all files)
+            safe_filename = sanitize_filename(title)
         else:
             _, original_ext = os.path.splitext(file_path)
             if original_ext:
@@ -1380,7 +1378,7 @@ class TelegramHandler:
             else:
                 ext = ".mp3" if download_type == "audio" else ".mp4"
 
-        safe_filename = sanitize_filename(f"{title}{ext}")
+            safe_filename = sanitize_filename(f"{title}{ext}")
 
         return await self.storage_service.store_file(file_path, safe_filename, download_type)
 
@@ -1405,13 +1403,32 @@ class TelegramHandler:
             is_twitter: Whether this is a Twitter/X download
         """
         if is_twitter and content_info.get('success'):
-            lines = [
-                "🐦 Twitter/X 内容",
-                "",
-                "✅ 已保存到本地",
-                f"📁 文件: {content_info.get('title', '推文内容')}",
-                f"💾 保存位置: {storage_result.get('file_path', '本地存储')}",
-            ]
+            # Build display title from Twitter scrape result
+            author = content_info.get('author', '')
+            full_text = content_info.get('full_text', '')
+            if author:
+                display_title = f"{author}: {full_text[:50]}"
+            elif full_text:
+                display_title = full_text[:60]
+            else:
+                display_title = "推文内容"
+
+            if storage_result.get('storage_type') == 'nextcloud':
+                lines = [
+                    "🐦 Twitter/X 内容",
+                    "",
+                    "✅ 已保存到 Nextcloud",
+                    f"📁 文件: {display_title}",
+                    f"🔗 访问链接: {storage_result.get('file_url', '')}",
+                ]
+            else:
+                lines = [
+                    "🐦 Twitter/X 内容",
+                    "",
+                    "✅ 已保存到本地",
+                    f"📁 文件: {display_title}",
+                    f"💾 保存位置: {storage_result.get('file_path', '本地存储')}",
+                ]
             message = "\n".join(lines)
         else:
             type_emoji = "🎵" if download_type == "audio" else "🎬"

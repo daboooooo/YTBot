@@ -4,6 +4,8 @@ Startup Manager for YTBot
 Manages the startup sequence with phase tracking, error handling, and rollback capabilities.
 """
 
+import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -25,7 +27,7 @@ config = get_config()
 class StartupPhase(Enum):
     """Startup phases enumeration"""
     CONFIG_VALIDATION = auto()
-    FFMPEG_CHECK = auto()
+    DEPENDENCY_CHECK = auto()
     YT_DLP_UPDATE = auto()
     TELEGRAM_CONNECTION = auto()
     NEXTCLOUD_CONNECTION = auto()
@@ -66,7 +68,7 @@ class StartupManager:
         self.phases: Dict[StartupPhase, PhaseResult] = {}
         self.phase_order: List[StartupPhase] = [
             StartupPhase.CONFIG_VALIDATION,
-            StartupPhase.FFMPEG_CHECK,
+            StartupPhase.DEPENDENCY_CHECK,
             StartupPhase.YT_DLP_UPDATE,
             StartupPhase.TELEGRAM_CONNECTION,
             StartupPhase.NEXTCLOUD_CONNECTION,
@@ -207,7 +209,7 @@ class StartupManager:
         """Get the handler function for a phase"""
         handlers = {
             StartupPhase.CONFIG_VALIDATION: self._phase_config_validation,
-            StartupPhase.FFMPEG_CHECK: self._phase_ffmpeg_check,
+            StartupPhase.DEPENDENCY_CHECK: self._phase_dependency_check,
             StartupPhase.YT_DLP_UPDATE: self._phase_yt_dlp_update,
             StartupPhase.TELEGRAM_CONNECTION: self._phase_telegram_connection,
             StartupPhase.NEXTCLOUD_CONNECTION: self._phase_nextcloud_connection,
@@ -221,7 +223,10 @@ class StartupManager:
         """Get human-readable description for a phase"""
         descriptions = {
             StartupPhase.CONFIG_VALIDATION: "Loading and validating configuration settings",
-            StartupPhase.FFMPEG_CHECK: "Checking FFmpeg availability for media processing",
+            StartupPhase.DEPENDENCY_CHECK: (
+                "Checking OS-specific dependencies "
+                "(ffmpeg, Chrome, wkhtmltopdf, etc.)"
+            ),
             StartupPhase.YT_DLP_UPDATE: "Checking and updating yt-dlp to latest version",
             StartupPhase.TELEGRAM_CONNECTION: "Establishing connection to Telegram Bot API",
             StartupPhase.NEXTCLOUD_CONNECTION: "Connecting to Nextcloud storage server",
@@ -270,51 +275,119 @@ class StartupManager:
         except Exception as e:
             return False, "Configuration validation failed", str(e)
 
-    async def _phase_ffmpeg_check(self) -> tuple[bool, str, Optional[str]]:
-        """Phase 2: Check FFmpeg availability"""
-        logger.info("🎬 Checking FFmpeg availability...")
+    async def _phase_dependency_check(self) -> tuple[bool, str, Optional[str]]:
+        """Phase 2: Check OS-specific dependencies"""
+        os_type = platform.system()
+        logger.info(f"🔍 Checking dependencies for {os_type}...")
 
-        try:
-            # Check if ffmpeg is available
-            ffmpeg_path = shutil.which('ffmpeg')
+        # Define dependencies per OS
+        # Each entry: (name, check_command_or_which, required, install_hint)
+        dependencies = {
+            'Darwin': [
+                ('ffmpeg', 'ffmpeg', True,
+                 'brew install ffmpeg'),
+                ('Chrome/Chromium', self._find_chrome, False,
+                 'Download from https://www.google.com/chrome/ '
+                 'or: brew install --cask google-chrome'),
+                ('textutil', 'textutil', False,
+                 'Built-in on macOS (should be available)'),
+            ],
+            'Linux': [
+                ('ffmpeg', 'ffmpeg', True,
+                 'sudo apt install ffmpeg  # Debian/Ubuntu\n'
+                 '  sudo dnf install ffmpeg  # Fedora\n'
+                 '  sudo pacman -S ffmpeg    # Arch'),
+                ('Chrome/Chromium', self._find_chrome, False,
+                 'sudo apt install chromium-browser  # Debian/Ubuntu\n'
+                 '  sudo dnf install chromium          # Fedora\n'
+                 '  sudo snap install chromium         # Snap'),
+                ('wkhtmltopdf', 'wkhtmltopdf', False,
+                 'sudo apt install wkhtmltopdf  # Debian/Ubuntu\n'
+                 '  sudo dnf install wkhtmltopdf  # Fedora'),
+                ('libreoffice', 'libreoffice', False,
+                 'sudo apt install libreoffice  # Debian/Ubuntu\n'
+                 '  sudo dnf install libreoffice  # Fedora'),
+            ],
+            'Windows': [
+                ('ffmpeg', 'ffmpeg', True,
+                 'Download from https://ffmpeg.org/download.html\n'
+                 '  Or: winget install ffmpeg'),
+                ('Chrome', self._find_chrome, False,
+                 'Download from https://www.google.com/chrome/'),
+            ],
+        }
 
-            if ffmpeg_path:
-                logger.info(f"✅ FFmpeg found at: {ffmpeg_path}")
+        os_deps = dependencies.get(os_type, dependencies['Linux'])
+        missing_required = []
+        missing_optional = []
+        found_list = []
 
-                # Get FFmpeg version
-                try:
-                    result = subprocess.run(
-                        ['ffmpeg', '-version'],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    if result.returncode == 0:
-                        version_line = result.stdout.split('\n')[0]
-                        logger.info(f"📹 FFmpeg version: {version_line}")
-                        return True, f"FFmpeg available: {version_line}", None
-                except Exception as e:
-                    logger.warning(f"⚠️  Could not get FFmpeg version: {e}")
-                    return True, "FFmpeg is available", None
-
+        for name, check, required, install_hint in os_deps:
+            found = False
+            if callable(check):
+                found = check() is not None
             else:
-                # FFmpeg not found
-                error_msg = (
-                    "FFmpeg is not installed or not in PATH.\n"
-                    "FFmpeg is required for media processing (audio/video conversion).\n\n"
-                    "Please install FFmpeg:\n"
-                    "  - macOS: brew install ffmpeg\n"
-                    "  - Ubuntu/Debian: sudo apt-get install ffmpeg\n"
-                    "  - Windows: Download from https://ffmpeg.org/download.html\n"
-                    "  - Or use: pip install ffmpeg-python"
-                )
-                logger.error("❌ FFmpeg not found")
-                logger.error(error_msg)
+                found = shutil.which(check) is not None
 
-                return False, "FFmpeg not available", error_msg
+            if found:
+                found_list.append(name)
+                logger.info(f"  ✅ {name}: found")
+            else:
+                if required:
+                    missing_required.append((name, install_hint))
+                    logger.error(f"  ❌ {name}: NOT FOUND (required)")
+                else:
+                    missing_optional.append((name, install_hint))
+                    logger.warning(f"  ⚠️  {name}: NOT FOUND (optional, needed for PDF conversion)")
 
-        except Exception as e:
-            return False, "FFmpeg check failed", str(e)
+        # Build result message
+        found_str = ', '.join(found_list) if found_list else 'none'
+        msg = f"OS: {os_type}, Found: [{found_str}]"
+
+        if missing_required:
+            error_lines = ["Missing required dependencies:"]
+            for name, hint in missing_required:
+                error_lines.append(f"  - {name}:")
+                error_lines.append(f"    {hint}")
+            error_msg = '\n'.join(error_lines)
+            return False, msg, error_msg
+
+        if missing_optional:
+            warn_lines = ["Optional dependencies missing (PDF conversion may not work):"]
+            for name, hint in missing_optional:
+                warn_lines.append(f"  - {name}:")
+                warn_lines.append(f"    {hint}")
+            logger.warning('\n'.join(warn_lines))
+            msg += f", Missing optional: [{', '.join(n for n, _ in missing_optional)}]"
+
+        return True, msg, None
+
+    @staticmethod
+    def _find_chrome() -> Optional[str]:
+        """Find Chrome/Chromium executable path"""
+        possible_paths = [
+            # macOS
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            # Linux
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            # Windows
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        for name in ["google-chrome", "google-chrome-stable",
+                      "chromium", "chromium-browser", "chrome"]:
+            found = shutil.which(name)
+            if found:
+                return found
+        return None
 
     async def _phase_yt_dlp_update(self) -> tuple[bool, str, Optional[str]]:
         """Phase 3: Check and update yt-dlp"""

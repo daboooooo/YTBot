@@ -356,15 +356,26 @@ class CacheManager:
             for entry in self._cache_queue:
                 file_path = entry.get('file_path')
                 content_type = entry.get('content_type', 'unknown')
+                metadata = entry.get('metadata', {})
+                is_directory = metadata.get('is_directory', False)
 
                 # Count content types
-                content_types[content_type] = content_types.get(content_type, 0) + 1
+                content_types[content_type] = content_types.get(
+                    content_type, 0
+                ) + 1
 
                 # Check file existence and size
                 if file_path and os.path.exists(file_path):
                     files_exist += 1
                     try:
-                        total_size += os.path.getsize(file_path)
+                        if is_directory and os.path.isdir(file_path):
+                            # Calculate total directory size
+                            for dp, dn, fns in os.walk(file_path):
+                                for fn in fns:
+                                    fp = os.path.join(dp, fn)
+                                    total_size += os.path.getsize(fp)
+                        else:
+                            total_size += os.path.getsize(file_path)
                     except Exception:
                         pass
                 else:

@@ -793,10 +793,9 @@ class TwitterContentExtractor:
                         for (const btn of buttons) {
                             const text = btn.textContent.trim();
                             // 匹配"查看 X 条回复"或"Show X replies"
+                            // 注意：不匹配"查看引用"/"Show quotes"，点击引用会导航离开当前推文
                             if (text.match(/查看.*回复/) ||
-                                text.match(/Show.*repl/i) ||
-                                text.includes('查看引用') ||
-                                text.includes('Show quotes')) {
+                                text.match(/Show.*repl/i)) {
                                 return {
                                     found: true,
                                     text: text,
@@ -989,7 +988,7 @@ class TwitterContentExtractor:
 
                 // 英文格式匹配 (on X: "...")
                 if (pageTitle && pageTitle.includes(' on X:')) {
-                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
+                    const titleMatch = pageTitle.match(/on X:\\s*"([^"]+)"/);
                     if (titleMatch && titleMatch[1]) {
                         pageTitleContent = titleMatch[1].trim();
                     }
@@ -1647,7 +1646,7 @@ class TwitterContentExtractor:
 
                 // 英文格式匹配 (on X: "...")
                 if (pageTitle && pageTitle.includes(' on X:')) {
-                    const titleMatch = pageTitle.match(/on X:\s*"([^"]+)"/);
+                    const titleMatch = pageTitle.match(/on X:\\s*"([^"]+)"/);
                     if (titleMatch && titleMatch[1]) {
                         pageTitleContent = titleMatch[1].trim();
                     }
@@ -2090,7 +2089,7 @@ class TwitterContentExtractor:
                 }
 
                 // 清理内容开头的数字噪声（如浏览量、点赞数等）
-                text = text.replace(/^[\d,.\s]+/, '');
+                text = text.replace(/^[\\d,.\\s]+/, '');
 
                 return {
                     text: text,
@@ -2511,10 +2510,20 @@ class TwitterContentExtractor:
             await self.expand_long_tweet(page)
             await page.wait_for_timeout(1000)
 
-            # 尝试展开回复（连续贴）- 在提取内容之前展开
-            logger.info("Checking for thread replies...")
-            await self.expand_thread_replies(page)
-            
+            # 先检测帖子类型，article 类型不需要展开回复
+            # （article 的 expand_thread_replies 会点击"查看引用"导致页面导航离开）
+            pre_detect = await self.detect_post_type(page)
+            is_article_type = pre_detect.get('post_type') == 'article'
+
+            if not is_article_type:
+                # 尝试展开回复（连续贴）- 在提取内容之前展开
+                logger.info("Checking for thread replies...")
+                await self.expand_thread_replies(page)
+            else:
+                logger.info(
+                    "Skipping thread reply expansion for article type"
+                )
+
             # 等待内容加载完成
             await page.wait_for_timeout(3000)
 
@@ -3219,7 +3228,8 @@ class TwitterHandler(PlatformHandler):
             video_urls = result.get('video_urls', [])
             local_videos = []
             has_video = result.get('has_video', False)
-            # Download videos if detected (regardless of content_type)
+            # Download videos if detected (regardless of content_type or post_type)
+            # yt-dlp can extract videos from tweet URLs even for article-type posts
             if has_video:
                 if progress_callback:
                     await progress_callback({
@@ -3246,7 +3256,7 @@ class TwitterHandler(PlatformHandler):
                         if video_path:
                             local_videos.append(video_path)
                             logger.info(f"Video saved to: {video_path}")
-                else:
+                elif '/i/article/' not in url:
                     # Use the original tweet URL to download video
                     logger.info(
                         f"No valid video URLs, using tweet URL: {url}"
@@ -3417,6 +3427,92 @@ class TwitterHandler(PlatformHandler):
 
         return thumbnails
 
+    def _calculate_reading_time(self, text: str) -> int:
+        """Calculate estimated reading time in minutes.
+
+        Chinese: ~400 chars/min, English: ~200 words/min.
+        Returns at least 1 minute.
+        """
+        if not text:
+            return 1
+        zh_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        non_zh_text = ''.join(
+            c for c in text if not ('\u4e00' <= c <= '\u9fff')
+        )
+        en_words = len(non_zh_text.split()) if non_zh_text.strip() else 0
+        minutes = zh_chars / 400 + en_words / 200
+        return max(1, int(minutes + 0.5))
+
+    def _add_heading_ids(self, html: str) -> tuple:
+        """Add id attributes to h2/h3 tags and return (modified_html, headings_list).
+
+        headings_list: [{'id': 'toc-1', 'level': 2, 'text': '...'}, ...]
+        """
+        headings = []
+        h2_counter = 0
+        h3_counter = 0
+
+        def replace_heading(match):
+            nonlocal h2_counter, h3_counter
+            tag = match.group(1)  # h2 or h3
+            attrs = match.group(2) or ''  # existing attributes
+            text = match.group(3)  # heading text
+
+            if tag == 'h2':
+                h2_counter += 1
+                h3_counter = 0
+                heading_id = f'toc-{h2_counter}'
+            else:
+                h3_counter += 1
+                heading_id = f'toc-{h2_counter}-{h3_counter}'
+
+            headings.append({
+                'id': heading_id,
+                'level': int(tag[1]),
+                'text': text.strip()
+            })
+
+            # Preserve existing attributes but add id
+            if 'id=' in attrs:
+                return match.group(0)
+            return f'<{tag}{attrs} id="{heading_id}">{text}</{tag}>'
+
+        modified = re.sub(
+            r'<(h[23])(\s[^>]*)?>(.*?)</\1>',
+            replace_heading,
+            html,
+            flags=re.DOTALL
+        )
+        return modified, headings
+
+    def _generate_toc(self, headings: list) -> str:
+        """Generate TOC HTML from headings list.
+
+        Only generates TOC if there are >= 2 headings.
+        Returns empty string otherwise.
+        """
+        if len(headings) < 2:
+            return ''
+
+        toc_items = []
+        for h in headings:
+            indent = '    ' if h['level'] == 3 else '  '
+            font_size = '0.95em' if h['level'] == 3 else '1em'
+            toc_items.append(
+                f'{indent}<li class="toc-level-{h["level"]}">'
+                f'<a href="#{h["id"]}" style="font-size:{font_size}">'
+                f'{h["text"]}</a></li>'
+            )
+
+        items_html = '\n'.join(toc_items)
+        return f'''    <div class="toc">
+        <h2>目录</h2>
+        <ul>
+{items_html}
+        </ul>
+    </div>
+'''
+
     def _generate_html(
         self,
         result: Dict[str, Any],
@@ -3465,15 +3561,25 @@ class TwitterHandler(PlatformHandler):
         embedded_videos = result.get('embedded_videos', [])
         external_links = result.get('external_links', [])
 
+        # Determine if article (needed before header and reading time)
+        is_article = (post_type == 'article')
+
+        # Calculate reading time for articles
+        reading_time = ''
+        if is_article:
+            rt = self._calculate_reading_time(content)
+            reading_time = f'<p class="reading-time">阅读时间: 约{rt}分钟</p>'
+
         # Build header HTML based on post type
         if post_type == 'article' and article_title:
             header_html = f'''
     <div class="header article-header">
-        <span class="post-type-badge article">Article</span>
+        <span class="post-type-badge article">📄 Article</span>
         <h1>{display_title}</h1>
         <div class="meta">
             <p class="author">作者: {author}</p>
             <p class="time">发布时间: {publish_time}</p>
+            {reading_time}
             <p class="source">原文: <a href="{url}" target="_blank">{url}</a></p>
         </div>
     </div>'''
@@ -3491,7 +3597,6 @@ class TwitterHandler(PlatformHandler):
 
         # Build content HTML
         content_parts = result.get('content_parts', [])
-        is_article = (post_type == 'article')
 
         if is_article and html_content:
             clean_content = self._clean_html_content(
@@ -3532,6 +3637,19 @@ class TwitterHandler(PlatformHandler):
             clean_content = self._clean_html_content(html_content, local_images)
         else:
             clean_content = f'<p>{content}</p>'
+
+        # Generate TOC and add heading ids for articles
+        toc_html = ''
+        if is_article and clean_content:
+            clean_content, headings = self._add_heading_ids(clean_content)
+            toc_html = self._generate_toc(headings)
+            # Add .lead class to first <p> for articles
+            clean_content = re.sub(
+                r'<p(?=\s|>)',
+                '<p class="lead"',
+                clean_content,
+                count=1
+            )
 
         # Build thread section HTML if it's a thread
         thread_html = ''
@@ -3816,9 +3934,9 @@ class TwitterHandler(PlatformHandler):
         }}
         .post-type-badge {{
             display: inline-block;
-            padding: 4px 12px;
+            padding: 5px 14px;
             border-radius: 12px;
-            font-size: 0.75em;
+            font-size: 0.85em;
             font-weight: 600;
             text-transform: uppercase;
             margin-bottom: 12px;
@@ -3851,6 +3969,55 @@ class TwitterHandler(PlatformHandler):
         .meta a:hover {{
             text-decoration: underline;
         }}
+        .toc {{
+            background: #fff;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .toc h2 {{
+            font-size: 1em;
+            font-weight: 600;
+            margin: 0 0 12px 0;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #e1e8ed;
+            color: #536471;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .toc ul {{
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }}
+        .toc li {{
+            margin: 0;
+            padding: 6px 0;
+        }}
+        .toc-level-3 {{
+            padding-left: 20px;
+        }}
+        .toc a {{
+            color: #1d9bf0;
+            text-decoration: none;
+        }}
+        .toc a:hover {{
+            text-decoration: underline;
+        }}
+        .reading-time {{
+            color: #1d9bf0;
+            font-weight: 500;
+        }}
+        .content .lead {{
+            font-size: 1.1em;
+            line-height: 1.7;
+            color: #1a1a1a;
+            font-weight: 500;
+            margin-bottom: 16px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #e1e8ed;
+        }}
         .content {{
             background: #fff;
             border-radius: 16px;
@@ -3864,14 +4031,20 @@ class TwitterHandler(PlatformHandler):
         }}
         .content h2 {{
             font-size: 1.3em;
-            font-weight: 600;
-            margin: 1.5em 0 0.8em 0;
+            font-weight: 700;
+            margin: 1.8em 0 1em 0;
+            padding-left: 12px;
+            border-left: 4px solid #1d9bf0;
+            border-bottom: 1px solid #e1e8ed;
+            padding-bottom: 8px;
             color: #0f1419;
         }}
         .content h3 {{
             font-size: 1.15em;
             font-weight: 600;
-            margin: 1.2em 0 0.6em 0;
+            margin: 1.5em 0 0.8em 0;
+            padding-left: 10px;
+            border-left: 2px solid #1d9bf0;
             color: #0f1419;
         }}
         .content a {{
@@ -4203,6 +4376,20 @@ class TwitterHandler(PlatformHandler):
                 padding-left: 8px;
                 border-left: 2px solid #00ba7c;
             }}
+            .toc {{
+                border-radius: 6px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: none;
+            }}
+            .toc h2 {{
+                font-size: 0.95em;
+            }}
+            .content .lead {{
+                font-size: 1.05em;
+                padding-bottom: 12px;
+                margin-bottom: 12px;
+            }}
             .content pre {{
                 padding: 12px;
                 border-radius: 4px;
@@ -4334,6 +4521,34 @@ class TwitterHandler(PlatformHandler):
             .content h3 {{
                 color: #000;
                 page-break-after: avoid;
+            }}
+            .toc {{
+                background: #fff;
+                border-radius: 0;
+                padding: 0 0 12px 0;
+                margin-bottom: 16px;
+                box-shadow: none;
+                border-bottom: 1px solid #000;
+            }}
+            .toc h2 {{
+                color: #000;
+                font-size: 0.95em;
+                border-bottom: 1px solid #000;
+            }}
+            .toc a {{
+                color: #000;
+                text-decoration: none;
+            }}
+            .reading-time {{
+                color: #333;
+            }}
+            .content .lead {{
+                font-size: 1em;
+                color: #000;
+                font-weight: 500;
+                border-bottom: 1px solid #ccc;
+                padding-bottom: 12px;
+                margin-bottom: 12px;
             }}
             .content a {{
                 color: #000;
@@ -4484,7 +4699,7 @@ class TwitterHandler(PlatformHandler):
 </head>
 <body>
 {header_html}
-    <div class="content">
+{toc_html}    <div class="content">
 {clean_content}
     </div>
 {thread_html}{media_html}{links_html}    <div class="footer">
@@ -4586,45 +4801,54 @@ class TwitterHandler(PlatformHandler):
         async def download_single_image(img_url: str, index: int) -> Dict[str, Any]:
             try:
                 timeout = aiohttp.ClientTimeout(total=30)
-                session = await self.get_http_session()
-                async with session.get(img_url, timeout=timeout) as response:
-                    if response.status == 200:
-                        content = await response.read()
-                        content_type = response.headers.get('Content-Type', '')
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_url, timeout=timeout) as response:
+                        if response.status == 200:
+                            content = await response.read()
+                            content_type = response.headers.get(
+                                'Content-Type', ''
+                            )
 
-                        ext = self._detect_image_extension(img_url, content_type)
+                            ext = self._detect_image_extension(
+                                img_url, content_type
+                            )
 
-                        local_filename = f'image_{index + 1}{ext}'
-                        local_path = os.path.join(images_dir, local_filename)
+                            local_filename = f'image_{index + 1}{ext}'
+                            local_path = os.path.join(
+                                images_dir, local_filename
+                            )
 
-                        with open(local_path, 'wb') as f:
-                            f.write(content)
+                            with open(local_path, 'wb') as f:
+                                f.write(content)
 
-                        file_size = len(content)
-                        meta = metadata_map.get(img_url, {})
+                            file_size = len(content)
+                            meta = metadata_map.get(img_url, {})
 
-                        result = {
-                            img_url: {
-                                'local_path': f'images/{local_filename}',
-                                'filename': local_filename,
-                                'size': file_size,
-                                'width': meta.get('width'),
-                                'height': meta.get('height'),
-                                'format': ext.lstrip('.'),
-                                'alt': meta.get('alt')
+                            result = {
+                                img_url: {
+                                    'local_path': (
+                                        f'images/{local_filename}'
+                                    ),
+                                    'filename': local_filename,
+                                    'size': file_size,
+                                    'width': meta.get('width'),
+                                    'height': meta.get('height'),
+                                    'format': ext.lstrip('.'),
+                                    'alt': meta.get('alt')
+                                }
                             }
-                        }
 
-                        logger.info(
-                            f"Downloaded image {index + 1}/{len(image_urls)}: "
-                            f"{local_filename} ({file_size} bytes)"
-                        )
-                        return result
-                    else:
-                        logger.warning(
-                            f"Image download failed with status {response.status}: "
-                            f"{img_url}"
-                        )
+                            logger.info(
+                                f"Downloaded image "
+                                f"{index + 1}/{len(image_urls)}: "
+                                f"{local_filename} ({file_size} bytes)"
+                            )
+                            return result
+                        else:
+                            logger.warning(
+                                f"Image download failed with "
+                                f"status {response.status}: {img_url}"
+                            )
             except Exception as e:
                 logger.warning(f"Failed to download image {img_url}: {e}")
             return {}

@@ -51,6 +51,18 @@ class StorageService:
         logger.info("🔄 Storage failover: Switching to local storage backend")
         self._nextcloud_available = False
 
+    def _cleanup_source(self, source_path: str):
+        """Delete local source file or directory after successful Nextcloud upload"""
+        try:
+            if os.path.isdir(source_path):
+                shutil.rmtree(source_path)
+                logger.info(f"Deleted local source directory: {source_path}")
+            elif os.path.isfile(source_path):
+                os.remove(source_path)
+                logger.info(f"Deleted local source file: {source_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete local source {source_path}: {e}")
+
     def check_storage_quota(self, file_size_bytes: int) -> Dict[str, Any]:
         """
         Check if there's enough storage space before upload.
@@ -157,7 +169,7 @@ class StorageService:
             if is_directory:
                 # Calculate total size of directory
                 total_size = 0
-                for dirpath, dirnames, filenames in os.walk(source_path):
+                for dirpath, _, filenames in os.walk(source_path):
                     for f in filenames:
                         file_path = os.path.join(dirpath, f)
                         file_size = os.path.getsize(file_path)
@@ -204,16 +216,11 @@ class StorageService:
                 if not remote_dir.startswith('/'):
                     remote_dir = f'/{remote_dir}'
 
-                # Organize by content type
-                media_type_dir = content_type.capitalize()
-
+                # Store directly in upload_dir (no media type subdirectory)
                 if is_directory:
                     # Upload directory (for Twitter content with images/videos)
-                    # Use filename (without extension) as directory name
-                    name, _ = os.path.splitext(filename)
-                    remote_path = (
-                        f"{remote_dir}/{media_type_dir}/{name}"
-                    )
+                    # filename is already the directory name (no extension)
+                    remote_path = f"{remote_dir}/{filename}"
 
                     logger.debug(f"Remote path: {remote_path}")
                     logger.debug("Uploading directory to Nextcloud...")
@@ -237,6 +244,13 @@ class StorageService:
                             ),
                             "upload_errors": upload_result.get("errors", [])
                         })
+
+                        # Delete local source after successful upload
+                        if CONFIG.get('local_storage', {}).get(
+                            'delete_after_upload', False
+                        ):
+                            self._cleanup_source(source_path)
+
                         return result
                     else:
                         errors = upload_result.get('errors')
@@ -247,7 +261,7 @@ class StorageService:
                         self.mark_nextcloud_unavailable()
                 else:
                     # Upload single file
-                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
+                    remote_path = f"{remote_dir}/{filename}"
 
                     logger.debug(f"Remote path: {remote_path}")
                     logger.debug("Uploading file to Nextcloud...")
@@ -262,6 +276,13 @@ class StorageService:
                             "file_url": file_url,
                             "file_path": remote_path
                         })
+
+                        # Delete local source after successful upload
+                        if CONFIG.get('local_storage', {}).get(
+                            'delete_after_upload', False
+                        ):
+                            self._cleanup_source(source_path)
+
                         return result
                     else:
                         logger.warning("⚠️  Nextcloud upload returned no URL")
@@ -295,6 +316,11 @@ class StorageService:
                         "timestamp": datetime.now().isoformat()
                     }
 
+                    # Pre-compute remote path for retry consistency
+                    remote_dir = CONFIG['nextcloud']['upload_dir']
+                    if not remote_dir.startswith('/'):
+                        remote_dir = f'/{remote_dir}'
+
                     if is_directory:
                         # local_path is the HTML file inside the tweet dir
                         # Cache the parent directory instead
@@ -303,8 +329,16 @@ class StorageService:
                         # Use directory name as filename for remote path
                         cache_filename = Path(cache_dir_path).name
                         cache_metadata["is_directory"] = True
+                        # Pre-compute remote path: /YTBot/dirname
+                        cache_metadata["remote_path"] = (
+                            f"{remote_dir}/{filename}"
+                        )
                         logger.info(
                             f"📁 Caching directory for retry: {cache_dir_path}"
+                        )
+                    else:
+                        cache_metadata["remote_path"] = (
+                            f"{remote_dir}/{filename}"
                         )
 
                     # Add to cache queue for later retry
@@ -497,16 +531,24 @@ class StorageService:
                 continue
 
             try:
-                # Build remote path
-                remote_dir = CONFIG['nextcloud']['upload_dir']
-                if not remote_dir.startswith('/'):
-                    remote_dir = f'/{remote_dir}'
-
-                media_type_dir = content_type.capitalize()
+                # Use pre-computed remote path from cache metadata
+                # to ensure consistency with the original upload attempt
+                cached_remote_path = metadata.get('remote_path')
+                if cached_remote_path:
+                    remote_path = cached_remote_path
+                else:
+                    # Fallback: compute remote path (for legacy cache entries)
+                    remote_dir = CONFIG['nextcloud']['upload_dir']
+                    if not remote_dir.startswith('/'):
+                        remote_dir = f'/{remote_dir}'
+                    if is_directory:
+                        name, _ = os.path.splitext(filename)
+                        remote_path = f"{remote_dir}/{name}"
+                    else:
+                        remote_path = f"{remote_dir}/{filename}"
 
                 if is_directory:
                     # Upload entire directory (including images/videos)
-                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
                     logger.debug(f"Uploading directory to: {remote_path}")
 
                     upload_result = self.nextcloud_storage.upload_directory(
@@ -549,7 +591,6 @@ class StorageService:
                         )
                 else:
                     # Upload single file
-                    remote_path = f"{remote_dir}/{media_type_dir}/{filename}"
                     logger.debug(f"Uploading to: {remote_path}")
 
                     file_url = self.nextcloud_storage.upload_file(

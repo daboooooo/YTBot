@@ -283,24 +283,6 @@ class YTBot:
                         logger.info("✅ Telegram polling restarted successfully")
                     except Exception as e:
                         logger.error(f"❌ Failed to restart polling: {e}")
-                        return
-
-                # Send notification to admin about reconnection
-                admin_chat_id = self.config.telegram.admin_chat_id
-                if admin_chat_id:
-                    from datetime import datetime
-
-                    reconnect_message = (
-                        f"🔄 **Telegram 连接已恢复**\n\n"
-                        f"⏰ 恢复时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"✅ 机器人已重新连接并可以接收消息"
-                    )
-
-                    await self.telegram_service.send_message(
-                        chat_id=int(admin_chat_id),
-                        text=reconnect_message
-                    )
-                    logger.info(f"✅ Reconnection notification sent to admin (chat_id: {admin_chat_id})")
 
         except Exception as e:
             logger.error(f"❌ Error in reconnection callback: {e}")

@@ -2,13 +2,15 @@
 PDF conversion service for YTBot
 
 Converts HTML to PDF using multiple fallback strategies:
-1. Chrome/Chromium headless (preferred)
-2. macOS textutil + cupsfilter (fallback)
+1. Chrome/Chromium headless (preferred, cross-platform)
+2. wkhtmltopdf (Linux fallback)
+3. macOS textutil + cupsfilter (macOS fallback)
 """
 
 import asyncio
 import os
 import shutil
+import sys
 import tempfile
 from typing import Dict, Optional
 
@@ -23,18 +25,28 @@ class PdfConverter:
 
     def __init__(self):
         self._chrome_path = self._find_chrome_path()
+        self._wkhtmltopdf_path = self._find_wkhtmltopdf_path()
         self._preprocessor = PdfPreprocessor()
 
     def _find_chrome_path(self) -> Optional[str]:
         """Find Chrome/Chromium executable path"""
 
         possible_paths = [
+            # macOS
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-            "/usr/local/bin/chromium",
+            (
+                "/Applications/Google Chrome for Testing.app/"
+                "Contents/MacOS/Google Chrome for Testing"
+            ),
+            # Linux (common locations)
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
+            "/usr/local/bin/chromium",
+            "/snap/bin/chromium",
+            # Also check via which
         ]
 
         for path in possible_paths:
@@ -42,12 +54,31 @@ class PdfConverter:
                 logger.info(f"Found Chrome/Chromium at: {path}")
                 return path
 
+        # Try finding via PATH
+        for name in ["google-chrome", "google-chrome-stable",
+                      "chromium", "chromium-browser"]:
+            found = shutil.which(name)
+            if found:
+                logger.info(f"Found Chrome/Chromium via PATH: {found}")
+                return found
+
         logger.warning("Chrome/Chromium not found in standard locations")
         return None
 
+    def _find_wkhtmltopdf_path(self) -> Optional[str]:
+        """Find wkhtmltopdf executable path"""
+        found = shutil.which("wkhtmltopdf")
+        if found:
+            logger.info(f"Found wkhtmltopdf at: {found}")
+        return found
+
     def is_available(self) -> bool:
         """Check if PDF conversion is available"""
-        return self._chrome_path is not None or shutil.which("textutil") is not None
+        return (
+            self._chrome_path is not None
+            or self._wkhtmltopdf_path is not None
+            or shutil.which("textutil") is not None
+        )
 
     async def convert_html_to_pdf(
         self,
@@ -111,6 +142,7 @@ class PdfConverter:
 
         conversion_methods = [
             ("Chrome Headless", self._convert_with_chrome),
+            ("wkhtmltopdf", self._convert_with_wkhtmltopdf),
             ("textutil + cupsfilter", self._convert_with_textutil),
         ]
 
@@ -118,7 +150,9 @@ class PdfConverter:
             try:
                 result = await method_func(html_to_convert, output_pdf_path)
                 if result:
-                    logger.info(f"PDF generated successfully using {method_name}")
+                    logger.info(
+                        f"PDF generated successfully using {method_name}"
+                    )
                     return result
             except Exception as e:
                 logger.warning(f"{method_name} conversion failed: {e}")
@@ -232,6 +266,70 @@ class PdfConverter:
 
         raise RuntimeError("PDF file was not created")
 
+    async def _convert_with_wkhtmltopdf(
+        self,
+        html_path: str,
+        output_path: str
+    ) -> Optional[str]:
+        """Convert HTML to PDF using wkhtmltopdf (Linux-friendly)"""
+
+        if not self._wkhtmltopdf_path:
+            raise RuntimeError("wkhtmltopdf not found")
+
+        html_path_abs = os.path.abspath(html_path)
+        output_path_abs = os.path.abspath(output_path)
+
+        cmd = [
+            self._wkhtmltopdf_path,
+            "--enable-local-file-access",
+            "--no-stop-slow-scripts",
+            "--encoding", "utf-8",
+            "--page-size", "A4",
+            "--margin-top", "10mm",
+            "--margin-bottom", "10mm",
+            "--margin-left", "10mm",
+            "--margin-right", "10mm",
+            html_path_abs,
+            output_path_abs,
+        ]
+
+        logger.info("Running wkhtmltopdf PDF conversion...")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=60
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise RuntimeError("wkhtmltopdf conversion timed out")
+
+        # wkhtmltopdf returns 0 for success, 1 for warnings (still produces PDF)
+        if process.returncode not in (0, 1):
+            error_msg = stderr.decode().strip()
+            if error_msg:
+                logger.error(f"wkhtmltopdf error: {error_msg}")
+            raise RuntimeError(
+                f"wkhtmltopdf failed with code {process.returncode}"
+            )
+
+        if os.path.exists(output_path_abs):
+            file_size = os.path.getsize(output_path_abs)
+            logger.info(
+                f"PDF generated with wkhtmltopdf: {output_path_abs} "
+                f"({file_size} bytes)"
+            )
+            return output_path_abs
+
+        raise RuntimeError("PDF file was not created")
+
     async def _convert_with_textutil(
         self,
         html_path: str,
@@ -271,7 +369,7 @@ class PdfConverter:
             raise RuntimeError("RTF file was not created")
 
         if shutil.which("cupsfilter") is None:
-            logger.warning("cupsfilter not available, trying alternative method")
+            logger.warning("cupsfilter not available, trying alternative")
             return await self._convert_rtf_to_pdf_alternative(
                 rtf_path,
                 output_path_abs
@@ -318,9 +416,55 @@ class PdfConverter:
         rtf_path: str,
         output_path: str
     ) -> Optional[str]:
-        """Alternative method to convert RTF to PDF using macOS tools"""
+        """Alternative method to convert RTF to PDF"""
 
-        logger.warning("AppleScript PDF conversion not implemented")
+        # Try libreoffice if available (common on Linux)
+        libreoffice = (
+            shutil.which("libreoffice")
+            or shutil.which("soffice")
+        )
+        if libreoffice:
+            logger.info("Trying LibreOffice for RTF to PDF conversion...")
+            output_dir = os.path.dirname(output_path)
+            cmd = [
+                libreoffice,
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", output_dir,
+                rtf_path
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=60
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                raise RuntimeError("LibreOffice conversion timed out")
+
+            # Clean up RTF
+            if os.path.exists(rtf_path):
+                try:
+                    os.remove(rtf_path)
+                except Exception:
+                    pass
+
+            if process.returncode == 0 and os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                logger.info(
+                    f"PDF generated with LibreOffice: {output_path} "
+                    f"({file_size} bytes)"
+                )
+                return output_path
+
         raise RuntimeError("Alternative PDF conversion not available")
 
 
