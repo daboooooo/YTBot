@@ -147,9 +147,12 @@ class ConnectionMonitor:
                 logger.debug("Telegram connection test successful")
 
                 # Check if polling stopped unexpectedly while connection is healthy
-                if not self.telegram_service.is_polling and not self._reconnect_in_progress:
+                # Only trigger if polling was previously started (not during initial startup)
+                if (self.telegram_service.polling_was_started
+                        and not self.telegram_service.is_polling
+                        and not self._reconnect_in_progress):
                     logger.warning(
-                        "Telegram connected but polling stopped, "
+                        "Telegram connected but polling stopped unexpectedly, "
                         "triggering reconnect callback to restart polling"
                     )
                     if self._on_telegram_reconnect:

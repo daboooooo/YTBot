@@ -347,6 +347,11 @@ class TelegramService:
                 return False
         return True
 
+    @property
+    def polling_was_started(self) -> bool:
+        """Check if polling was ever started (flag set), regardless of current state"""
+        return self._polling_started
+
     @log_function_entry_exit(logger)
     async def send_message(
         self,
