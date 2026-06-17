@@ -152,6 +152,7 @@ class TelegramService:
                 self._connected = False
                 self._external_polling = False
                 self._shutdown_event.set()
+                self._shutdown_event.clear()
 
                 logger.info("✅ Disconnected from Telegram servers")
 
@@ -308,7 +309,18 @@ class TelegramService:
         try:
             # Try to get bot info as a health check
             bot_info = await self.bot.get_me()
-            return bot_info is not None
+            if bot_info is None:
+                return False
+
+            # Check if polling is expected but not actually running
+            if self._polling_started and self.application and self.application.updater:
+                if not self.application.updater.running:
+                    logger.warning(
+                        "Polling stopped unexpectedly - connection unhealthy"
+                    )
+                    return False
+
+            return True
         except Conflict:
             logger.warning("Conflict error during health check - another instance running")
             return False
@@ -323,8 +335,17 @@ class TelegramService:
 
     @property
     def is_polling(self) -> bool:
-        """Check if polling is active"""
-        return self._polling_started
+        """Check if polling is actually active by verifying both flag and updater state"""
+        if not self._polling_started:
+            return False
+        # Also verify the updater is actually running
+        if self.application and self.application.updater:
+            if not self.application.updater.running:
+                logger.warning(
+                    "Polling flag is True but updater is not running - state mismatch"
+                )
+                return False
+        return True
 
     @log_function_entry_exit(logger)
     async def send_message(

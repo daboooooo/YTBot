@@ -278,11 +278,24 @@ class YTBot:
             if self.telegram_service and self.telegram_service.connected:
                 if not self.telegram_service.is_polling:
                     logger.info("🎧 Restarting Telegram polling after reconnection...")
-                    try:
-                        await self.telegram_service.start_polling()
-                        logger.info("✅ Telegram polling restarted successfully")
-                    except Exception as e:
-                        logger.error(f"❌ Failed to restart polling: {e}")
+                    max_retries = 3
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            await self.telegram_service.start_polling()
+                            logger.info("✅ Telegram polling restarted successfully")
+                            break
+                        except Exception as e:
+                            logger.error(
+                                f"❌ Failed to restart polling "
+                                f"(attempt {attempt}/{max_retries}): {e}"
+                            )
+                            if attempt < max_retries:
+                                await asyncio.sleep(5)
+                    else:
+                        logger.critical(
+                            "❌ Failed to restart polling after all retries, "
+                            "bot will not receive messages until restarted"
+                        )
 
         except Exception as e:
             logger.error(f"❌ Error in reconnection callback: {e}")

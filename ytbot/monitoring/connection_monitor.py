@@ -145,6 +145,18 @@ class ConnectionMonitor:
                 self.status["telegram"] = True
                 self._consecutive_conflict_errors = 0  # Reset on success
                 logger.debug("Telegram connection test successful")
+
+                # Check if polling stopped unexpectedly while connection is healthy
+                if not self.telegram_service.is_polling and not self._reconnect_in_progress:
+                    logger.warning(
+                        "Telegram connected but polling stopped, "
+                        "triggering reconnect callback to restart polling"
+                    )
+                    if self._on_telegram_reconnect:
+                        try:
+                            await self._on_telegram_reconnect()
+                        except Exception as e:
+                            logger.error(f"Error in polling restart callback: {e}")
             else:
                 self.status["telegram"] = False
                 logger.warning("Telegram connection test failed")
