@@ -274,16 +274,18 @@ class YTBot:
         logger.info("🔄 Telegram reconnection callback triggered")
 
         try:
-            # Restart polling if it was stopped
             if self.telegram_service and self.telegram_service.connected:
                 if not self.telegram_service.is_polling:
                     logger.info("🎧 Restarting Telegram polling after reconnection...")
                     max_retries = 3
                     for attempt in range(1, max_retries + 1):
                         try:
-                            await self.telegram_service.start_polling()
-                            logger.info("✅ Telegram polling restarted successfully")
-                            break
+                            # Use restart_polling which handles the full
+                            # stop/initialize/start cycle without reconnecting
+                            success = await self.telegram_service.restart_polling()
+                            if success:
+                                logger.info("✅ Telegram polling restarted successfully")
+                                break
                         except Exception as e:
                             logger.error(
                                 f"❌ Failed to restart polling "

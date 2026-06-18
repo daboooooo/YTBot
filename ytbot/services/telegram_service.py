@@ -309,18 +309,7 @@ class TelegramService:
         try:
             # Try to get bot info as a health check
             bot_info = await self.bot.get_me()
-            if bot_info is None:
-                return False
-
-            # Check if polling is expected but not actually running
-            if self._polling_started and self.application and self.application.updater:
-                if not self.application.updater.running:
-                    logger.warning(
-                        "Polling stopped unexpectedly - connection unhealthy"
-                    )
-                    return False
-
-            return True
+            return bot_info is not None
         except Conflict:
             logger.warning("Conflict error during health check - another instance running")
             return False
@@ -573,6 +562,7 @@ class TelegramService:
                 logger.error(f"❌ Failed to start Telegram polling: {e}")
                 logger.exception("Polling error details:")
                 self._polling_started = False
+                raise
 
     @log_function_entry_exit(logger)
     async def stop_polling(self):
@@ -602,6 +592,50 @@ class TelegramService:
             except Exception as e:
                 logger.error(f"❌ Failed to stop Telegram polling: {e}")
                 logger.exception("Stop polling error details:")
+
+    @log_function_entry_exit(logger)
+    async def restart_polling(self) -> bool:
+        """Restart polling without reconnecting. Used when polling stops
+        unexpectedly but the Telegram API connection is still healthy.
+
+        Returns:
+            bool: True if polling restarted successfully, False otherwise
+        """
+        async with self._polling_lock:
+            if not self.application:
+                logger.error("❌ Cannot restart polling: application not initialized")
+                return False
+
+            try:
+                # Stop any remaining updater first
+                if self.application.updater and self.application.updater.running:
+                    logger.info("🛑 Stopping running updater before restart...")
+                    await self.application.updater.stop()
+
+                # Stop and shutdown application if it was running
+                if getattr(self.application, 'running', False):
+                    logger.info("🛑 Stopping running application before restart...")
+                    await self.application.stop()
+                    await self.application.shutdown()
+
+                logger.info("🔄 Restarting Telegram polling...")
+                await self.application.initialize()
+                await self.application.start()
+                await self.application.updater.start_polling()
+                self._polling_started = True
+                self._external_polling = True
+                logger.info("✅ Telegram polling restarted successfully")
+                return True
+
+            except Conflict as ce:
+                logger.error(f"❌ Conflict error restarting polling: {ce}")
+                self._polling_started = False
+                return False
+            except Exception as e:
+                logger.error(f"❌ Failed to restart Telegram polling: {e}")
+                logger.exception("Restart polling error details:")
+                self._polling_started = False
+                return False
 
     @log_function_entry_exit(logger)
     def check_user_permission(self, chat_id: int) -> bool:
