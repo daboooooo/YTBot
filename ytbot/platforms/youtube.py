@@ -237,6 +237,8 @@ class YouTubeHandler(PlatformHandler):
             return "ERROR_RENTAL_PURCHASE"
         if 'login' in error_lower and ('require' in error_lower or 'denied' in error_lower):
             return "ERROR_LOGIN_REQUIRED"
+        if 'requested format is not available' in error_lower:
+            return "ERROR_FORMAT_NOT_AVAILABLE"
 
         return "ERROR_GENERIC"
 
@@ -280,6 +282,11 @@ class YouTubeHandler(PlatformHandler):
             "ERROR_LOGIN_REQUIRED": (
                 "🔐 需要登录\n\n"
                 "此视频需要登录YouTube账户才能访问。"
+            ),
+            "ERROR_FORMAT_NOT_AVAILABLE": (
+                "📦 格式不可用\n\n"
+                "请求的下载格式不可用。视频可能已被限制或格式已更改。\n"
+                "请尝试选择其他格式或稍后重试。"
             ),
             "ERROR_GENERIC": (
                 "❌ 下载失败\n\n"

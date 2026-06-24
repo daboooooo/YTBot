@@ -188,6 +188,29 @@ class TestYouTubeHandler:
         """Test finding file when none exists"""
         result = handler._find_downloaded_file(str(tmp_path), ContentType.VIDEO)
         assert result is None
+    
+    def test_parse_youtube_error_format_not_available(self, handler):
+        """Test parsing 'requested format is not available' error"""
+        error_msg = "[youtube] I6tSh_fLAKk: Requested format is not available. Use --list-formats for a list of available formats"
+        result = handler._parse_youtube_error(error_msg)
+        assert result == "ERROR_FORMAT_NOT_AVAILABLE"
+    
+    def test_parse_youtube_error_sign_in_required(self, handler):
+        """Test parsing sign-in required error"""
+        error_msg = "Please sign in to view this video"
+        result = handler._parse_youtube_error(error_msg)
+        assert result == "ERROR_SIGN_IN_REQUIRED"
+    
+    def test_parse_youtube_error_generic(self, handler):
+        """Test parsing unknown error"""
+        error_msg = "Some unknown error occurred"
+        result = handler._parse_youtube_error(error_msg)
+        assert result == "ERROR_GENERIC"
+    
+    def test_get_error_message_format_not_available(self, handler):
+        """Test getting error message for format not available"""
+        message = handler.get_error_message("ERROR_FORMAT_NOT_AVAILABLE")
+        assert "格式不可用" in message
 
 
 class TestYouTubeHandlerAsync:
