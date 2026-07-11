@@ -1127,6 +1127,7 @@ class TelegramHandler:
             content_info: Optional content info dictionary (for Twitter, contains scrape result)
             handler: Optional pre-matched handler to avoid redundant matching
         """
+        download_result = None
         try:
             # Use the already-matched handler if provided
             if handler is None:

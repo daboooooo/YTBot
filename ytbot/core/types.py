@@ -64,6 +64,7 @@ class DownloadResult:
     file_path: Optional[str] = None
     content_info: Optional[ContentInfo] = None
     error_message: Optional[str] = None
+    error_detail: Optional[str] = None
     cancelled: bool = False
     temp_dir: Optional[str] = None
 

@@ -80,6 +80,19 @@ class YouTubeHandler(PlatformHandler):
 
         return None
 
+    def _apply_solver_opts(self, ydl_opts: JSONDict) -> None:
+        """
+        Enable yt-dlp's remote JS challenge solver (EJS) if configured.
+
+        YouTube requires solving a JS "n" challenge to expose playable formats
+        when authenticated cookies are used. Without a solver, only storyboard
+        images remain and format selection fails with "Requested format is not
+        available". Needs a JS runtime (deno/node) available on the host.
+        """
+        remote_components = self.config.download.remote_components
+        if remote_components:
+            ydl_opts['remote_components'] = list(remote_components)
+
     def _convert_json_cookies_to_netscape(self, json_path: str, output_path: str) -> bool:
         """
         Convert JSON cookies (browser extension format) to Netscape format.
@@ -181,6 +194,8 @@ class YouTubeHandler(PlatformHandler):
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
                 logger.info(f"Using cookies file for content info: {cookies_path}")
+
+            self._apply_solver_opts(ydl_opts)
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = await asyncio.to_thread(ydl.extract_info, url, download=False)
@@ -416,6 +431,8 @@ class YouTubeHandler(PlatformHandler):
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
 
+            self._apply_solver_opts(ydl_opts)
+
             def _extract_sync():
                 """Synchronous extraction wrapped for async execution"""
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -441,12 +458,22 @@ class YouTubeHandler(PlatformHandler):
             Tuple of (video_info, formats_list)
         """
         try:
-            cmd = [
-                'yt-dlp',
-                '--flat-playlist',
-                '--dump-json',
-                url
-            ]
+            cmd = ['yt-dlp', '--dump-json']
+
+            # --flat-playlist only for playlist URLs; for single videos it
+            # skips format extraction, leaving formats empty.
+            if self.is_playlist(url):
+                cmd.append('--flat-playlist')
+
+            cookies_path = self._load_youtube_cookies()
+            if cookies_path:
+                cmd.extend(['--cookies', cookies_path])
+
+            remote_components = self.config.download.remote_components
+            for comp in remote_components:
+                cmd.extend(['--remote-components', comp])
+
+            cmd.append(url)
 
             logger.info(f"Getting format list for: {url}")
 
@@ -516,6 +543,8 @@ class YouTubeHandler(PlatformHandler):
 
             if cookies_path:
                 ydl_opts['cookiefile'] = cookies_path
+
+            self._apply_solver_opts(ydl_opts)
 
             def extract_info():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -678,6 +707,8 @@ class YouTubeHandler(PlatformHandler):
         if cookies_path:
             base_opts['cookiefile'] = cookies_path
             logger.info(f"Using cookies file for download: {cookies_path}")
+
+        self._apply_solver_opts(base_opts)
 
         if progress_callback:
             loop = asyncio.get_running_loop()

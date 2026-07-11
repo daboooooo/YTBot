@@ -178,6 +178,10 @@ class DownloadConfig:
     merge_output_format: str = field(default_factory=lambda: get_env_str("MERGE_OUTPUT_FORMAT", "mp4"))
     prefer_ffmpeg: bool = field(default_factory=lambda: get_env_bool("PREFER_FFMPEG", True))
     ignore_no_formats_error: bool = field(default_factory=lambda: get_env_bool("IGNORE_NO_FORMATS_ERROR", True))
+    # yt-dlp remote challenge-solver components (EJS). Required to solve
+    # YouTube's JS "n" challenge when using authenticated cookies; needs a
+    # JS runtime (deno/node). Set YT_DLP_REMOTE_COMPONENTS="" to disable.
+    remote_components: List[str] = field(default_factory=lambda: get_env_list("YT_DLP_REMOTE_COMPONENTS", ["ejs:github"]))
     allow_playlist_files: bool = field(default_factory=lambda: get_env_bool("ALLOW_PLAYLIST_FILES", True))
     sleep_interval_requests: float = field(default_factory=lambda: get_env_float("SLEEP_INTERVAL_REQUESTS", 0.5, min_value=0))
     sleep_interval: float = field(default_factory=lambda: get_env_float("SLEEP_INTERVAL", 2.0, min_value=0))

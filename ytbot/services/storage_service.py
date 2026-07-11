@@ -16,6 +16,7 @@ from ..core.enhanced_logger import get_logger, log_function_entry_exit
 from ..storage.local_storage import LocalStorageManager, get_local_storage_info
 from ..storage.nextcloud_storage import NextcloudStorage
 from ..storage.cache_manager import get_cache_manager
+from ..utils.common import sanitize_filename
 
 logger = get_logger(__name__)
 
@@ -531,11 +532,17 @@ class StorageService:
                 continue
 
             try:
+                # Sanitize filename to avoid Nextcloud "filename too long" errors
+                # (cache entries may predate sanitization fixes)
+                filename = sanitize_filename(filename)
+
                 # Use pre-computed remote path from cache metadata
                 # to ensure consistency with the original upload attempt
                 cached_remote_path = metadata.get('remote_path')
                 if cached_remote_path:
-                    remote_path = cached_remote_path
+                    # Rebuild remote_path with sanitized filename
+                    remote_dir_cached = os.path.dirname(cached_remote_path)
+                    remote_path = f"{remote_dir_cached}/{filename}"
                 else:
                     # Fallback: compute remote path (for legacy cache entries)
                     remote_dir = CONFIG['nextcloud']['upload_dir']

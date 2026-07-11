@@ -21,32 +21,44 @@ T = TypeVar('T')
 def sanitize_filename(filename: str, max_length: int = 100) -> str:
     """
     Sanitize a filename by removing invalid characters.
-    
+
+    Truncation is byte-aware (UTF-8): multi-byte characters (e.g. Chinese)
+    count as their encoded byte length, so the result stays within filesystem
+    and WebDAV/Nextcloud limits (~250 bytes).
+
     Args:
         filename: Original filename
-        max_length: Maximum length for the filename
-        
+        max_length: Maximum length in **bytes** for the filename
+
     Returns:
         Sanitized filename
     """
     # Remove invalid characters
     sanitized = re.sub(r'[<>:"/\\|?*]', '', filename)
-    
+
     # Replace multiple spaces with single space
     sanitized = re.sub(r'\s+', ' ', sanitized)
-    
+
     # Strip leading/trailing whitespace
     sanitized = sanitized.strip()
-    
-    # Limit length
-    if len(sanitized) > max_length:
+
+    # Limit length (byte-aware for UTF-8 compatibility)
+    if len(sanitized.encode('utf-8')) > max_length:
         name, ext = os.path.splitext(sanitized)
-        sanitized = name[:max_length - len(ext)] + ext
-    
+        ext_bytes = len(ext.encode('utf-8'))
+        # Truncate name by characters until byte budget is met
+        budget = max_length - ext_bytes
+        truncated = ''
+        for ch in name:
+            if len((truncated + ch).encode('utf-8')) > budget:
+                break
+            truncated += ch
+        sanitized = truncated + ext
+
     # Ensure not empty
     if not sanitized:
         sanitized = "unnamed"
-    
+
     return sanitized
 
 

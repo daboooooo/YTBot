@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any
 
 from ..core.config import CONFIG
 from ..core.enhanced_logger import get_logger
+from ..utils.common import sanitize_filename
 
 logger = get_logger(__name__)
 
@@ -77,6 +78,18 @@ class NextcloudStorage:
         if not self.client:
             logger.error("Nextcloud client not connected")
             return None
+
+        # Sanitize filename in remote_path to avoid Nextcloud
+        # "filename too long" (InvalidPath) errors
+        remote_dir = os.path.dirname(remote_path)
+        remote_name = os.path.basename(remote_path)
+        sanitized_name = sanitize_filename(remote_name)
+        if sanitized_name != remote_name:
+            logger.warning(
+                f"Filename truncated for Nextcloud: "
+                f"'{remote_name}' -> '{sanitized_name}'"
+            )
+        remote_path = f"{remote_dir}/{sanitized_name}"
 
         max_retries = CONFIG['nextcloud']['upload_retries']
         retry_delay = CONFIG['nextcloud']['upload_retry_delay']
