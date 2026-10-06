@@ -19,6 +19,7 @@ from ytbot.core.process_lock import acquire_lock, release_lock, is_another_insta
 from ytbot.services.telegram_service import TelegramService
 from ytbot.services.storage_service import StorageService
 from ytbot.services.download_service import DownloadService
+from ytbot.services.one_shot_download import OneShotDownloader
 from ytbot.monitoring.health_monitor import HealthMonitor
 from ytbot.monitoring.connection_monitor import ConnectionMonitor
 
@@ -477,6 +478,7 @@ Examples:
   ytbot --cache-status           # Show cache queue status
   ytbot --retry-cache            # Manually retry cached files upload
   ytbot --force                  # Force start even if another instance is running
+  ytbot --download <url> --type video  # One-shot download without Telegram
         """
     )
 
@@ -530,12 +532,28 @@ Examples:
     )
 
     parser.add_argument(
+        "--download",
+        type=str,
+        help="One-shot download mode: download the URL and exit (no Telegram, no process lock)"
+    )
+
+    parser.add_argument(
+        "--type",
+        choices=["video", "audio"],
+        help="Download content type (required with --download)"
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {ytbot.__version__}"
     )
 
     args = parser.parse_args()
+
+    # One-shot download mode: --type is mandatory
+    if args.download and not args.type:
+        parser.error("--type is required when using --download")
 
     # Get config instance
     config = get_config()
@@ -634,6 +652,18 @@ Examples:
         except Exception as e:
             print(f"❌ Error retrying cache: {e}")
             return 1
+
+    # Handle one-shot download mode: no Telegram, no process lock,
+    # download and exit
+    if args.download:
+        # StorageService 在本函数其它分支中存在局部导入（函数级遮蔽），
+        # 此处需先局部导入再使用
+        from ytbot.services.storage_service import StorageService
+
+        downloader = OneShotDownloader(
+            DownloadService(), StorageService()
+        )
+        return asyncio.run(downloader.run(args.download, args.type))
 
     # Store no-cache-retry flag
     if args.no_cache_retry:

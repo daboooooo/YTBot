@@ -218,3 +218,21 @@ class TestStorageOutcomes:
         exit_code = await downloader.run(ENTRY_URLS[0], "video")
 
         assert exit_code == 0
+
+
+class TestCliArgumentHandling:
+
+    def test_download_requires_type(self):
+        """--download without --type exits with argparse error (code 2)"""
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "ytbot.cli",
+                "--download", "https://www.youtube.com/watch?v=abc123",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 2
+        assert "--type" in result.stderr

@@ -81,6 +81,7 @@ PDF Generation Example:
 from .telegram_service import TelegramService
 from .storage_service import StorageService
 from .download_service import DownloadService
+from .one_shot_download import OneShotDownloader
 from .pdf_converter import (
     PdfConverter,
     pdf_converter,
