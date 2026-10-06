@@ -181,3 +181,40 @@ class TestPlaylist:
         first, second = ds.download_content.await_args_list
         assert first.kwargs.get('format_id') == '137+140'
         assert second.kwargs.get('format_id') is None
+
+
+class TestStorageOutcomes:
+
+    @pytest.mark.asyncio
+    async def test_storage_failure_returns_error(self):
+        downloader, ds, ss = make_downloader(store_result={
+            'success': False,
+            'error': '上传失败',
+        })
+        yh = make_youtube_handler(ENTRY_URLS)
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        exit_code = await downloader.run(ENTRY_URLS[0], "video")
+
+        assert exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_cached_storage_counts_as_success(self):
+        downloader, ds, ss = make_downloader(store_result={
+            'success': True,
+            'storage_type': 'local',
+            'file_path': '/downloads/fake.mp4',
+            'cached': True,
+        })
+        yh = make_youtube_handler(ENTRY_URLS)
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        exit_code = await downloader.run(ENTRY_URLS[0], "video")
+
+        assert exit_code == 0
