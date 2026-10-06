@@ -247,6 +247,12 @@ class YouTubeConfig:
     """YouTube configuration"""
     cookies_file: str = field(default_factory=lambda: get_env_str("YOUTUBE_COOKIES_FILE"))
     cookies_json: str = field(default_factory=lambda: get_env_str("YOUTUBE_COOKIES_JSON"))
+    # Read cookies directly from a browser's cookie store. More robust than a
+    # cookies file because YouTube rotates exported cookies as an anti-bot
+    # measure. Format: <browser>[:<profile>], e.g. "chrome:Profile 7".
+    # Supported browsers: chrome, edge, firefox, safari, opera, brave, chromium.
+    cookies_browser: str = field(default_factory=lambda: get_env_str("YOUTUBE_COOKIES_BROWSER"))
+    cookies_browser_profile: str = field(default_factory=lambda: get_env_str("YOUTUBE_COOKIES_BROWSER_PROFILE"))
 
 
 @dataclass(frozen=True)

@@ -6,15 +6,33 @@ Handles Telegram bot communication and message processing.
 
 import asyncio
 import threading
+import time
 from typing import Optional, Dict, Any, Callable, List
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
-from telegram.error import Conflict
+from telegram.error import Conflict, RetryAfter
 
 from ..core.config import CONFIG
 from ..core.enhanced_logger import get_logger, log_function_entry_exit
 
 logger = get_logger(__name__)
+
+# 统一的长轮询参数（方案B）：
+# - timeout=50: 空闲时服务器挂起50秒，代理上的请求频率从约6次/分降至约1.2次/分，
+#   降低代理断连概率；有消息时服务器立即返回，不增加响应延迟
+# - read_timeout 必须 > timeout，避免代理慢导致误判超时
+# - allowed_updates 只订阅实际处理的更新类型，减少无关流量
+POLLING_PARAMS = {
+    "timeout": 50,
+    "read_timeout": 60,
+    "write_timeout": 30,
+    "connect_timeout": 30,
+    "allowed_updates": ["message", "callback_query"],
+    "drop_pending_updates": False,
+}
+
+# 单次等待 flood 熔断窗口的最大时长（秒），防止极端情况下调用方无限阻塞
+FLOOD_WAIT_MAX_SECONDS = 900
 
 
 class TelegramService:
@@ -54,6 +72,9 @@ class TelegramService:
         self._connection_lock = asyncio.Lock()
         self._polling_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
+        # 全局 flood 熔断（方案A）：monotonic 时间戳，出站消息暂停截止时间。
+        # 触发 RetryAfter 后在窗口内丢弃可丢弃消息、等待重要消息，避免封锁续期。
+        self._flood_until = 0.0
         self._initialized = True
         self._external_polling = False  # 标记是否有外部管理polling
 
@@ -206,7 +227,7 @@ class TelegramService:
                                     if not self._polling_started:  # Double-check
                                         await self.application.initialize()
                                         await self.application.start()
-                                        await self.application.updater.start_polling()
+                                        await self._start_updater_polling()
                                         self._polling_started = True
                                         logger.info("✅ Telegram polling started after reconnection")
                             except Conflict as ce:
@@ -306,6 +327,13 @@ class TelegramService:
         if not self.connected or not self.bot:
             return False
 
+        # 熔断窗口内跳过 API 健康检查（方案A4）：
+        # 出站限流不影响 get_updates 轮询，此时连接是健康的；
+        # 额外的 get_me 请求既无必要，还可能被连带限流而误判为断连、触发重连。
+        if time.monotonic() < self._flood_until:
+            logger.debug("Skipping Telegram health check during flood-control window")
+            return True
+
         try:
             # Try to get bot info as a health check
             bot_info = await self.bot.get_me()
@@ -341,6 +369,36 @@ class TelegramService:
         """Check if polling was ever started (flag set), regardless of current state"""
         return self._polling_started
 
+    def _register_flood(self, retry_after: float):
+        """记录 flood 熔断窗口（方案A）：RetryAfter 的 retry_after + 2 秒余量。
+
+        窗口内丢弃 discardable 消息、阻塞等待重要消息，
+        让封锁自然到期而不是被重试续期。
+        """
+        try:
+            pause = float(retry_after) + 2.0
+        except (TypeError, ValueError):
+            pause = 30.0
+        until = time.monotonic() + pause
+        if until > self._flood_until:
+            self._flood_until = until
+        logger.warning(
+            f"⏳ Telegram flood control triggered: pausing outbound messages for {pause:.0f}s"
+        )
+
+    async def _wait_out_flood(self, max_wait: float = FLOOD_WAIT_MAX_SECONDS) -> bool:
+        """等待 flood 熔断窗口结束。返回 False 表示因断开连接或超过上限而放弃。"""
+        waited = 0.0
+        while True:
+            if self._shutdown_event.is_set():
+                return False
+            remaining = self._flood_until - time.monotonic()
+            if remaining <= 0 or waited >= max_wait:
+                return True
+            sleep_for = min(remaining, 30.0, max_wait - waited)
+            await asyncio.sleep(sleep_for)
+            waited += sleep_for
+
     @log_function_entry_exit(logger)
     async def send_message(
         self,
@@ -348,7 +406,11 @@ class TelegramService:
         text: str,
         **kwargs
     ) -> Optional[Dict[str, Any]]:
-        """Send a message to a chat with detailed logging"""
+        """Send a message to a chat with detailed logging.
+
+        遇到 flood 熔断窗口时等待窗口结束再发送（重要消息不丢弃），
+        最多等待 FLOOD_WAIT_MAX_SECONDS，最多重试一轮。
+        """
         logger.info(f"📤 Sending message to chat {chat_id}")
         logger.debug(f"Message text: {text[:50]}..." if len(text) > 50 else f"Message text: {text}")
         logger.debug(f"Additional kwargs: {list(kwargs.keys())}")
@@ -357,26 +419,37 @@ class TelegramService:
             logger.error("❌ Not connected to Telegram")
             return None
 
-        try:
-            logger.debug(f"Calling bot.send_message with chat_id={chat_id}")
-            message = await self.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                **kwargs
-            )
-
-            if message:
-                logger.info(f"✅ Message sent successfully to chat {chat_id}")
-                logger.debug(f"Message ID: {message.message_id}")
-                return message.to_dict()
-            else:
-                logger.warning(f"⚠️  No message returned for chat {chat_id}")
+        for attempt in range(2):
+            if not await self._wait_out_flood():
+                logger.warning(f"⏭️  Aborted send to chat {chat_id}: shutdown during flood wait")
                 return None
 
-        except Exception as e:
-            logger.error(f"❌ Failed to send message to {chat_id}: {e}")
-            logger.exception("Message sending error details:")
-            return None
+            try:
+                logger.debug(f"Calling bot.send_message with chat_id={chat_id}")
+                message = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    **kwargs
+                )
+
+                if message:
+                    logger.info(f"✅ Message sent successfully to chat {chat_id}")
+                    logger.debug(f"Message ID: {message.message_id}")
+                    return message.to_dict()
+                else:
+                    logger.warning(f"⚠️  No message returned for chat {chat_id}")
+                    return None
+
+            except RetryAfter as e:
+                # 记录熔断窗口后重试一次（等待窗口结束）
+                self._register_flood(e.retry_after)
+            except Exception as e:
+                logger.error(f"❌ Failed to send message to {chat_id}: {e}")
+                logger.exception("Message sending error details:")
+                return None
+
+        logger.error(f"❌ Failed to send message to {chat_id} after flood wait retries")
+        return None
 
     @log_function_entry_exit(logger)
     async def edit_message(
@@ -384,9 +457,15 @@ class TelegramService:
         chat_id: int,
         message_id: int,
         text: str,
+        discardable: bool = False,
         **kwargs
     ) -> Optional[Dict[str, Any]]:
-        """Edit an existing message with detailed logging"""
+        """Edit an existing message with detailed logging.
+
+        Args:
+            discardable: 若为 True，遇到 flood 熔断窗口时直接丢弃本次编辑
+                         （用于下载进度等高频可丢失更新）；否则等待窗口结束再发送。
+        """
         logger.info(f"✏️  Editing message {message_id} in chat {chat_id}")
         logger.debug(f"New text: {text[:50]}..." if len(text) > 50 else f"New text: {text}")
 
@@ -394,30 +473,50 @@ class TelegramService:
             logger.error("❌ Not connected to Telegram")
             return None
 
-        try:
-            logger.debug(f"Calling bot.edit_message_text with message_id={message_id}")
-            message = await self.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                **kwargs
+        # 熔断窗口内丢弃可丢弃的编辑，避免无意义的 API 调用使封锁续期
+        if discardable and time.monotonic() < self._flood_until:
+            logger.debug(
+                f"⏭️ Dropping discardable edit for message {message_id} (flood window active)"
             )
+            return None
 
-            if message:
-                logger.info(f"✅ Message {message_id} edited successfully in chat {chat_id}")
-                return message.to_dict()
-            else:
-                logger.warning(f"⚠️  No message returned for edit operation in chat {chat_id}")
+        for attempt in range(2):
+            if not await self._wait_out_flood():
+                logger.warning(
+                    f"⏭️  Aborted edit of message {message_id}: shutdown during flood wait"
+                )
                 return None
 
-        except Exception as e:
-            error_str = str(e)
-            if "Message is not modified" in error_str:
-                logger.debug(f"Message {message_id} content unchanged, skipping")
-                return {"message_id": message_id, "unchanged": True}
-            logger.error(f"❌ Failed to edit message {message_id} in {chat_id}: {e}")
-            logger.exception("Message editing error details:")
-            return None
+            try:
+                logger.debug(f"Calling bot.edit_message_text with message_id={message_id}")
+                message = await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    **kwargs
+                )
+
+                if message:
+                    logger.info(f"✅ Message {message_id} edited successfully in chat {chat_id}")
+                    return message.to_dict()
+                else:
+                    logger.warning(f"⚠️  No message returned for edit operation in chat {chat_id}")
+                    return None
+
+            except RetryAfter as e:
+                # 记录熔断窗口后重试一次（等待窗口结束）
+                self._register_flood(e.retry_after)
+            except Exception as e:
+                error_str = str(e)
+                if "Message is not modified" in error_str:
+                    logger.debug(f"Message {message_id} content unchanged, skipping")
+                    return {"message_id": message_id, "unchanged": True}
+                logger.error(f"❌ Failed to edit message {message_id} in {chat_id}: {e}")
+                logger.exception("Message editing error details:")
+                return None
+
+        logger.error(f"❌ Failed to edit message {message_id} in {chat_id} after flood wait retries")
+        return None
 
     @log_function_entry_exit(logger)
     async def get_bot_info(self) -> Optional[Dict[str, Any]]:
@@ -530,6 +629,10 @@ class TelegramService:
             logger.error(f"❌ Failed to add error handler: {e}")
             logger.exception("Error handler error details:")
 
+    async def _start_updater_polling(self):
+        """以统一的长轮询参数启动 updater polling（见 POLLING_PARAMS，方案B）。"""
+        await self.application.updater.start_polling(**POLLING_PARAMS)
+
     @log_function_entry_exit(logger)
     async def start_polling(self):
         """Start polling for updates with detailed logging"""
@@ -546,7 +649,7 @@ class TelegramService:
                 logger.info("🚀 Starting Telegram polling...")
                 await self.application.initialize()
                 await self.application.start()
-                await self.application.updater.start_polling()
+                await self._start_updater_polling()
                 self._polling_started = True
                 self._external_polling = True  # Mark that polling is managed externally
                 logger.info("✅ Telegram polling started successfully")
@@ -621,7 +724,7 @@ class TelegramService:
                 logger.info("🔄 Restarting Telegram polling...")
                 await self.application.initialize()
                 await self.application.start()
-                await self.application.updater.start_polling()
+                await self._start_updater_polling()
                 self._polling_started = True
                 self._external_polling = True
                 logger.info("✅ Telegram polling restarted successfully")

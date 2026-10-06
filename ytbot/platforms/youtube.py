@@ -93,6 +93,67 @@ class YouTubeHandler(PlatformHandler):
         if remote_components:
             ydl_opts['remote_components'] = list(remote_components)
 
+    def _apply_youtube_cookies(self, ydl_opts: JSONDict) -> None:
+        """
+        Inject YouTube credentials into yt-dlp options.
+
+        Two modes (in priority order):
+        1. cookies-from-browser: read cookies live from a browser's cookie
+           store. Recommended because YouTube rotates exported cookies as an
+           anti-bot measure, so a static cookies file tends to break quickly.
+        2. cookies file: load from .youtube_cookies.txt / .youtube_cookies.json
+           / YOUTUBE_COOKIES_FILE / YOUTUBE_COOKIES_JSON. Falls back to this
+           when no browser is configured.
+
+        Args:
+            ydl_opts: yt-dlp options dict to update in place.
+        """
+        youtube_config = self.config.youtube
+        browser = (youtube_config.cookies_browser or '').strip().lower()
+        if browser:
+            # yt-dlp expects (browser, profile, keyring, container). Profile
+            # and the rest may be None.
+            profile = youtube_config.cookies_browser_profile or None
+            ydl_opts['cookiesfrombrowser'] = (browser, profile, None, None)
+            logger.info(
+                f"Using cookies from browser: {browser}"
+                + (f" (profile={profile})" if profile else "")
+            )
+            return
+
+        cookies_path = self._load_youtube_cookies()
+        if cookies_path:
+            ydl_opts['cookiefile'] = cookies_path
+
+    def _add_youtube_cookies_to_cmd(self, cmd: List[str]) -> None:
+        """
+        Append YouTube credentials to a yt-dlp CLI command.
+
+        CLI twin of _apply_youtube_cookies: produces the equivalent of
+        --cookies-from-browser / --cookies on the command line.
+
+        Args:
+            cmd: list of CLI args to extend in place.
+        """
+        youtube_config = self.config.youtube
+        browser = (youtube_config.cookies_browser or '').strip().lower()
+        if browser:
+            # yt-dlp CLI syntax: --cookies-from-browser BROWSER[+KEYRING][:PROFILE]
+            arg = browser
+            profile = youtube_config.cookies_browser_profile
+            if profile:
+                arg = f"{arg}:{profile}"
+            cmd.extend(['--cookies-from-browser', arg])
+            logger.info(
+                f"Using cookies from browser (CLI): {browser}"
+                + (f" (profile={profile})" if profile else "")
+            )
+            return
+
+        cookies_path = self._load_youtube_cookies()
+        if cookies_path:
+            cmd.extend(['--cookies', cookies_path])
+
     def _convert_json_cookies_to_netscape(self, json_path: str, output_path: str) -> bool:
         """
         Convert JSON cookies (browser extension format) to Netscape format.
@@ -183,18 +244,13 @@ class YouTubeHandler(PlatformHandler):
     async def get_content_info(self, url: str) -> Optional[ContentInfo]:
         """Get information about the content without downloading"""
         try:
-            cookies_path = self._load_youtube_cookies()
-
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': True,  # Don't download, just extract info
             }
 
-            if cookies_path:
-                ydl_opts['cookiefile'] = cookies_path
-                logger.info(f"Using cookies file for content info: {cookies_path}")
-
+            self._apply_youtube_cookies(ydl_opts)
             self._apply_solver_opts(ydl_opts)
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -421,16 +477,12 @@ class YouTubeHandler(PlatformHandler):
     async def get_supported_formats(self, url: str) -> List[JSONDict]:
         """Get available download formats for the content"""
         try:
-            cookies_path = self._load_youtube_cookies()
-
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
             }
 
-            if cookies_path:
-                ydl_opts['cookiefile'] = cookies_path
-
+            self._apply_youtube_cookies(ydl_opts)
             self._apply_solver_opts(ydl_opts)
 
             def _extract_sync():
@@ -465,9 +517,7 @@ class YouTubeHandler(PlatformHandler):
             if self.is_playlist(url):
                 cmd.append('--flat-playlist')
 
-            cookies_path = self._load_youtube_cookies()
-            if cookies_path:
-                cmd.extend(['--cookies', cookies_path])
+            self._add_youtube_cookies_to_cmd(cmd)
 
             remote_components = self.config.download.remote_components
             for comp in remote_components:

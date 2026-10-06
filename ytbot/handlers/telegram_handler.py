@@ -6,8 +6,10 @@ Handles Telegram bot commands and message processing.
 
 import os
 import shutil
+import time
 from typing import Dict, Any, Optional, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import ContextTypes, filters
 
 from ..core.config import CONFIG
@@ -33,6 +35,12 @@ class TelegramHandler:
         self.storage_service = storage_service
         self.download_service = download_service
         self.user_states: Dict[int, Dict[str, Any]] = {}
+
+        # 下载进度节流状态（方案A2）：
+        # editMessageText 单 chat 上限约 1 次/秒，yt-dlp hook 频率约 1-10 次/秒，
+        # 不节流会持续触发 Flood control。双阈值：距上次编辑 < 5s 或进度变化 < 2% 时跳过。
+        self._progress_last_edit: Dict[int, float] = {}     # message_id -> monotonic 时间
+        self._progress_last_percent: Dict[int, float] = {}  # message_id -> 百分比
 
         # UserStateManager will be set by cli.py to share the same instance
         self.state_manager: UserStateManager = UserStateManager()
@@ -911,8 +919,8 @@ class TelegramHandler:
             f"请选择下载类型："
         )
 
-        # Edit message with inline keyboard
-        await self.telegram_service.bot.edit_message_text(
+        # Edit message with inline keyboard（走统一接口以获得熔断保护）
+        await self.telegram_service.edit_message(
             chat_id=chat_id,
             message_id=message_id,
             text=message_text,
@@ -1286,6 +1294,10 @@ class TelegramHandler:
                 text=f"❌ 下载过程中发生错误: {str(e)}"
             )
         finally:
+            # 清理进度节流状态
+            self._progress_last_edit.pop(message_id, None)
+            self._progress_last_percent.pop(message_id, None)
+
             # Clean up temp directory after storage is complete
             if download_result and download_result.temp_dir:
                 try:
@@ -1322,6 +1334,15 @@ class TelegramHandler:
 
                 if total > 0:
                     percentage = (downloaded / total) * 100
+
+                    # 节流（方案A2）：距上次成功编辑不足 5 秒，或进度变化不足 2% 时跳过。
+                    # 仅在编辑成功后更新时间戳，熔断期丢弃后能立即恢复。
+                    now = time.monotonic()
+                    if now - self._progress_last_edit.get(message_id, 0.0) < 5.0:
+                        return
+                    if abs(percentage - self._progress_last_percent.get(message_id, -100.0)) < 2.0:
+                        return
+
                     downloaded_mb = downloaded / (1024 * 1024)
                     total_mb = total / (1024 * 1024)
 
@@ -1337,13 +1358,17 @@ class TelegramHandler:
                         f"{speed_str}"
                     )
 
-                    # Update message (with rate limiting)
-                    # Only update every 2 seconds to avoid API limits
-                    await self.telegram_service.edit_message(
+                    # discardable=True：flood 熔断窗口内直接丢弃本次进度编辑，
+                    # 避免重试使封锁续期（最终结果消息不受影响）
+                    result = await self.telegram_service.edit_message(
                         chat_id=chat_id,
                         message_id=message_id,
-                        text=progress_text
+                        text=progress_text,
+                        discardable=True
                     )
+                    if result is not None:
+                        self._progress_last_edit[message_id] = now
+                        self._progress_last_percent[message_id] = percentage
         except Exception as e:
             # Don't fail the download if progress update fails
             logger.debug(f"Progress update error: {e}")
@@ -1635,6 +1660,10 @@ class TelegramHandler:
                     text=f"❌ 下载失败: {download_result.error_message}"
                 )
         finally:
+            # 清理进度节流状态
+            self._progress_last_edit.pop(message_id, None)
+            self._progress_last_percent.pop(message_id, None)
+
             # Clean up temp directory after storage is complete
             if download_result and download_result.temp_dir:
                 try:
@@ -1708,6 +1737,15 @@ class TelegramHandler:
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
         logger.error(f"Telegram error: {context.error}")
+
+        # 网络类/限流类错误（方案A3）：此时再向用户发通知只会增加 API 负载、
+        # 加剧 Flood control（且大概率同样失败），只记日志即可。
+        if isinstance(context.error, (RetryAfter, NetworkError)):
+            logger.debug(
+                "Network/rate-limit error - skipping user notification to avoid "
+                "worsening flood control"
+            )
+            return
 
         if update and update.effective_chat:
             await self.telegram_service.send_message(
