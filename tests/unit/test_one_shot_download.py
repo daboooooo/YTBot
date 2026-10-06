@@ -105,3 +105,56 @@ class TestSingleVideo:
 
         assert exit_code == 1
         ds.download_content.assert_not_awaited()
+
+
+class TestPlaylist:
+
+    @pytest.mark.asyncio
+    async def test_playlist_processes_each_entry_with_shared_format(self):
+        downloader, ds, ss = make_downloader()
+        yh = make_youtube_handler(ENTRY_URLS)
+        yh.select_best_video_format = MagicMock(return_value='137')
+        yh.select_best_audio_format = MagicMock(return_value='140')
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        exit_code = await downloader.run(PLAYLIST_URL, "video")
+
+        assert exit_code == 0
+        # One download and one upload per entry
+        assert ds.download_content.await_count == 3
+        assert ss.store_file.await_count == 3
+        # Format selection happens once (first entry), entries inherit it
+        assert yh.get_format_list.await_count == 1
+        for call in ds.download_content.await_args_list:
+            assert call.kwargs.get('format_id') == '137+140'
+
+    @pytest.mark.asyncio
+    async def test_empty_playlist_returns_error(self):
+        downloader, ds, ss = make_downloader()
+        yh = make_youtube_handler([])
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock()
+
+        exit_code = await downloader.run(PLAYLIST_URL, "video")
+
+        assert exit_code == 1
+        ds.download_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_playlist_expansion_failure_falls_back_to_whole_download(self):
+        downloader, ds, ss = make_downloader()
+        yh = make_youtube_handler(None)
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        exit_code = await downloader.run(PLAYLIST_URL, "video")
+
+        assert exit_code == 0
+        # Whole playlist URL is downloaded directly (no entry expansion)
+        ds.download_content.assert_awaited_once()
+        assert ds.download_content.await_args.kwargs.get('url') == PLAYLIST_URL

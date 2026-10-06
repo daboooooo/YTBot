@@ -70,11 +70,66 @@ class OneShotDownloader:
             print(f"❌ 无法处理此链接：{url}")
             return 1
 
+        if handler.name == "YouTube" and handler.is_playlist(url):
+            return await self._run_playlist(url, content_type, handler)
+
         error = await self._download_and_store(url, content_type, handler)
         return 0 if error is None else 1
 
-    async def _download_and_store(
+    async def _run_playlist(
         self, url: str, content_type: str, handler
+    ) -> int:
+        """Expand a playlist into single videos and process each one
+        exactly like the bot: download one, upload one."""
+        entries = await handler.get_playlist_entries(url)
+        if entries is None:
+            # 展开失败：回退整列表直接下载（playlist URL 的格式选择为空，
+            # yt-dlp 以默认格式整包下载，存储按目录处理）
+            logger.warning(
+                f"Failed to expand playlist, falling back to "
+                f"whole-playlist download: {url}"
+            )
+            error = await self._download_and_store(url, content_type, handler)
+            return 0 if error is None else 1
+
+        if not entries:
+            print("❌ 播放列表为空或没有可下载的视频。")
+            return 1
+
+        total = len(entries)
+        print(f"📋 检测到播放列表，共 {total} 个视频，将逐个下载并上传...")
+
+        # 一次性共享格式选择（取自首个视频），所有 entry 继承
+        shared_format_id, _ = await self._select_format(
+            entries[0], content_type, handler
+        )
+
+        succeeded = 0
+        failures = []
+        for i, entry_url in enumerate(entries, 1):
+            error = await self._download_and_store(
+                entry_url, content_type, handler,
+                inherited_format_id=shared_format_id,
+                progress_label=f"{i}/{total}",
+            )
+            if error is None:
+                succeeded += 1
+            else:
+                failures.append((entry_url, error))
+
+        failed = total - succeeded
+        print(f"📋 播放列表处理完成：成功 {succeeded} / 失败 {failed} / 共 {total}")
+        for entry_url, error in failures:
+            print(f"   ❌ {entry_url}: {error}")
+        return 0 if failed == 0 else 1
+
+    async def _download_and_store(
+        self,
+        url: str,
+        content_type: str,
+        handler,
+        inherited_format_id: Optional[str] = None,
+        progress_label: Optional[str] = None,
     ) -> Optional[str]:
         """Download one URL and store it.
 
@@ -82,8 +137,8 @@ class OneShotDownloader:
         """
         download_result = None
         try:
-            format_id = None
-            if handler.name == "YouTube":
+            format_id = inherited_format_id
+            if handler.name == "YouTube" and not inherited_format_id:
                 format_id, formats = await self._select_format(
                     url, content_type, handler
                 )
@@ -95,7 +150,7 @@ class OneShotDownloader:
                         f"跳过确认直接下载"
                     )
 
-            progress_callback = self._make_progress_callback()
+            progress_callback = self._make_progress_callback(progress_label)
 
             download_result = await self.download_service.download_content(
                 url=url,
