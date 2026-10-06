@@ -279,5 +279,144 @@ class TestYouTubeHandlerAsync:
             assert len(formats) == 2
 
 
+class TestGetPlaylistEntries:
+    """Tests for YouTubeHandler.get_playlist_entries (playlist expansion)"""
+
+    @pytest.fixture
+    def handler(self):
+        return YouTubeHandler()
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_success(self, handler):
+        """Test expanding a playlist into watch URLs"""
+        mock_info = {
+            '_type': 'playlist',
+            'title': 'My Playlist',
+            'entries': [
+                {'id': 'abc123', 'title': 'Video 1'},
+                {'id': 'def456', 'title': 'Video 2'},
+                {'id': 'ghi789', 'title': 'Video 3'},
+            ],
+        }
+
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = mock_info
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+
+            assert result == [
+                "https://www.youtube.com/watch?v=abc123",
+                "https://www.youtube.com/watch?v=def456",
+                "https://www.youtube.com/watch?v=ghi789",
+            ]
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_urls_have_no_list_param(self, handler):
+        """Entry URLs must be plain watch URLs without 'list=', otherwise
+        is_playlist() would match them again and cause recursive expansion"""
+        mock_info = {
+            '_type': 'playlist',
+            'entries': [
+                {'id': 'abc123'},
+                {'id': 'def456'},
+            ],
+        }
+
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = mock_info
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/watch?v=zzz&list=PL123"
+            )
+
+            for url in result:
+                assert 'list=' not in url
+                assert url.startswith("https://www.youtube.com/watch?v=")
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_empty(self, handler):
+        """Empty playlist returns empty list"""
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = {
+                '_type': 'playlist', 'entries': []
+            }
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+            assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_no_entries_key(self, handler):
+        """Info dict without entries key returns empty list"""
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = {
+                '_type': 'playlist', 'title': 'Empty'
+            }
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+            assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_skips_invalid_entries(self, handler):
+        """Entries without an id (e.g. removed videos) are skipped"""
+        mock_info = {
+            '_type': 'playlist',
+            'entries': [
+                None,
+                {'title': 'No id here'},
+                {'id': 'abc123'},
+            ],
+        }
+
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = mock_info
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+            assert result == ["https://www.youtube.com/watch?v=abc123"]
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_extraction_error(self, handler):
+        """Extraction failure returns None (caller falls back)"""
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.side_effect = Exception("network error")
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_playlist_entries_none_info(self, handler):
+        """extract_info returning None returns None (caller falls back)"""
+        with patch('yt_dlp.YoutubeDL') as mock_ydl:
+            mock_ydl_instance = MagicMock()
+            mock_ydl_instance.extract_info.return_value = None
+            mock_ydl.return_value.__enter__.return_value = mock_ydl_instance
+
+            result = await handler.get_playlist_entries(
+                "https://www.youtube.com/playlist?list=PL123"
+            )
+            assert result is None
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

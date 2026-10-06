@@ -241,6 +241,62 @@ class YouTubeHandler(PlatformHandler):
 
         return None
 
+    async def get_playlist_entries(self, url: str) -> Optional[List[str]]:
+        """
+        Expand a playlist URL into a list of single-video watch URLs.
+
+        Uses flat extraction so no per-video metadata is fetched. Each entry
+        URL is rebuilt as a plain watch URL WITHOUT the 'list=' parameter,
+        so downstream processing treats it exactly like a normal single
+        video link (no recursive playlist expansion).
+
+        Args:
+            url: YouTube playlist URL
+
+        Returns:
+            List of watch URLs (empty list if the playlist has no entries),
+            or None if the playlist could not be expanded (caller should
+            fall back to whole-playlist handling).
+        """
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': 'in_playlist',
+            }
+
+            self._apply_youtube_cookies(ydl_opts)
+            self._apply_solver_opts(ydl_opts)
+
+            def _extract_sync():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+
+            info = await asyncio.to_thread(_extract_sync)
+
+            if not info:
+                return None
+
+            entries = info.get('entries')
+            if not entries:
+                return []
+
+            watch_urls = []
+            for entry in entries:
+                if not entry:
+                    continue
+                video_id = entry.get('id')
+                if video_id:
+                    watch_urls.append(
+                        f"https://www.youtube.com/watch?v={video_id}"
+                    )
+
+            return watch_urls
+
+        except Exception as e:
+            logger.error(f"Failed to expand YouTube playlist {url}: {e}")
+            return None
+
     async def get_content_info(self, url: str) -> Optional[ContentInfo]:
         """Get information about the content without downloading"""
         try:

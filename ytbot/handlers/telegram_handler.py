@@ -1122,8 +1122,10 @@ class TelegramHandler:
         url: str,
         download_type: str,
         content_info: Optional[Dict[str, Any]] = None,
-        handler=None
-    ):
+        handler=None,
+        progress_label: Optional[str] = None,
+        skip_large_file_confirmation: bool = False
+    ) -> bool:
         """
         Proceed with the actual download.
 
@@ -1134,6 +1136,14 @@ class TelegramHandler:
             download_type: "audio" or "video"
             content_info: Optional content info dictionary (for Twitter, contains scrape result)
             handler: Optional pre-matched handler to avoid redundant matching
+            progress_label: Optional label like "3/12" shown in progress
+                messages (used when processing playlist entries)
+            skip_large_file_confirmation: Skip the 500MB confirmation prompt
+                (playlist mode processes entries without pauses)
+
+        Returns:
+            bool: True if the content was downloaded and stored
+            successfully, False otherwise.
         """
         download_result = None
         try:
@@ -1147,10 +1157,68 @@ class TelegramHandler:
                     message_id=message_id,
                     text="❌ 无法处理此链接。"
                 )
-                return
+                return False
+
+            # Expand YouTube playlists into single-video URLs and process
+            # each one exactly like a normal link: download one, upload one.
+            # Entry URLs are plain watch URLs (no 'list=' param), so
+            # is_playlist() is False for them and no recursion occurs.
+            if handler.name == "YouTube" and handler.is_playlist(url):
+                entries = await handler.get_playlist_entries(url)
+                if entries is None:
+                    # Expansion failed: fall back to whole-playlist download
+                    logger.warning(
+                        f"Failed to expand playlist, falling back to "
+                        f"whole-playlist download: {url}"
+                    )
+                elif not entries:
+                    await self.telegram_service.edit_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="❌ 播放列表为空或没有可下载的视频。"
+                    )
+                    return False
+                else:
+                    total = len(entries)
+                    await self.telegram_service.edit_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=(
+                            f"📋 检测到播放列表，共 {total} 个视频，"
+                            f"将逐个下载并上传..."
+                        )
+                    )
+                    succeeded = 0
+                    failed = 0
+                    for i, entry_url in enumerate(entries, 1):
+                        item_ok = await self._proceed_with_download(
+                            chat_id,
+                            message_id,
+                            entry_url,
+                            download_type,
+                            None,
+                            handler,
+                            progress_label=f"{i}/{total}",
+                            skip_large_file_confirmation=True
+                        )
+                        if item_ok:
+                            succeeded += 1
+                        else:
+                            failed += 1
+                    await self.telegram_service.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"📋 播放列表处理完成："
+                            f"成功 {succeeded} / 失败 {failed} / 共 {total}"
+                        )
+                    )
+                    return failed == 0
 
             is_twitter = handler.name == "Twitter/X"
-            twitter_result = content_info if is_twitter and content_info and content_info.get('success') else None
+            twitter_result = (
+                content_info if is_twitter and content_info
+                and content_info.get('success') else None
+            )
 
             if is_twitter:
                 action_text = "正在获取推文"
@@ -1162,10 +1230,12 @@ class TelegramHandler:
                     )
                 else:
                     message_text = f"⬇️ {action_text}..."
-            elif download_type == "audio":
-                message_text = "⬇️ 正在下载音频..."
             else:
-                message_text = "⬇️ 正在下载视频..."
+                label_suffix = f" ({progress_label})" if progress_label else ""
+                if download_type == "audio":
+                    message_text = f"⬇️ 正在下载音频{label_suffix}..."
+                else:
+                    message_text = f"⬇️ 正在下载视频{label_suffix}..."
 
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
@@ -1207,6 +1277,7 @@ class TelegramHandler:
             is_large_file = (
                 handler.name == "YouTube"
                 and download_type == "video"
+                and not skip_large_file_confirmation
                 and file_size_estimate is not None
                 and file_size_estimate > LARGE_FILE_THRESHOLD
             )
@@ -1217,7 +1288,7 @@ class TelegramHandler:
                     chat_id, message_id, url, download_type,
                     content_info, file_size_estimate, format_id
                 )
-                return
+                return False
 
             # Create progress callback
             async def progress_callback(progress_data):
@@ -1271,20 +1342,24 @@ class TelegramHandler:
                         content_info or {},
                         storage_result,
                         actual_download_type,
-                        is_twitter=is_twitter
+                        is_twitter=is_twitter,
+                        send_as_new=bool(progress_label)
                     )
+                    return True
                 else:
                     await self.telegram_service.edit_message(
                         chat_id=chat_id,
                         message_id=message_id,
                         text="❌ 文件存储失败，请稍后重试。"
                     )
+                    return False
             else:
                 await self.telegram_service.edit_message(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=f"❌ 下载失败: {download_result.error_message}"
                 )
+                return False
 
         except Exception as e:
             logger.error(f"Download error: {e}")
@@ -1293,6 +1368,7 @@ class TelegramHandler:
                 message_id=message_id,
                 text=f"❌ 下载过程中发生错误: {str(e)}"
             )
+            return False
         finally:
             # 清理进度节流状态
             self._progress_last_edit.pop(message_id, None)
@@ -1415,18 +1491,21 @@ class TelegramHandler:
         content_info: Dict[str, Any],
         storage_result: Dict[str, Any],
         download_type: str = "video",
-        is_twitter: bool = False
+        is_twitter: bool = False,
+        send_as_new: bool = False
     ):
         """
         Send success message to user.
 
         Args:
             chat_id: Telegram chat ID
-            message_id: Message ID to edit
+            message_id: Message ID to edit (ignored when send_as_new=True)
             content_info: Content information dictionary
             storage_result: Storage result dictionary
             download_type: "audio", "video", "image", or "text"
             is_twitter: Whether this is a Twitter/X download
+            send_as_new: Send as a new message instead of editing
+                (playlist entries keep their own result message)
         """
         if is_twitter and content_info.get('success'):
             # Build display title from Twitter scrape result
@@ -1475,11 +1554,17 @@ class TelegramHandler:
                     f"💾 本地路径: {storage_result['file_path']}"
                 )
 
-        await self.telegram_service.edit_message(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=message
-        )
+        if send_as_new:
+            await self.telegram_service.send_message(
+                chat_id=chat_id,
+                text=message
+            )
+        else:
+            await self.telegram_service.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=message
+            )
 
     async def _handle_large_file_confirmation_response(
         self, chat_id: int, message_text: str
