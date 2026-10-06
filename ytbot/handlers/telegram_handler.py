@@ -1124,7 +1124,8 @@ class TelegramHandler:
         content_info: Optional[Dict[str, Any]] = None,
         handler=None,
         progress_label: Optional[str] = None,
-        skip_large_file_confirmation: bool = False
+        skip_large_file_confirmation: bool = False,
+        inherited_format_id: Optional[str] = None
     ) -> bool:
         """
         Proceed with the actual download.
@@ -1140,6 +1141,10 @@ class TelegramHandler:
                 messages (used when processing playlist entries)
             skip_large_file_confirmation: Skip the 500MB confirmation prompt
                 (playlist mode processes entries without pauses)
+            inherited_format_id: Playlist-level format selected once from
+                the first entry; skips per-entry format fetching. If the
+                inherited format is unavailable for a video, the entry
+                falls back to the default format
 
         Returns:
             bool: True if the content was downloaded and stored
@@ -1188,6 +1193,30 @@ class TelegramHandler:
                             f"将逐个下载并上传..."
                         )
                     )
+
+                    # One-time format selection from the first entry; all
+                    # entries inherit it (YouTube format IDs are site-wide
+                    # stable). Entries that don't have the inherited format
+                    # fall back to the default format.
+                    shared_format_id = None
+                    _, first_formats = await handler.get_format_list(entries[0])
+                    if download_type == "audio":
+                        shared_format_id = handler.select_best_audio_format(
+                            first_formats
+                        )
+                    else:
+                        vfmt = handler.select_best_video_format(first_formats)
+                        afmt = handler.select_best_audio_format(first_formats)
+                        if vfmt and afmt:
+                            shared_format_id = f"{vfmt}+{afmt}"
+                        elif vfmt:
+                            shared_format_id = vfmt
+                    if shared_format_id:
+                        logger.info(
+                            f"Playlist format selection: {shared_format_id} "
+                            f"(inherited by {total} entries)"
+                        )
+
                     succeeded = 0
                     failed = 0
                     for i, entry_url in enumerate(entries, 1):
@@ -1199,7 +1228,8 @@ class TelegramHandler:
                             None,
                             handler,
                             progress_label=f"{i}/{total}",
-                            skip_large_file_confirmation=True
+                            skip_large_file_confirmation=True,
+                            inherited_format_id=shared_format_id
                         )
                         if item_ok:
                             succeeded += 1
@@ -1245,7 +1275,12 @@ class TelegramHandler:
 
             format_id = None
             file_size_estimate = None
-            if handler.name == "YouTube":
+            if handler.name == "YouTube" and inherited_format_id:
+                # Playlist entry: inherit the playlist-level format
+                # selection (chosen once from the first entry) instead of
+                # fetching formats again for every entry
+                format_id = inherited_format_id
+            elif handler.name == "YouTube":
                 # Get format list
                 video_info, formats = await handler.get_format_list(url)
 
@@ -1311,6 +1346,27 @@ class TelegramHandler:
                 handler=handler,
                 pre_scraped_result=twitter_result
             )
+
+            # Playlist entry whose inherited format is not available for
+            # this particular video (e.g. max 480p video without the 1080p
+            # stream): retry once with the default format selection
+            if (
+                not download_result.success
+                and inherited_format_id
+                and download_result.error_detail == "ERROR_FORMAT_NOT_AVAILABLE"
+            ):
+                logger.warning(
+                    f"Inherited format {inherited_format_id} not available "
+                    f"for {url}, retrying with default format"
+                )
+                download_result = await self.download_service.download_content(
+                    url=url,
+                    content_type=download_type,
+                    progress_callback=progress_callback,
+                    format_id=None,
+                    handler=handler,
+                    pre_scraped_result=twitter_result
+                )
 
             if download_result.success:
                 # Get content info from result

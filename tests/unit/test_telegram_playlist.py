@@ -36,7 +36,7 @@ def make_youtube_handler(entries):
     return h
 
 
-def make_download_result(url, ok=True, title="Video"):
+def make_download_result(url, ok=True, title="Video", error_detail=None):
     if ok:
         return DownloadResult(
             success=True,
@@ -46,7 +46,12 @@ def make_download_result(url, ok=True, title="Video"):
             ),
             temp_dir=None
         )
-    return DownloadResult(success=False, error_message="失败", temp_dir=None)
+    return DownloadResult(
+        success=False,
+        error_message="失败",
+        error_detail=error_detail,
+        temp_dir=None
+    )
 
 
 @pytest.fixture
@@ -289,6 +294,166 @@ class TestPlaylistExpansion:
             for call in telegram_handler.telegram_service.edit_message.await_args_list
         ]
         assert not any('下载和上传完成' in text for text in edited_texts)
+
+
+class TestPlaylistFormatInheritance:
+    """Tests for one-time playlist-level format selection with inheritance"""
+
+    # Formats present on the first entry: 1080p video + m4a audio
+    FORMATS = [
+        {'format_id': '137', 'vcodec': 'avc1', 'acodec': 'none', 'height': 1080},
+        {'format_id': '140', 'acodec': 'aac', 'vcodec': 'none', 'abr': 128},
+    ]
+
+    @pytest.fixture
+    def telegram_handler(self):
+        handler = TelegramHandler(
+            telegram_service=MagicMock(),
+            storage_service=MagicMock(),
+            download_service=MagicMock()
+        )
+        handler.telegram_service.edit_message = AsyncMock(
+            return_value={'message_id': 1}
+        )
+        handler.telegram_service.send_message = AsyncMock(
+            return_value={'message_id': 2}
+        )
+        handler.storage_service.store_file = AsyncMock(return_value={
+            'success': True,
+            'storage_type': 'nextcloud',
+            'file_url': 'https://nc.example.com/fake',
+        })
+        return handler
+
+    def _make_handler(self):
+        yh = make_youtube_handler(ENTRY_URLS)
+        yh.get_format_list = AsyncMock(return_value=({}, self.FORMATS))
+        yh.select_best_video_format = MagicMock(return_value='137')
+        yh.select_best_audio_format = MagicMock(return_value='140')
+        return yh
+
+    @pytest.mark.asyncio
+    async def test_format_selected_once_and_inherited(self, telegram_handler):
+        """get_format_list is called once (first entry) and every entry
+        downloads with the inherited format"""
+        yh = self._make_handler()
+        telegram_handler.download_service.platform_manager.get_handler = \
+            MagicMock(return_value=yh)
+        telegram_handler.download_service.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        result = await telegram_handler._proceed_with_download(
+            chat_id=100, message_id=1, url=PLAYLIST_URL,
+            download_type="video", handler=yh
+        )
+
+        assert result is True
+        # Only ONE format list fetch: the playlist-level selection
+        assert yh.get_format_list.await_count == 1
+        assert yh.get_format_list.await_args_list[0].args[0] == ENTRY_URLS[0]
+        # Every entry downloads with the inherited format
+        for call in telegram_handler.download_service.download_content.await_args_list:
+            assert call.kwargs.get('format_id') == '137+140'
+
+    @pytest.mark.asyncio
+    async def test_audio_format_inherited(self, telegram_handler):
+        """Audio playlists inherit the audio format selection"""
+        yh = self._make_handler()
+        yh.select_best_audio_format = MagicMock(return_value='140')
+        telegram_handler.download_service.platform_manager.get_handler = \
+            MagicMock(return_value=yh)
+        telegram_handler.download_service.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        result = await telegram_handler._proceed_with_download(
+            chat_id=100, message_id=1, url=PLAYLIST_URL,
+            download_type="audio", handler=yh
+        )
+
+        assert result is True
+        assert yh.get_format_list.await_count == 1
+        for call in telegram_handler.download_service.download_content.await_args_list:
+            assert call.kwargs.get('format_id') == '140'
+
+    @pytest.mark.asyncio
+    async def test_inherited_format_fallback_retries_default(
+        self, telegram_handler
+    ):
+        """An entry missing the inherited format retries once with the
+        default format and still counts as a success"""
+        yh = self._make_handler()
+        telegram_handler.download_service.platform_manager.get_handler = \
+            MagicMock(return_value=yh)
+
+        # Call order: entry1 ok, entry2 format-fail, entry2 retry ok,
+        # entry3 ok
+        results = [
+            make_download_result(ENTRY_URLS[0]),
+            make_download_result(
+                ENTRY_URLS[1], ok=False,
+                error_detail="ERROR_FORMAT_NOT_AVAILABLE"
+            ),
+            make_download_result(ENTRY_URLS[1]),
+            make_download_result(ENTRY_URLS[2]),
+        ]
+        telegram_handler.download_service.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: results.pop(0)
+        )
+
+        result = await telegram_handler._proceed_with_download(
+            chat_id=100, message_id=1, url=PLAYLIST_URL,
+            download_type="video", handler=yh
+        )
+
+        assert result is True
+        calls = telegram_handler.download_service.download_content.await_args_list
+        assert len(calls) == 4
+        # First attempt with inherited format, retry without it
+        assert calls[1].kwargs.get('format_id') == '137+140'
+        assert calls[2].kwargs.get('format_id') is None
+        # All three entries uploaded
+        assert telegram_handler.storage_service.store_file.await_count == 3
+        sent = [
+            call.kwargs.get('text', '')
+            for call in telegram_handler.telegram_service.send_message.await_args_list
+        ]
+        assert any('成功 3' in text and '失败 0' in text for text in sent)
+
+    @pytest.mark.asyncio
+    async def test_other_download_errors_do_not_retry(
+        self, telegram_handler
+    ):
+        """Only format-unavailable triggers the fallback retry"""
+        yh = self._make_handler()
+        telegram_handler.download_service.platform_manager.get_handler = \
+            MagicMock(return_value=yh)
+
+        results = [
+            make_download_result(ENTRY_URLS[0]),
+            make_download_result(
+                ENTRY_URLS[1], ok=False, error_detail="ERROR_GEO_RESTRICTED"
+            ),
+            make_download_result(ENTRY_URLS[2]),
+        ]
+        telegram_handler.download_service.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: results.pop(0)
+        )
+
+        result = await telegram_handler._proceed_with_download(
+            chat_id=100, message_id=1, url=PLAYLIST_URL,
+            download_type="video", handler=yh
+        )
+
+        assert result is False
+        # No retry happened: exactly 3 download attempts
+        assert telegram_handler.download_service.download_content.await_count == 3
+        sent = [
+            call.kwargs.get('text', '')
+            for call in telegram_handler.telegram_service.send_message.await_args_list
+        ]
+        assert any('成功 2' in text and '失败 1' in text for text in sent)
 
 
 if __name__ == '__main__':
