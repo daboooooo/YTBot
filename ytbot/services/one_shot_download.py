@@ -160,6 +160,24 @@ class OneShotDownloader:
                 handler=handler,
             )
 
+            # 继承格式对该视频不可用：以默认格式选择重试一次
+            if (
+                not download_result.success
+                and inherited_format_id
+                and download_result.error_detail == "ERROR_FORMAT_NOT_AVAILABLE"
+            ):
+                logger.warning(
+                    f"Inherited format {inherited_format_id} not available "
+                    f"for {url}, retrying with default format"
+                )
+                download_result = await self.download_service.download_content(
+                    url=url,
+                    content_type=content_type,
+                    progress_callback=progress_callback,
+                    format_id=None,
+                    handler=handler,
+                )
+
             if not download_result.success:
                 return download_result.error_message or "下载失败"
 

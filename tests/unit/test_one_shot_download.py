@@ -158,3 +158,26 @@ class TestPlaylist:
         # Whole playlist URL is downloaded directly (no entry expansion)
         ds.download_content.assert_awaited_once()
         assert ds.download_content.await_args.kwargs.get('url') == PLAYLIST_URL
+
+    @pytest.mark.asyncio
+    async def test_inherited_format_unavailable_retries_with_default(self):
+        downloader, ds, ss = make_downloader()
+        yh = make_youtube_handler([ENTRY_URLS[0]])
+        yh.select_best_video_format = MagicMock(return_value='137')
+        yh.select_best_audio_format = MagicMock(return_value='140')
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(side_effect=[
+            make_download_result(
+                ENTRY_URLS[0], ok=False,
+                error_detail="ERROR_FORMAT_NOT_AVAILABLE"
+            ),
+            make_download_result(ENTRY_URLS[0]),
+        ])
+
+        exit_code = await downloader.run(PLAYLIST_URL, "video")
+
+        assert exit_code == 0
+        assert ds.download_content.await_count == 2
+        first, second = ds.download_content.await_args_list
+        assert first.kwargs.get('format_id') == '137+140'
+        assert second.kwargs.get('format_id') is None
