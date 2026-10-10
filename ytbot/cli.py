@@ -479,8 +479,20 @@ Examples:
   ytbot --retry-cache            # Manually retry cached files upload
   ytbot --force                  # Force start even if another instance is running
   ytbot --download <url> --type video  # One-shot download without Telegram
+
+X user archive (no Telegram, no process lock):
+  ytbot --archive-x-user elonmusk --dry-run          # enumerate only
+  ytbot --archive-x-user elonmusk --start-at 2025-01-01T00:00:00Z
+  ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
+
+Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
+            1 download/enumeration/merged-PDF failure.
         """
     )
+
+    # --- X user archive (spec: docs/get_all_post.md; additive only) -----
+    from ytbot.services.x_user_archive.runner import add_archive_arguments
+    add_archive_arguments(parser)
 
     parser.add_argument(
         "--config",
@@ -554,6 +566,10 @@ Examples:
     # One-shot download mode: --type is mandatory
     if args.download and not args.type:
         parser.error("--type is required when using --download")
+
+    # X user archive cross-field validation (spec 5.2)
+    from ytbot.services.x_user_archive.runner import validate_archive_args
+    validate_archive_args(parser, args)
 
     # Get config instance
     config = get_config()
@@ -664,6 +680,12 @@ Examples:
             DownloadService(), StorageService()
         )
         return asyncio.run(downloader.run(args.download, args.type))
+
+    # X user archive mode: no Telegram, no process lock, run and exit
+    if args.archive_x_user or args.resume:
+        from ytbot.services.x_user_archive.runner import XUserArchiveRunner
+
+        return XUserArchiveRunner().run(args)
 
     # Store no-cache-retry flag
     if args.no_cache_retry:

@@ -190,13 +190,16 @@ class TimelineEnumerator:
         extractor: Any,
         options: EnumerateOptions,
         sleep_func: Optional[Callable[[float], Any]] = None,
+        preload_ids: Optional[set] = None,
     ):
         self.extractor = extractor
         self.options = options
         self._sleep = sleep_func or (lambda d: asyncio.sleep(d))
         self.outcome = EnumerationOutcome()
-        self._seen_ids = set()       # raw status ids observed this run
-        self._accepted_ids = set()   # in-scope/in-window unique ids
+        # Resume (spec 13.2.6): ids already in the manifest count as
+        # seen so re-scrolling dedupes against them.
+        self._seen_ids = set(preload_ids or ())
+        self._accepted_ids = set(preload_ids or ())
         self._page = None
         self._owned_page = False
 
