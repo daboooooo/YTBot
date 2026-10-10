@@ -220,11 +220,34 @@ class PdfConverter:
 
         file_url = f"file://{html_path_abs}"
 
+        # Dedicated throwaway profile: avoids any contention with the
+        # user's running Chrome GUI profile (singleton lock, first-run UI).
+        chrome_profile = tempfile.mkdtemp(prefix='ytbot_chrome_profile_')
+
         cmd = [
             self._chrome_path,
             "--headless=new",
             "--disable-gpu",
             "--no-sandbox",
+            f"--user-data-dir={chrome_profile}",
+            # Do NOT touch the macOS Keychain ("Safe Storage"): we render a
+            # local file and store no credentials, so use the in-memory
+            # password store with a mock keychain. Otherwise Chrome raises
+            # the system "wants to use confidential information" dialog.
+            "--password-store=basic",
+            "--use-mock-keychain",
+            # Avoid spawning Keystone/GoogleUpdater and background fetches.
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-client-side-phishing-detection",
+            "--disable-domain-reliability",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            # new-headless on macOS can stay alive AFTER printing (remote
+            # resources keep the renderer busy); the virtual-time budget
+            # bounds page activity and makes Chrome exit deterministically.
+            "--virtual-time-budget=20000",
             f"--print-to-pdf={output_path_abs}",
             "--print-to-pdf-no-header",
             file_url
@@ -238,33 +261,74 @@ class PdfConverter:
             stderr=asyncio.subprocess.PIPE
         )
 
+        def _pdf_signature():
+            """(size, mtime) once a non-empty output exists, else None."""
+            try:
+                if os.path.exists(output_path_abs):
+                    size = os.path.getsize(output_path_abs)
+                    if size > 0:
+                        return size, os.path.getmtime(output_path_abs)
+            except OSError:
+                pass
+            return None
+
+        # new-headless may keep running after the PDF is fully written,
+        # so do NOT wait for process exit: consider the job done once the
+        # output file stays unchanged, or once Chrome exits on its own.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 60
+        stable_checks = 0
+        last_sig = None
+        completed_naturally = False
+        while True:
+            if process.returncode is not None:
+                completed_naturally = True
+                break
+            sig = _pdf_signature()
+            if sig is not None and sig == last_sig:
+                stable_checks += 1
+                if stable_checks >= 4:   # ~2s stable at 0.5s polling
+                    break
+            else:
+                stable_checks = 0
+                last_sig = sig
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=60
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            raise RuntimeError("Chrome PDF conversion timed out")
+            file_ready = _pdf_signature() is not None
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            elif not file_ready:
+                # exited on its own without producing anything useful
+                stderr_data = await process.stderr.read()
+                error_msg = stderr_data.decode().strip()
+                if process.returncode != 0:
+                    if error_msg:
+                        logger.error(f"Chrome error: {error_msg}")
+                    raise RuntimeError(
+                        f"Chrome conversion failed with code "
+                        f"{process.returncode}"
+                    )
+                raise RuntimeError("PDF file was not created")
 
-        if process.returncode != 0:
-            error_msg = stderr.decode().strip()
-            if error_msg:
-                logger.error(f"Chrome error: {error_msg}")
-            raise RuntimeError(
-                f"Chrome conversion failed with code {process.returncode}"
-            )
+            if not file_ready:
+                raise RuntimeError(
+                    "Chrome PDF conversion timed out and no PDF was produced"
+                )
 
-        if os.path.exists(output_path_abs):
             file_size = os.path.getsize(output_path_abs)
             logger.info(
                 f"PDF generated with Chrome: {output_path_abs} "
                 f"({file_size} bytes)"
+                + ("" if completed_naturally else
+                   " (process lingered, terminated after stable output)")
             )
             return output_path_abs
-
-        raise RuntimeError("PDF file was not created")
+        finally:
+            shutil.rmtree(chrome_profile, ignore_errors=True)
 
     async def _convert_with_wkhtmltopdf(
         self,
