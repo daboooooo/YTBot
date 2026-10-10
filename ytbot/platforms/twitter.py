@@ -23,6 +23,7 @@ from ytbot.platforms.base import PlatformHandler, ContentInfo, ContentType, Down
 from ytbot.core.enhanced_logger import get_logger
 from ytbot.services.storage_service import StorageService
 from ytbot.services.pdf_converter import pdf_converter
+from ytbot.utils.system_proxy import get_system_proxy
 
 # Try to import aiohttp for link preview
 aiohttp = None
@@ -2818,7 +2819,8 @@ class TwitterHandler(PlatformHandler):
         try:
             timeout = aiohttp.ClientTimeout(total=5)
             session = await self.get_http_session()
-            async with session.get(url, timeout=timeout, headers={
+            proxy = get_system_proxy(url)
+            async with session.get(url, timeout=timeout, proxy=proxy, headers={
                 'User-Agent': (
                     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -4801,8 +4803,11 @@ class TwitterHandler(PlatformHandler):
         async def download_single_image(img_url: str, index: int) -> Dict[str, Any]:
             try:
                 timeout = aiohttp.ClientTimeout(total=30)
+                proxy = get_system_proxy(img_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(img_url, timeout=timeout) as response:
+                    async with session.get(
+                        img_url, timeout=timeout, proxy=proxy
+                    ) as response:
                         if response.status == 200:
                             content = await response.read()
                             content_type = response.headers.get(
@@ -4901,6 +4906,12 @@ class TwitterHandler(PlatformHandler):
                 'quiet': True,
                 'no_warnings': True,
                 'cookiesfrombrowser': None,  # Don't use browser cookies
+                # Proxied links can drop mid-transfer; retry and resume
+                # instead of leaving a .part file after a few megabytes.
+                'retries': 5,
+                'fragment_retries': 10,
+                'continuedl': True,
+                'http_chunk_size': 1048576,
                 'http_headers': {
                     'User-Agent': (
                         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -4911,6 +4922,13 @@ class TwitterHandler(PlatformHandler):
                     'Accept-Language': 'en-US,en;q=0.9',
                 },
             }
+
+            # yt-dlp does not read the macOS/Windows system proxy on its
+            # own; pass the resolved proxy explicitly (None = direct).
+            proxy = get_system_proxy(video_url)
+            if proxy:
+                ydl_opts['proxy'] = proxy
+                logger.info(f"Using proxy for video download: {proxy}")
 
             # Skip blob URLs (browser-local, not accessible by yt-dlp)
             if video_url.startswith('blob:'):
