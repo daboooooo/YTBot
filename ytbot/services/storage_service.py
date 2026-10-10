@@ -8,7 +8,7 @@ import os
 import shutil
 import asyncio
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from datetime import datetime
 
 from ..core.config import CONFIG
@@ -124,7 +124,8 @@ class StorageService:
         self,
         source_path: str,
         filename: str,
-        content_type: str = "media"
+        content_type: str = "media",
+        progress_callback: Optional[Callable[[int, int], None]] = None
     ) -> Dict[str, Any]:
         """
         Store a file or directory using the best available storage backend with detailed logging
@@ -133,6 +134,8 @@ class StorageService:
             source_path: Local file path or directory to store
             filename: Target filename
             content_type: Type of content (for organization)
+            progress_callback: Optional sync callback for Nextcloud upload
+                progress, invoked as ``callback(current_bytes, total_bytes)``
 
         Returns:
             dict: Storage result with status and location info
@@ -228,7 +231,8 @@ class StorageService:
 
                     nc_storage = self.nextcloud_storage
                     upload_result = nc_storage.upload_directory(
-                        source_path, remote_path
+                        source_path, remote_path,
+                        progress_callback=progress_callback
                     )
 
                     if upload_result.get("success"):
@@ -267,7 +271,10 @@ class StorageService:
                     logger.debug(f"Remote path: {remote_path}")
                     logger.debug("Uploading file to Nextcloud...")
 
-                    file_url = self.nextcloud_storage.upload_file(source_path, remote_path)
+                    file_url = self.nextcloud_storage.upload_file(
+                        source_path, remote_path,
+                        progress_callback=progress_callback
+                    )
 
                     if file_url:
                         logger.info(f"✅ File stored in Nextcloud: {file_url}")

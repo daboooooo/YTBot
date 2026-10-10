@@ -64,13 +64,28 @@ class NextcloudStorage:
             logger.error(f"Nextcloud connection test failed: {e}")
             return False
 
-    def upload_file(self, local_path: str, remote_path: str) -> Optional[str]:
+    def upload_file(
+        self,
+        local_path: str,
+        remote_path: str,
+        progress_callback: Optional[Any] = None,
+        byte_offset: int = 0,
+        total_bytes: Optional[int] = None,
+    ) -> Optional[str]:
         """
         Upload a file to Nextcloud
 
         Args:
             local_path: Local file path
             remote_path: Remote file path in Nextcloud
+            progress_callback: Optional sync callback invoked per uploaded
+                chunk as ``callback(current, total)`` with global bytes
+                (byte_offset added to per-file current; total_bytes is the
+                grand total when aggregating a directory upload)
+            byte_offset: Bytes already uploaded before this file (for
+                aggregating directory uploads into one overall progress)
+            total_bytes: Grand total bytes reported to the callback;
+                defaults to the size of this single file
 
         Returns:
             str: File URL if successful, None otherwise
@@ -103,7 +118,28 @@ class NextcloudStorage:
 
                 # Upload file
                 logger.info(f"Uploading file to Nextcloud: {remote_path}")
-                self.client.upload_sync(remote_path=remote_path, local_path=local_path)
+                if progress_callback is not None:
+                    # Call the low-level API directly: upload_sync's file
+                    # branch does not forward `progress` to the client
+                    file_size = os.path.getsize(local_path)
+                    grand_total = (
+                        total_bytes if total_bytes is not None else file_size
+                    )
+
+                    def _lib_progress(current: int, total: int) -> None:
+                        progress_callback(
+                            byte_offset + current, grand_total
+                        )
+
+                    self.client.upload_file(
+                        remote_path=remote_path,
+                        local_path=local_path,
+                        progress=_lib_progress,
+                    )
+                else:
+                    self.client.upload_sync(
+                        remote_path=remote_path, local_path=local_path
+                    )
 
                 # Verify upload
                 if self._verify_upload(remote_path, local_path):
@@ -132,13 +168,21 @@ class NextcloudStorage:
 
         return None
 
-    def upload_directory(self, local_dir: str, remote_dir: str) -> Dict[str, Any]:
+    def upload_directory(
+        self,
+        local_dir: str,
+        remote_dir: str,
+        progress_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """
         Upload a directory and all its contents to Nextcloud
 
         Args:
             local_dir: Local directory path
-            remote_dir: Remote directory path in Nextcloud
+            remote_dir: Remote directory path
+            progress_callback: Optional sync callback invoked as
+                ``callback(current, total)`` with aggregated bytes across
+                all files in the directory
 
         Returns:
             dict: Upload result with 'success', 'file_url',
@@ -174,6 +218,22 @@ class NextcloudStorage:
             errors = []
             total_files = 0
 
+            # Pre-compute total bytes for aggregated progress reporting
+            total_bytes = 0
+            if progress_callback is not None:
+                for root_pre, _, files_pre in os.walk(local_dir):
+                    for f in files_pre:
+                        try:
+                            total_bytes += os.path.getsize(
+                                os.path.join(root_pre, f)
+                            )
+                        except OSError:
+                            pass
+                progress_callback(0, total_bytes)
+
+            # Bytes of files already processed (for progress aggregation)
+            completed_bytes = 0
+
             # Walk through directory and upload all files
             for root, dirs, files in os.walk(local_dir):
                 # Calculate relative path from local_dir
@@ -200,16 +260,34 @@ class NextcloudStorage:
                             f"Uploading: {local_file_path} -> "
                             f"{remote_file_path}"
                         )
-                        self.client.upload_sync(
-                            remote_path=remote_file_path,
-                            local_path=local_file_path
-                        )
+                        file_size = 0
+                        try:
+                            file_size = os.path.getsize(local_file_path)
+                        except OSError:
+                            pass
+                        if progress_callback is not None:
+                            self.upload_file(
+                                local_path=local_file_path,
+                                remote_path=remote_file_path,
+                                progress_callback=progress_callback,
+                                byte_offset=completed_bytes,
+                                total_bytes=total_bytes,
+                            )
+                        else:
+                            self.client.upload_sync(
+                                remote_path=remote_file_path,
+                                local_path=local_file_path
+                            )
                         uploaded_files.append(remote_file_path)
                         logger.info(f"Successfully uploaded: {file}")
                     except Exception as e:
                         error_msg = f"Failed to upload {file}: {e}"
                         logger.error(error_msg)
                         errors.append(error_msg)
+                    finally:
+                        # Advance the global offset even on failure so the
+                        # overall percentage keeps moving
+                        completed_bytes += file_size
 
             # Build file URL - use Nextcloud web UI browse URL
             base_url = CONFIG['nextcloud']['url'].rstrip('/')

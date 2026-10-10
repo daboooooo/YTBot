@@ -198,6 +198,9 @@ class OneShotDownloader:
                     download_result.file_path, title, actual_type
                 ),
                 actual_type,
+                progress_callback=self._make_upload_progress_callback(
+                    progress_label
+                ),
             )
 
             if storage_result.get('success'):
@@ -275,3 +278,33 @@ class OneShotDownloader:
             self._last_progress_percent = percentage
 
         return progress_callback
+
+    def _make_upload_progress_callback(self, progress_label: Optional[str] = None):
+        """Create a throttled terminal upload progress callback (sync)"""
+        label = f"[{progress_label}] " if progress_label else ""
+        # Independent throttle state per file upload
+        last_time = 0.0
+        last_percent = -100.0
+
+        def upload_progress_callback(current: int, total: int):
+            nonlocal last_time, last_percent
+            if total <= 0:
+                return
+            percentage = current / total * 100
+            now = time.monotonic()
+            # 节流：每 5 秒或进度变化 10% 才打印一行；结束必打
+            if (
+                current < total
+                and now - last_time < 5.0
+                and abs(percentage - last_percent) < 10.0
+            ):
+                return
+            print(
+                f"{label}☁️ 上传中 {percentage:.1f}% "
+                f"({current / 1024 / 1024:.1f}/"
+                f"{total / 1024 / 1024:.1f} MB)"
+            )
+            last_time = now
+            last_percent = percentage
+
+        return upload_progress_callback

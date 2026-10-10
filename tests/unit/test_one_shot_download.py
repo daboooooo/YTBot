@@ -96,6 +96,22 @@ class TestSingleVideo:
         ss.store_file.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_upload_progress_callback_passed_to_storage(self):
+        downloader, ds, ss = make_downloader()
+        yh = make_youtube_handler(ENTRY_URLS)
+        ds.platform_manager.get_handler = MagicMock(return_value=yh)
+        ds.download_content = AsyncMock(
+            side_effect=lambda url, **kwargs: make_download_result(url)
+        )
+
+        await downloader.run(ENTRY_URLS[0], "video")
+
+        kwargs = ss.store_file.await_args.kwargs
+        assert callable(kwargs.get('progress_callback'))
+        # Callback accepts sync (current, total) bytes
+        kwargs['progress_callback'](500, 1000)
+
+    @pytest.mark.asyncio
     async def test_no_handler_returns_error(self):
         downloader, ds, ss = make_downloader()
         ds.platform_manager.get_handler = MagicMock(return_value=None)
