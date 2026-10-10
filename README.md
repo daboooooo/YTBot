@@ -159,6 +159,52 @@ ytbot --download "https://www.youtube.com/playlist?list=PLAYLIST_ID" --type vide
 - Files follow the normal storage flow: Nextcloud first, local storage + cache queue on failure
 - Exit code `0` = all items succeeded, `1` = any failure; the process exits immediately when done
 
+### Archive an X user's history
+
+`--archive-x-user` enumerates a user's timeline into a manifest, then
+archives every post into an independent `--archive-dir` (default
+`./x_archive`) organized by **publish** time (`YYYY/MM/`), and finally
+builds one merged book PDF with a cover, table of contents and
+bookmarks. It runs standalone like `--download`: no Telegram, no
+process lock.
+
+```bash
+# Always preview first: enumerate only, build the manifest, no downloads
+ytbot --archive-x-user elonmusk --dry-run
+
+# Control scope with an explicit time window (recommended)
+ytbot --archive-x-user https://x.com/elonmusk \
+  --start-at 2025-01-01T00:00:00Z --end-at 2025-04-01T00:00:00Z
+
+# Targets accept @handle, bare handle, profile URL or any status URL
+ytbot --archive-x-user "https://x.com/elonmusk/status/1234567890" \
+  --include-replies --no-merged-pdf
+
+# Resume an interrupted task (directory or task id); window stays fixed
+ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
+```
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--archive-x-user TARGET` | — | handle / profile URL / status URL to archive |
+| `--history-years N` | `5` | calendar-year lookback (ignored when `--start-at` given) |
+| `--start-at` / `--end-at` | now window | explicit half-open ISO-8601 window |
+| `--archive-dir DIR` | `./x_archive` | independent archive root (not `LOCAL_STORAGE_PATH`) |
+| `--dry-run` | off | enumerate + manifest only |
+| `--resume TASK` | — | resume a task directory/id with its fixed window |
+| `--include-replies` | off | also scroll `/with_replies` |
+| `--no-reposts` | off | exclude reposts (kept by default) |
+| `--max-posts N` | `1000` | unique-post safety cap (`0` = unlimited); cap hit → `partial` |
+| `--scroll-stall N` | `8` | empty rounds before the timeline bottom is assumed |
+| `--request-delay S` | `2.0` | polite delay between per-post downloads |
+| `--no-merged-pdf` | off | skip the merged book PDF |
+| `--merged-pdf PATH` | auto | custom merged PDF output path |
+
+Exit codes: `0` = complete enumeration and all downloads/PDF ok;
+`2` = enumeration `partial` but downloads and merged PDF ok;
+`1` = download/enumeration/merged-PDF failure (including missing
+`pypdf`; install it with `pip install pypdf` and `--resume`).
+
 ### Utility commands
 
 ```bash
@@ -187,7 +233,9 @@ ytbot/
 │   ├── telegram_service.py    # Telegram polling and messaging
 │   ├── download_service.py    # Platform dispatch for downloads
 │   ├── storage_service.py     # Nextcloud + local/cache storage
-│   └── one_shot_download.py   # Telegram-free one-shot orchestration
+│   ├── one_shot_download.py   # Telegram-free one-shot orchestration
+│   └── x_user_archive/        # --archive-x-user: manifest/timeline/
+│                              #   archiver/merged-PDF/runner
 ├── handlers/
 │   └── telegram_handler.py    # Telegram command/message flows
 ├── storage/                   # Local storage, Nextcloud WebDAV, cache manager
