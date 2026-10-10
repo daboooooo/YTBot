@@ -78,6 +78,7 @@ class EnumStopReason:
 class SkipReason:
     OUT_OF_SCOPE = "out_of_scope"
     NO_REPOSTS = "no_reposts"
+    ALREADY_ARCHIVED = "already_archived"
 
 
 class MergedPdfStatus:

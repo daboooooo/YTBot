@@ -23,3 +23,6 @@ playwright>=1.58.0
 
 # Terminal UI (Rich library for beautiful terminal output)
 rich>=13.0.0
+
+# Merged archive book PDF (lazy import; only needed by --archive-x-user)
+pypdf>=4.0.0
