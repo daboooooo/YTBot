@@ -13,6 +13,7 @@ from telegram.error import NetworkError, RetryAfter
 
 from ytbot.services.telegram_service import (
     POLLING_PARAMS,
+    POLLING_REQUEST_PARAMS,
     TelegramService,
 )
 from ytbot.handlers.telegram_handler import TelegramHandler
@@ -285,10 +286,16 @@ class TestPollingParams:
 
     def test_params_values(self):
         assert POLLING_PARAMS["timeout"] == 50
-        # read_timeout 必须大于长轮询挂起时长，避免代理慢导致误判超时
-        assert POLLING_PARAMS["read_timeout"] > POLLING_PARAMS["timeout"]
         assert set(POLLING_PARAMS["allowed_updates"]) == {"message", "callback_query"}
         assert POLLING_PARAMS["drop_pending_updates"] is False
+        # PTB 22.0 起超时改由 get_updates_request 配置，不再传入 start_polling
+        assert "read_timeout" not in POLLING_PARAMS
+
+    def test_get_updates_request_timeouts(self):
+        # read_timeout 必须大于长轮询挂起时长，避免代理慢导致误判超时
+        assert (
+            POLLING_REQUEST_PARAMS["read_timeout"] > POLLING_PARAMS["timeout"]
+        )
 
     async def test_start_updater_polling_uses_unified_params(self, service):
         service.application.updater.start_polling = AsyncMock()

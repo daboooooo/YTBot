@@ -10,25 +10,49 @@ import time
 from typing import Optional, Dict, Any, Callable, List
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler
-from telegram.error import Conflict, RetryAfter
+from telegram.error import Conflict, RetryAfter, TelegramError
+from telegram.request import HTTPXRequest
 
 from ..core.config import CONFIG
 from ..core.enhanced_logger import get_logger, log_function_entry_exit
 
 logger = get_logger(__name__)
 
+
+def _handle_polling_error(exc: TelegramError) -> None:
+    """轮询异常回调：用单行告警替代 PTB 默认的整段 traceback 噪音。
+
+    Updater 的轮询重试循环以 max_retries=-1 运行，网络类异常会自动无限重试，
+    因此这里只保留可读的告警，不改变任何重试行为。
+    """
+    detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+    cause = exc.__cause__
+    if cause is not None:
+        detail += f" (cause: {type(cause).__name__})"
+    logger.warning(f"⚠️ Telegram polling error, will auto-retry: {detail}")
+
+
 # 统一的长轮询参数（方案B）：
 # - timeout=50: 空闲时服务器挂起50秒，代理上的请求频率从约6次/分降至约1.2次/分，
 #   降低代理断连概率；有消息时服务器立即返回，不增加响应延迟
-# - read_timeout 必须 > timeout，避免代理慢导致误判超时
 # - allowed_updates 只订阅实际处理的更新类型，减少无关流量
+# 注意：python-telegram-bot 22.0 起 start_polling() 不再接受
+# read_timeout/write_timeout/connect_timeout/pool_timeout，
+# 这些超时改为在 get_updates_request 上配置（见 POLLING_REQUEST_PARAMS）
 POLLING_PARAMS = {
     "timeout": 50,
+    "allowed_updates": ["message", "callback_query"],
+    "drop_pending_updates": False,
+    # 降噪：默认回调会把每次重试打成一整篇 ERROR traceback，这里换成单行告警
+    "error_callback": _handle_polling_error,
+}
+
+# getUpdates 请求的超时参数：
+# read_timeout 必须 > timeout（50），避免代理慢导致误判超时
+POLLING_REQUEST_PARAMS = {
     "read_timeout": 60,
     "write_timeout": 30,
     "connect_timeout": 30,
-    "allowed_updates": ["message", "callback_query"],
-    "drop_pending_updates": False,
 }
 
 # 单次等待 flood 熔断窗口的最大时长（秒），防止极端情况下调用方无限阻塞
@@ -105,7 +129,14 @@ class TelegramService:
                 logger.info("🔗 Connecting to Telegram servers...")
                 logger.debug(f"Token length: {len(self.token)} characters")
 
-                self.application = Application.builder().token(self.token).build()
+                self.application = (
+                    Application.builder()
+                    .token(self.token)
+                    .get_updates_request(
+                        HTTPXRequest(**POLLING_REQUEST_PARAMS)
+                    )
+                    .build()
+                )
                 self.bot = self.application.bot
 
                 # Test connection
