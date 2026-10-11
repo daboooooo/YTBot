@@ -92,8 +92,24 @@ def add_archive_arguments(parser: argparse.ArgumentParser) -> None:
         help="Enumerate and build the manifest only; do not download",
     )
     g.add_argument(
+        "--enum-only", action="store_true",
+        help=(
+            "Phase 1 only: enumerate, persist the manifest snapshot and "
+            "exit; downloads start later via --resume (historical posts "
+            "are immutable, so a boundary-confirmed manifest is reused "
+            "without re-scrolling"
+        ),
+    )
+    g.add_argument(
         "--resume", type=str, default=None, metavar="TASK",
         help="Resume a task directory or task id (reuses its window)",
+    )
+    g.add_argument(
+        "--refresh-enum", action="store_true",
+        help=(
+            "With --resume: re-run timeline enumeration even when the "
+            "stored manifest already reached the window start boundary"
+        ),
     )
     g.add_argument(
         "--include-replies", action="store_true",
@@ -143,6 +159,8 @@ def validate_archive_args(parser: argparse.ArgumentParser, args) -> None:
                 "pass --start-at/--end-at/--history-years with it"
             )
     else:
+        if getattr(args, "refresh_enum", False):
+            parser.error("--refresh-enum requires --resume")
         try:
             resolve_time_window(
                 datetime.now(timezone.utc),
@@ -157,6 +175,11 @@ def validate_archive_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--max-posts must be a non-negative integer (0 = unlimited)")
     if args.no_merged_pdf and args.merged_pdf:
         parser.error("--no-merged-pdf cannot be combined with --merged-pdf")
+    if getattr(args, "enum_only", False) and getattr(args, "resume", None):
+        parser.error(
+            "--enum-only starts a fresh enumeration snapshot; to extend "
+            "an existing task use --resume (optionally with --refresh-enum)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +258,26 @@ class XUserArchiveRunner:
         state_store = TaskStateStore(paths)
 
         # -- phase 1: enumeration -----------------------------------------
-        # Fresh tasks are "unknown"; resume re-scrolls only when the
-        # previous enumeration was not complete (spec 13.2.6).
-        need_enum = state.enum_status != EnumStatus.COMPLETE
+        # Fresh tasks are "unknown". On resume the manifest is treated as
+        # an immutable historical snapshot when the previous scroll either
+        # completed cleanly or reached the window-start boundary (posts
+        # coverage confirmed; long-form caveat is recorded separately).
+        # --refresh-enum forces a re-scroll; anything else (stall, cap,
+        # failed, interrupted) re-enumerates and merges via preload.
+        enum_only = bool(getattr(args, "enum_only", False))
+        manifest_trustable = (
+            state.enum_status == EnumStatus.COMPLETE
+            or state.enum_stop_reason == EnumStopReason.START_BOUNDARY
+        )
+        if manifest_trustable and not getattr(args, "refresh_enum", False):
+            print(
+                f"ℹ️ 复用已存档清单（{state.enum_stop_reason}，"
+                f"{len(records)} 条），不重新滚动时间线；"
+                "如需刷新请加 --refresh-enum。"
+            )
+            need_enum = False
+        else:
+            need_enum = True
 
         interrupted = False
         if need_enum:
@@ -257,7 +297,7 @@ class XUserArchiveRunner:
                 return await self._finalize(
                     paths, state, manifest,
                     failed_rows, args, started, started_at,
-                    enum_failed=True,
+                    enum_failed=True, enum_only=enum_only,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 state.enum_status = EnumStatus.PARTIAL
@@ -291,6 +331,20 @@ class XUserArchiveRunner:
             return await self._finalize(
                 paths, state, manifest, records, args,
                 started, started_at, dry_run=True,
+            )
+
+        if enum_only:
+            print(
+                f"ℹ️ --enum-only：清单快照已存档（{len(records)} 条），"
+                "未下载正文、未生成合订大 PDF。"
+            )
+            print(
+                f"   稍后用  --resume {paths.task_id} "
+                f"--archive-dir {args.archive_dir}  直接按清单下载。"
+            )
+            return await self._finalize(
+                paths, state, manifest, records, args,
+                started, started_at, enum_only=True,
             )
 
         # -- phase 2: per-post downloads ----------------------------------
@@ -480,7 +534,7 @@ class XUserArchiveRunner:
         self, paths, state: TaskState, manifest: ManifestStore, records,
         args, started, started_at, *,
         enum_failed=False, interrupted=False, paused=False,
-        dry_run=False,
+        dry_run=False, enum_only=False,
     ) -> int:
         self._refresh_counters(state, records)
         state_store = TaskStateStore(paths)
@@ -489,7 +543,8 @@ class XUserArchiveRunner:
         finished_at = self._clock()
         report = self._build_report(
             paths, state, records, started_at, finished_at,
-            time.monotonic() - started, dry_run=dry_run,
+            time.monotonic() - started,
+            dry_run=dry_run, enum_only=enum_only,
         )
         report_path = paths.report_path()
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,9 +553,19 @@ class XUserArchiveRunner:
             encoding="utf-8",
         )
 
-        self._print_terminal_summary(state, report, report_path, dry_run)
+        self._print_terminal_summary(
+            state, report, report_path, dry_run or enum_only
+        )
 
         if dry_run:
+            return EXIT_SUCCESS
+        if enum_only:
+            # Snapshot archived intentionally: reflect coverage quality so
+            # callers can decide whether to --resume/--refresh-enum.
+            if enum_failed:
+                return EXIT_FAILURE
+            if state.enum_status == EnumStatus.PARTIAL:
+                return EXIT_PARTIAL
             return EXIT_SUCCESS
         pdf_status = state.merged_pdf.get("status")
         download_failures = (
@@ -516,7 +581,7 @@ class XUserArchiveRunner:
 
     def _build_report(
         self, paths, state: TaskState, records, started_at, finished_at,
-        elapsed, *, dry_run,
+        elapsed, *, dry_run, enum_only=False,
     ) -> dict:
         posts = [r for r in records if r.content_type != ContentKind.ARTICLE]
         articles = [r for r in records if r.content_type == ContentKind.ARTICLE]
@@ -562,6 +627,11 @@ class XUserArchiveRunner:
             "merged_pdf": dict(state.merged_pdf),
             "archive_dir": str(paths.task_dir),
             "dry_run": dry_run,
+            "enum_only": enum_only,
+            "manifest_trustable": (
+                state.enum_status == EnumStatus.COMPLETE
+                or state.enum_stop_reason == EnumStopReason.START_BOUNDARY
+            ),
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "elapsed_seconds": round(elapsed, 3),

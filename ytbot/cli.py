@@ -481,9 +481,11 @@ Examples:
   ytbot --download <url> --type video  # One-shot download without Telegram
 
 X user archive (no Telegram, no process lock):
-  ytbot --archive-x-user elonmusk --dry-run          # enumerate only
+  ytbot --archive-x-user elonmusk --dry-run          # preview, save nothing
+  ytbot --archive-x-user elonmusk --enum-only        # snapshot manifest only
   ytbot --archive-x-user elonmusk --start-at 2025-01-01T00:00:00Z
   ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
+  ytbot --resume <task> --refresh-enum               # force re-enumeration
 
 Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
             1 download/enumeration/merged-PDF failure.

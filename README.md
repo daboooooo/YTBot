@@ -180,8 +180,14 @@ ytbot --archive-x-user https://x.com/elonmusk \
 ytbot --archive-x-user "https://x.com/elonmusk/status/1234567890" \
   --include-replies --no-merged-pdf
 
-# Resume an interrupted task (directory or task id); window stays fixed
+# Two-phase workflow: persist the immutable manifest snapshot first,
+# download from it later (resume reuses a boundary-confirmed manifest
+# without re-scrolling)
+ytbot --archive-x-user elonmusk --start-at 2025-01-01T00:00:00Z --enum-only
 ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
+
+# Force re-enumeration (e.g. window was truncated by stall/--max-posts)
+ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000 --refresh-enum
 ```
 
 | Option | Default | Purpose |
@@ -190,8 +196,10 @@ ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
 | `--history-years N` | `5` | calendar-year lookback (ignored when `--start-at` given) |
 | `--start-at` / `--end-at` | now window | explicit half-open ISO-8601 window |
 | `--archive-dir DIR` | `./x_archive` | independent archive root (not `LOCAL_STORAGE_PATH`) |
-| `--dry-run` | off | enumerate + manifest only |
+| `--dry-run` | off | preview only: enumerate + manifest, report only |
+| `--enum-only` | off | phase 1 only: persist the manifest snapshot, download later via `--resume` |
 | `--resume TASK` | — | resume a task directory/id with its fixed window |
+| `--refresh-enum` | off | with `--resume`, force re-enumeration even when the stored manifest reached the window boundary |
 | `--include-replies` | off | also scroll `/with_replies` |
 | `--no-reposts` | off | exclude reposts (kept by default) |
 | `--max-posts N` | `1000` | unique-post safety cap (`0` = unlimited); cap hit → `partial` |

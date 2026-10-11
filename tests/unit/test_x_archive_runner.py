@@ -57,6 +57,8 @@ def make_args(tmp_path, **over):
         end_at=None,
         archive_dir=str(tmp_path / "x_archive"),
         dry_run=False,
+        enum_only=False,
+        refresh_enum=False,
         resume=None,
         include_replies=False,
         no_reposts=False,
@@ -269,6 +271,21 @@ class TestCliValidation:
                 "--no-merged-pdf", "--merged-pdf", "out.pdf",
             )
 
+    def test_refresh_enum_requires_resume(self):
+        with pytest.raises(SystemExit):
+            self._parse(
+                self._parser(),
+                "--archive-x-user", "bob", "--refresh-enum",
+            )
+
+    def test_enum_only_conflicts_with_resume(self):
+        with pytest.raises(SystemExit):
+            self._parse(
+                self._parser(),
+                "--archive-x-user", "bob",
+                "--resume", "tid", "--enum-only",
+            )
+
 
 class TestRunnerHappyPath:
     def test_dry_run_no_download_no_merge(self, tmp_path):
@@ -340,6 +357,50 @@ class TestRunnerHappyPath:
 
         assert code == EXIT_SUCCESS
         assert spy.calls == []
+
+    def test_enum_only_complete_snapshot_exit_zero(self, tmp_path):
+        handler = ScriptedHandler()
+        spy = MergeSpy()
+        runner = make_runner(handler, spy)
+        args = make_args(tmp_path, enum_only=True)
+
+        code = runner.run(args)
+
+        assert code == EXIT_SUCCESS
+        assert handler.calls == []          # no downloads
+        assert spy.calls == []              # no merged book
+        task_dir = list(
+            (Path(args.archive_dir) / "elonmusk" / "tasks").iterdir()
+        )[0]
+        assert (task_dir / "manifest.jsonl").exists()
+        report = task_dir / "reports" / f"{task_dir.name}.json"
+        data = __import__("json").loads(report.read_text())
+        assert data["enum_only"] is True
+        assert data["dry_run"] is False
+        assert data["manifest_trustable"] is True
+        assert data["unique"] == 3
+
+    def test_enum_only_partial_snapshot_exit_two(self, tmp_path):
+        handler = ScriptedHandler()
+        spy = MergeSpy()
+        records = [make_record(SID_A), make_record(SID_B)]
+        runner = make_runner(
+            handler, spy, outcome=partial_outcome(2), records=records
+        )
+        args = make_args(tmp_path, enum_only=True)
+
+        code = runner.run(args)
+
+        assert code == EXIT_PARTIAL
+        assert handler.calls == []
+        task_dir = list(
+            (Path(args.archive_dir) / "elonmusk" / "tasks").iterdir()
+        )[0]
+        data = __import__("json").loads(
+            (task_dir / "reports" / f"{task_dir.name}.json").read_text()
+        )
+        assert data["enum_only"] is True
+        assert data["manifest_trustable"] is False
 
 
 class TestFailures:
@@ -523,3 +584,97 @@ class TestStatusUrlAndResume:
         rows, warnings = ManifestStore(paths).load()
         assert [r.tweet_id for r in rows] == [SID_A, SID_B, SID_C]
         assert warnings == []
+
+    def test_resume_trusts_start_boundary_manifest_without_rescroll(
+        self, tmp_path
+    ):
+        """partial/start_boundary (articles channel absent) is still a
+        boundary-confirmed posts snapshot: resume must not re-scroll."""
+        from ytbot.services.x_user_archive.manifest import TaskPaths
+
+        archive_root = str(tmp_path / "x_archive")
+        paths = TaskPaths.create(archive_root, "elonmusk", now=FIXED_NOW)
+        records = [
+            make_record(SID_A), make_record(SID_B), make_record(SID_C)
+        ]
+        state = TaskState(
+            task_id=paths.task_id, author_id="elonmusk",
+            start_at="2021-10-10T00:00:00+00:00",
+            end_at="2026-10-10T00:00:00+00:00",
+            enum_status=EnumStatus.PARTIAL,
+            enum_stop_reason=EnumStopReason.START_BOUNDARY,
+            unique=3,
+        )
+        TaskStateStore(paths).save(state)
+        ManifestStore(paths).rewrite(records)
+
+        handler = ScriptedHandler()
+        spy = MergeSpy()
+
+        def no_enum(*a, **k):
+            raise AssertionError(
+                "start_boundary manifest must be reused, not re-scrolled"
+            )
+
+        runner = XUserArchiveRunner(
+            handler_factory=lambda handle, args: handler,
+            enumerator_factory=no_enum,
+            merge_func=spy,
+            sleep_func=lambda d: asyncio.sleep(0),
+            clock=lambda: FIXED_NOW,
+        )
+        args = make_args(tmp_path, resume=paths.task_id)
+
+        code = runner.run(args)
+
+        # enum_status remains partial (articles channel caveat) -> exit 2
+        assert code == EXIT_PARTIAL
+        assert handler.calls == [SID_A, SID_B, SID_C]
+        assert len(spy.calls) == 1
+
+    def test_resume_refresh_enum_forces_rescroll(self, tmp_path):
+        from ytbot.services.x_user_archive.manifest import TaskPaths
+
+        archive_root = str(tmp_path / "x_archive")
+        paths = TaskPaths.create(archive_root, "elonmusk", now=FIXED_NOW)
+        records = [
+            make_record(SID_A), make_record(SID_B), make_record(SID_C)
+        ]
+        state = TaskState(
+            task_id=paths.task_id, author_id="elonmusk",
+            start_at="2021-10-10T00:00:00+00:00",
+            end_at="2026-10-10T00:00:00+00:00",
+            enum_status=EnumStatus.PARTIAL,
+            enum_stop_reason=EnumStopReason.START_BOUNDARY,
+            unique=3,
+        )
+        TaskStateStore(paths).save(state)
+        ManifestStore(paths).rewrite(records)
+
+        handler = ScriptedHandler()
+        spy = MergeSpy()
+        enum_calls = {"n": 0}
+
+        def counting_factory(extractor, options, sleep_func, preload_ids):
+            enum_calls["n"] += 1
+            # preload must carry the stored ids even though this scroll
+            # observes nothing new
+            assert preload_ids == {SID_A, SID_B, SID_C}
+            return FakeEnumerator([], complete_outcome(0))
+
+        runner = XUserArchiveRunner(
+            handler_factory=lambda handle, args: handler,
+            enumerator_factory=counting_factory,
+            merge_func=spy,
+            sleep_func=lambda d: asyncio.sleep(0),
+            clock=lambda: FIXED_NOW,
+        )
+        args = make_args(
+            tmp_path, resume=paths.task_id, refresh_enum=True
+        )
+
+        code = runner.run(args)
+
+        assert enum_calls["n"] == 1
+        assert code == EXIT_SUCCESS
+        assert handler.calls == [SID_A, SID_B, SID_C]
