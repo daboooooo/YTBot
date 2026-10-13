@@ -72,6 +72,8 @@ class EnumStopReason:
     RATE_LIMITED = "rate_limited"
     PAGE_ERROR_LIMIT = "page_error_limit"
     INTERRUPTED = "interrupted"
+    # No live scroll: prior trustworthy snapshots fully cover the window
+    INDEX_COVERAGE = "index_coverage"
     UNKNOWN = "unknown"
 
 
@@ -79,6 +81,7 @@ class SkipReason:
     OUT_OF_SCOPE = "out_of_scope"
     NO_REPOSTS = "no_reposts"
     ALREADY_ARCHIVED = "already_archived"
+    REUSED = "reused_from_archive"
 
 
 class MergedPdfStatus:
@@ -240,6 +243,8 @@ class ContentRecord:
     skip_reason: Optional[str] = None
     # Cross-check/diagnostic only: DOM time[datetime] seen at enumeration
     dom_datetime: Optional[str] = None
+    # When content was zero-copied from another task: donor task_id
+    reused_from: Optional[str] = None
 
     @property
     def key(self) -> Tuple[str, str]:
@@ -286,6 +291,7 @@ class ContentRecord:
             "attempts": self.attempts,
             "skip_reason": self.skip_reason,
             "dom_datetime": self.dom_datetime,
+            "reused_from": self.reused_from,
         }
 
     @classmethod
@@ -311,6 +317,7 @@ class ContentRecord:
             attempts=int(data.get("attempts", 0)),
             skip_reason=data.get("skip_reason"),
             dom_datetime=data.get("dom_datetime"),
+            reused_from=data.get("reused_from"),
         )
 
 

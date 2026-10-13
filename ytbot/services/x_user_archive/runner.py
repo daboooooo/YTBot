@@ -26,6 +26,7 @@ from .archiver import (
     PostArchiver,
     is_valid_content_dir,
 )
+from .catalog import build_author_catalog, load_task_records
 from .manifest import (
     ManifestStore,
     TaskPaths,
@@ -33,13 +34,16 @@ from .manifest import (
     TaskState,
     TaskStateStore,
     dedupe_merge,
+    sort_key,
 )
 from .models import (
     ContentKind,
     DownloadStatus,
     EnumStatus,
     EnumStopReason,
+    SkipReason,
     classify_target,
+    in_window,
     parse_iso_utc,
     resolve_time_window,
 )
@@ -107,8 +111,9 @@ def add_archive_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--refresh-enum", action="store_true",
         help=(
-            "With --resume: re-run timeline enumeration even when the "
-            "stored manifest already reached the window start boundary"
+            "Force a live timeline re-scroll even when trustworthy "
+            "snapshots (this task's manifest or other tasks under the "
+            "same archive dir) already cover the requested window"
         ),
     )
     g.add_argument(
@@ -159,8 +164,6 @@ def validate_archive_args(parser: argparse.ArgumentParser, args) -> None:
                 "pass --start-at/--end-at/--history-years with it"
             )
     else:
-        if getattr(args, "refresh_enum", False):
-            parser.error("--refresh-enum requires --resume")
         try:
             resolve_time_window(
                 datetime.now(timezone.utc),
@@ -257,27 +260,64 @@ class XUserArchiveRunner:
         manifest = ManifestStore(paths)
         state_store = TaskStateStore(paths)
 
+        # Cross-task catalog, rebuilt from every task under this handle.
+        # It only accelerates later work, so any failure is non-fatal.
+        try:
+            catalog = build_author_catalog(
+                args.archive_dir, handle,
+                now=self._clock(), exclude_task_id=paths.task_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("catalog build failed, running live: %s", exc)
+            catalog = None
+
         # -- phase 1: enumeration -----------------------------------------
         # Fresh tasks are "unknown". On resume the manifest is treated as
         # an immutable historical snapshot when the previous scroll either
         # completed cleanly or reached the window-start boundary (posts
         # coverage confirmed; long-form caveat is recorded separately).
-        # --refresh-enum forces a re-scroll; anything else (stall, cap,
-        # failed, interrupted) re-enumerates and merges via preload.
+        # A fresh task whose window is already fully covered by trustworthy
+        # snapshots of OTHER tasks skips the browser entirely.
+        # --refresh-enum forces a live scroll in both cases; anything else
+        # (stall, cap, failed, interrupted) re-enumerates and merges via
+        # a preload seeded from the catalog.
         enum_only = bool(getattr(args, "enum_only", False))
-        manifest_trustable = (
-            state.enum_status == EnumStatus.COMPLETE
-            or state.enum_stop_reason == EnumStopReason.START_BOUNDARY
-        )
-        if manifest_trustable and not getattr(args, "refresh_enum", False):
-            print(
-                f"ℹ️ 复用已存档清单（{state.enum_stop_reason}，"
-                f"{len(records)} 条），不重新滚动时间线；"
-                "如需刷新请加 --refresh-enum。"
+        refresh_enum = bool(getattr(args, "refresh_enum", False))
+        is_resume = bool(getattr(args, "resume", None))
+
+        if is_resume:
+            manifest_trustable = (
+                state.enum_status == EnumStatus.COMPLETE
+                or state.enum_stop_reason == EnumStopReason.START_BOUNDARY
+                or state.enum_stop_reason == EnumStopReason.INDEX_COVERAGE
             )
-            need_enum = False
+            if manifest_trustable and not refresh_enum:
+                print(
+                    f"ℹ️ 复用已存档清单（{state.enum_stop_reason}，"
+                    f"{len(records)} 条），不重新滚动时间线；"
+                    "如需刷新请加 --refresh-enum。"
+                )
+                need_enum = False
+                state.options.setdefault("enum_source", "stored")
+            else:
+                need_enum = True
         else:
-            need_enum = True
+            donors = None
+            if catalog is not None and not refresh_enum:
+                donors = catalog.covering_donors(
+                    window_start, window_end,
+                    include_replies=args.include_replies,
+                    include_reposts=not args.no_reposts,
+                )
+            if donors:
+                records = self._import_from_index(
+                    catalog, donors, window_start, window_end,
+                    args, state, manifest,
+                )
+                state_store.save(state)
+                need_enum = False
+            else:
+                need_enum = True
 
         interrupted = False
         if need_enum:
@@ -286,6 +326,9 @@ class XUserArchiveRunner:
                 outcome = await self._enumerate(
                     handler, handle, window_start, window_end, args,
                     state, manifest, records,
+                    extra_preload_ids=(
+                        catalog.known_ids() if catalog is not None else None
+                    ),
                 )
             except TimelineEnumerationError as exc:
                 state.enum_status = EnumStatus.FAILED
@@ -323,6 +366,8 @@ class XUserArchiveRunner:
             state.unique = len(canonical)
             state.options["articles_channel"] = outcome.articles_channel
             state.options["enum_warnings"] = warnings + diag
+            state.options["enum_source"] = "live"
+            state.options.pop("enum_donors", None)
             self._print_enum_summary(outcome, canonical, args, paths, state)
             state_store.save(state)
 
@@ -348,6 +393,18 @@ class XUserArchiveRunner:
             )
 
         # -- phase 2: per-post downloads ----------------------------------
+        # Zero-copy reuse first: point pending records at validated
+        # products in other tasks (no network, no file copies).
+        reused_count = self._apply_content_reuse(records, catalog)
+        if reused_count:
+            print(
+                f"ℹ️ 正文复用历史存档 {reused_count} 篇（零拷贝引用，"
+                "不重新下载）；其余按需下载。"
+            )
+            self._refresh_counters(state, records)
+            manifest.rewrite(records)
+            state_store.save(state)
+
         handler = self._handler_factory(handle, args)
         archiver = self._archiver_factory(
             handler, paths.content_root, args, self._sleep
@@ -355,12 +412,13 @@ class XUserArchiveRunner:
 
         paused_reason = None
         for index, rec in enumerate(records, 1):
-            if rec.status == DownloadStatus.PERMANENT_ERROR:
-                # spec 13.2.5: skipped by default in v1
-                continue
             if rec.status == DownloadStatus.SKIPPED and \
                     rec.archive_path and \
                     is_valid_content_dir(Path(rec.archive_path)):
+                # reused-from-archive or previously skipped product
+                continue
+            if rec.status == DownloadStatus.PERMANENT_ERROR:
+                # spec 13.2.5: skipped by default in v1
                 continue
             state.download_status = "running"
             print(
@@ -396,9 +454,13 @@ class XUserArchiveRunner:
             state.download_status = "completed"
 
         if paused_reason is not None:
+            if paused_reason.reason == "browser_closed":
+                hint = "浏览器进程异常关闭；稍后用 --resume 继续。"
+            else:
+                hint = "更新 cookies/稍后用 --resume 继续。"
             print(
                 f"⏸️ 系统性错误，任务暂停：{paused_reason.message}"
-                "\n   更新 cookies/稍后用 --resume 继续。"
+                f"\n   {hint}"
             )
         if interrupted:
             print("\n⚠️ 下载被中断，进度已保存；可用 --resume 继续。")
@@ -445,7 +507,7 @@ class XUserArchiveRunner:
     async def _enumerate(
         self, handler, handle, window_start, window_end, args,
         state: TaskState, manifest: ManifestStore,
-        prior_records: List[Any],
+        prior_records: List[Any], *, extra_preload_ids=None,
     ):
         options = EnumerateOptions(
             target_handle=handle,
@@ -458,6 +520,8 @@ class XUserArchiveRunner:
             request_delay=args.request_delay,
         )
         preload = {r.tweet_id for r in prior_records}
+        if extra_preload_ids:
+            preload |= set(extra_preload_ids)
         enumerator = self._enumerator_factory(
             handler.extractor, options, self._sleep, preload
         )
@@ -476,6 +540,106 @@ class XUserArchiveRunner:
         state.out_of_range += outcome.out_of_range
         state.invalid += outcome.invalid
         return outcome
+
+    # -- cross-task reuse --------------------------------------------------
+
+    def _import_from_index(
+        self, catalog, donor_ids, window_start, window_end,
+        args, state: TaskState, manifest: ManifestStore,
+    ) -> List[Any]:
+        """Build this task's manifest purely from other tasks' trustworthy
+        snapshots — no browser. Every imported row starts PENDING; content
+        reuse (zero-copy pointers) is resolved later from the same catalog.
+        """
+        collected: List[Any] = []
+        for donor_id in donor_ids:
+            collected.extend(
+                load_task_records(args.archive_dir, state.author_id, donor_id)
+            )
+        canonical, _ = dedupe_merge(collected)
+        wanted: List[Any] = []
+        for rec in canonical:
+            if not in_window(rec.published_at, window_start, window_end):
+                continue
+            if rec.is_reply and not args.include_replies:
+                continue
+            if rec.is_repost and args.no_reposts:
+                continue
+            rec.status = DownloadStatus.PENDING
+            rec.archive_path = None
+            rec.error_code = None
+            rec.error_message = None
+            rec.attempts = 0
+            rec.skip_reason = None
+            rec.reused_from = None
+            wanted.append(rec)
+        wanted.sort(key=sort_key)
+        manifest.rewrite(wanted)
+
+        state.enum_status = EnumStatus.COMPLETE
+        state.enum_stop_reason = EnumStopReason.INDEX_COVERAGE
+        state.raw_discovered = len(wanted)
+        state.out_of_scope = 0
+        state.out_of_range = 0
+        state.invalid = 0
+        state.unique = len(wanted)
+        state.options["enum_source"] = "index"
+        state.options["enum_donors"] = list(donor_ids)
+
+        print("-" * 64)
+        print(
+            f"枚举：复用历史清单（{EnumStopReason.INDEX_COVERAGE}，"
+            f"来自 {len(donor_ids)} 个任务，未打开浏览器）"
+        )
+        print(f"窗口内去重后 {len(wanted)} 条")
+        if wanted:
+            print(
+                f"发布跨度：{min(r.published_at for r in wanted):%Y-%m-%d}"
+                f" ~ {max(r.published_at for r in wanted):%Y-%m-%d}"
+            )
+            print("最早 3 条：")
+            for r in wanted[:3]:
+                print(f"  {r.published_at:%Y-%m-%d} {r.post_url}")
+            print("最新 3 条：")
+            for r in wanted[-3:]:
+                print(f"  {r.published_at:%Y-%m-%d} {r.post_url}")
+        print(f"清单：{manifest.paths.manifest_path}")
+        print("捐赠任务：" + ", ".join(donor_ids))
+        return wanted
+
+    def _apply_content_reuse(self, records, catalog) -> int:
+        """Point records at validated products owned by other tasks.
+
+        Only rows that would otherwise need work are considered; a
+        referenced product is re-validated on disk right now, so a deleted
+        donor simply downgrades the row back to normal downloading.
+        """
+        if catalog is None:
+            return 0
+        reused = 0
+        for rec in records:
+            if rec.status == DownloadStatus.DOWNLOADED:
+                continue
+            if rec.status == DownloadStatus.SKIPPED \
+                    and not rec.reused_from:
+                continue
+            saved = catalog.saved(rec.tweet_id)
+            if saved is None or not is_valid_content_dir(
+                saved.archive_path
+            ):
+                continue
+            rec.status = DownloadStatus.SKIPPED
+            rec.archive_path = str(saved.archive_path)
+            rec.skip_reason = SkipReason.REUSED
+            rec.reused_from = saved.task_id
+            rec.error_code = None
+            rec.error_message = None
+            if rec.content_type == ContentKind.UNKNOWN:
+                rec.content_type = saved.content_type
+            if not rec.title and saved.title:
+                rec.title = saved.title
+            reused += 1
+        return reused
 
     # -- phase 2 -----------------------------------------------------------
 
@@ -585,6 +749,7 @@ class XUserArchiveRunner:
     ) -> dict:
         posts = [r for r in records if r.content_type != ContentKind.ARTICLE]
         articles = [r for r in records if r.content_type == ContentKind.ARTICLE]
+        reused = [r for r in records if r.reused_from]
         errors = {}
         for r in records:
             if r.error_code:
@@ -621,6 +786,10 @@ class XUserArchiveRunner:
             "out_of_scope": state.out_of_scope,
             "downloaded": state.downloaded,
             "skipped": state.skipped,
+            "reused_posts": len(reused),
+            "reused_from_tasks": sorted({r.reused_from for r in reused}),
+            "enum_source": state.options.get("enum_source", "live"),
+            "enum_donor_task_ids": state.options.get("enum_donors", []),
             "retryable_failed": state.retryable_failed,
             "permanent_failed": state.permanent_failed,
             "retries": state.retries,
@@ -705,10 +874,14 @@ class XUserArchiveRunner:
         print(f"  枚举：{state.enum_status}（{state.enum_stop_reason}）")
         print(f"  发现/去重：{state.raw_discovered}/{state.unique}")
         if not dry_run:
-            print(f"  已下载：{state.downloaded}，跳过：{state.skipped}，"
+            reused_n = report.get("reused_posts", 0)
+            print(f"  已下载：{state.downloaded}，跳过：{state.skipped}"
+                  f"（其中跨任务零拷贝复用：{reused_n}），"
                   f"可重试失败：{state.retryable_failed}，"
                   f"永久失败：{state.permanent_failed}，"
                   f"重试次数：{state.retries}")
+            if report.get("enum_source") == "index":
+                print(f"  枚举来源：历史清单（{len(report.get('enum_donor_task_ids', []))} 个捐赠任务，未联网滚动）")
             if mp.get("status") not in ("not_generated", None):
                 print(f"  合订 PDF：{mp.get('status')} "
                       f"收录 {mp.get('included_posts', 0)}/"
@@ -739,6 +912,16 @@ class XUserArchiveRunner:
                 ):
                     rec.status = DownloadStatus.PENDING
                     rec.archive_path = None
+            elif rec.status == DownloadStatus.SKIPPED and rec.reused_from:
+                # Zero-copy pointer into another task: re-validate; a
+                # vanished donor product means this row needs downloading.
+                if not rec.archive_path or not is_valid_content_dir(
+                    Path(rec.archive_path)
+                ):
+                    rec.status = DownloadStatus.PENDING
+                    rec.archive_path = None
+                    rec.reused_from = None
+                    rec.skip_reason = None
         return paths, state, canonical
 
 

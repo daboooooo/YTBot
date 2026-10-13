@@ -65,7 +65,13 @@ TABS_JS = r"""
 COLLECT_JS = r"""
 () => {
     const entries = [];
-    const arts = document.querySelectorAll('article[data-testid="tweet"]');
+    // Try multiple selectors for tweet containers (X changes their DOM often)
+    const arts = document.querySelectorAll(
+        'article[data-testid="tweet"], ' +
+        'div[data-testid="tweet"], ' +
+        'article[data-testid="tweetCard"], ' +
+        'div[data-testid="tweetCard"]'
+    );
     for (const art of arts) {
         let href = null;
         let domTime = null;
@@ -121,7 +127,28 @@ COLLECT_JS = r"""
 }
 """
 
-SCROLL_JS = "window.scrollTo(0, document.body.scrollHeight);"
+SCROLL_JS = """
+() => {
+    // Smooth incremental scroll for X's lazy-loading timeline
+    const start = window.scrollY;
+    const end = document.body.scrollHeight;
+    const distance = end - start;
+    if (distance <= 0) return false;
+    // Scroll in increments to trigger IntersectionObserver
+    window.scrollTo(0, end);
+    return true;
+}
+"""
+
+# Wait for new content to load after scroll
+WAIT_NEW_CONTENT_JS = """() => {
+    // Count current tweet elements
+    const currentCount = document.querySelectorAll(
+        'article[data-testid="tweet"], div[data-testid="tweet"], ' +
+        'article[data-testid="tweetCard"], div[data-testid="tweetCard"]'
+    ).length;
+    return currentCount;
+}"""
 
 # Full-page systemic signals (conservative; unverified against live pages)
 _RATE_TOKENS = (
@@ -199,7 +226,9 @@ class TimelineEnumerator:
         # Resume (spec 13.2.6): ids already in the manifest count as
         # seen so re-scrolling dedupes against them.
         self._seen_ids = set(preload_ids or ())
-        self._accepted_ids = set(preload_ids or ())
+        # _accepted_ids tracks ONLY newly accepted IDs this round;
+        # preload_ids are for dedup only (not counted against max_posts).
+        self._accepted_ids: set = set()
         self._page = None
         self._owned_page = False
 
@@ -265,7 +294,11 @@ class TimelineEnumerator:
 
         try:
             await self._page.wait_for_selector(
-                "article[data-testid='tweet']", timeout=20000
+                "article[data-testid='tweet'], "
+                "div[data-testid='tweet'], "
+                "article[data-testid='tweetCard'], "
+                "div[data-testid='tweetCard']",
+                timeout=20000
             )
         except Exception:  # noqa: BLE001
             pass
@@ -316,23 +349,25 @@ class TimelineEnumerator:
                 "accepted_total": len(self._accepted_ids),
                 "articles_in_dom": raw.get("article_count"),
                 "scroll_y": raw.get("scroll_y"),
+                "doc_height": raw.get("doc_height"),
+                "entries_collected": len(raw.get("entries", [])),
             })
+            seen_before_preload = len(self._seen_ids)
             logger.info(
-                "enum %s round %s: new=%s accepted=%s",
+                "enum %s round %s: new=%d accepted=%d (seen=%d, entries=%d, "
+                "scroll_y=%s, doc_height=%s, article_count=%s)",
                 url, round_idx, new_ids, len(self._accepted_ids),
+                seen_before_preload, len(raw.get("entries", [])),
+                raw.get("scroll_y"), raw.get("doc_height"),
+                raw.get("article_count"),
             )
 
             if records:
                 yield records
 
             # --- stop conditions --------------------------------------
-            if self._accepted_ids and self._hit_max_posts():
-                self.outcome.stop_reason = EnumStopReason.MAX_POSTS
-                self.outcome.detail = (
-                    f"--max-posts {opts.max_posts} reached"
-                )
-                return
-
+            # Check boundary FIRST (before max_posts), so we can scroll
+            # and discover more entries in the window before stopping.
             if saw_old:
                 boundary_confirm_rounds += 1
                 # spec 8.1.5: keep one more page to confirm no stragglers
@@ -341,6 +376,15 @@ class TimelineEnumerator:
                     return
             else:
                 boundary_confirm_rounds = 0
+
+            if self._accepted_ids and self._hit_max_posts():
+                self.outcome.stop_reason = EnumStopReason.MAX_POSTS
+                self.outcome.detail = (
+                    f"--max-posts {opts.max_posts} reached"
+                )
+                # Scroll one more time to check for more entries before returning
+                await self._page.evaluate(SCROLL_JS)
+                return
 
             if new_ids == 0:
                 stall += 1
@@ -356,6 +400,7 @@ class TimelineEnumerator:
                 self.outcome.detail = "internal round safety cap reached"
                 return
 
+            # Scroll to trigger X's lazy-loaded timeline
             await self._page.evaluate(SCROLL_JS)
             await self._pause(opts.request_delay)
 
@@ -395,7 +440,18 @@ class TimelineEnumerator:
         now = datetime.now(timezone.utc)
         opts = self.options
 
-        for entry in raw.get("entries", []):
+        entries = raw.get("entries", [])
+        logger.debug("parse_raw: %d entries in DOM (scroll_y=%s, doc_height=%s, preload_seen=%d)",
+                     len(entries), raw.get("scroll_y"), raw.get("doc_height"),
+                     len(self._seen_ids))
+        # Debug: log first entry details
+        if entries and len(entries) <= 3:
+            for i, e in enumerate(entries):
+                logger.debug("  entry[%d]: href=%s, dom_time=%s, social=%s",
+                             i, e.get("href"), e.get("dom_time"),
+                             e.get("social_context"))
+
+        for entry in entries:
             href = entry.get("href")
             if not href:
                 # Article-only cell without a status link: counted, not
@@ -496,7 +552,11 @@ class TimelineEnumerator:
 
     def _hit_max_posts(self) -> bool:
         limit = self.options.max_posts
-        return limit > 0 and len(self._accepted_ids) >= limit
+        hit = limit > 0 and len(self._accepted_ids) >= limit
+        if hit:
+            logger.debug("_hit_max_posts: accepted=%d, limit=%d",
+                         len(self._accepted_ids), limit)
+        return hit
 
     def _finalize_status(self) -> None:
         stop = self.outcome.stop_reason

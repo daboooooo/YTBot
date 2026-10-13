@@ -39,6 +39,8 @@ SID_3 = "1895000000000000789"
 # self); production archiver uses the handler's own method.
 def _parse_twitter_error(error_msg: str) -> str:
     low = error_msg.lower()
+    if "target page, context or browser has been closed" in low:
+        return "ERROR_BROWSER_CLOSED"
     if "登录失败" in error_msg or "重新登录" in error_msg:
         return "ERROR_LOGIN_FAILED"
     if "rate limit" in low or "速率限制" in error_msg:
@@ -364,6 +366,46 @@ class TestRetryClassification:
         assert exc.value.reason == "login_failed"
         assert rec.status == DownloadStatus.RETRYABLE_ERROR
         assert len(handler.calls) == 1
+
+    def test_browser_closed_result_is_systemic_pause(self, root):
+        # The exact failure that burned 84 posts in the archive incident:
+        # every post returns TargetClosedError text; it must pause the
+        # whole task immediately instead of 3 blind retries per post.
+        handler = FakeHandler([
+            ("fail",
+             "BrowserContext.new_page: Target page, context or browser "
+             "has been closed"),
+        ])
+        arch, sleeps = make_archiver(handler, root)
+        rec = make_record(SID_1)
+
+        with pytest.raises(ArchivePause) as exc:
+            asyncio.new_event_loop().run_until_complete(arch.archive(rec))
+
+        assert exc.value.code == "ERROR_BROWSER_CLOSED"
+        assert exc.value.reason == "browser_closed"
+        assert rec.status == DownloadStatus.RETRYABLE_ERROR
+        assert rec.error_code == "ERROR_BROWSER_CLOSED"
+        assert len(handler.calls) == 1
+        assert sleeps == []
+
+    def test_browser_closed_exception_is_systemic_pause(self, root):
+        handler = FakeHandler([
+            ("raise",
+             RuntimeError(
+                 "Page.wait_for_timeout: Target page, context or browser "
+                 "has been closed"
+             )),
+        ])
+        arch, sleeps = make_archiver(handler, root)
+        rec = make_record(SID_1)
+
+        with pytest.raises(ArchivePause) as exc:
+            asyncio.new_event_loop().run_until_complete(arch.archive(rec))
+
+        assert exc.value.code == "ERROR_BROWSER_CLOSED"
+        assert len(handler.calls) == 1
+        assert sleeps == []
 
     @pytest.mark.parametrize("message,code", [
         ("tweet not found", "ERROR_TWEET_NOT_FOUND"),

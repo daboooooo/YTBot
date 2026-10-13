@@ -28,7 +28,7 @@ from .models import (
 logger = get_logger(__name__)
 
 # Error codes produced by TwitterHandler._parse_twitter_error
-SYSTEMIC_CODES = {"ERROR_LOGIN_FAILED"}
+SYSTEMIC_CODES = {"ERROR_LOGIN_FAILED", "ERROR_BROWSER_CLOSED"}
 PERMANENT_CODES = {
     "ERROR_TWEET_NOT_FOUND",
     "ERROR_ACCOUNT_SUSPENDED",
@@ -36,6 +36,9 @@ PERMANENT_CODES = {
 }
 RETRYABLE_CODES = {"ERROR_RATE_LIMITED", "ERROR_TWITTER_UNKNOWN"}
 _NETWORK_HINTS = ("timeout", "timed out", "connection", "temporarily")
+# Playwright's TargetClosedError text: the browser process itself died,
+# so blind per-post backoff retries cannot help.
+_BROWSER_CLOSED_HINT = "target page, context or browser has been closed"
 
 
 class ArchivePause(Exception):
@@ -151,8 +154,13 @@ class PostArchiver:
 
             if last_code in SYSTEMIC_CODES:
                 record.status = DownloadStatus.RETRYABLE_ERROR
+                reason = (
+                    "browser_closed"
+                    if last_code == "ERROR_BROWSER_CLOSED"
+                    else "login_failed"
+                )
                 raise ArchivePause(
-                    "login_failed", last_code, last_message
+                    reason, last_code, last_message
                 )
             if last_code in PERMANENT_CODES:
                 record.status = DownloadStatus.PERMANENT_ERROR
@@ -223,6 +231,8 @@ class PostArchiver:
             except Exception:  # noqa: BLE001
                 pass
         low = (message or "").lower()
+        if _BROWSER_CLOSED_HINT in low:
+            return "ERROR_BROWSER_CLOSED"
         if "登录" in message or "login" in low:
             return "ERROR_LOGIN_FAILED"
         if "rate limit" in low or "速率" in message:
@@ -230,6 +240,8 @@ class PostArchiver:
         return "ERROR_TWITTER_UNKNOWN"
 
     def _classify_exception(self, exc: Exception) -> str:
+        if _BROWSER_CLOSED_HINT in str(exc).lower():
+            return "ERROR_BROWSER_CLOSED"
         if isinstance(exc, asyncio.TimeoutError):
             return "ERROR_RATE_LIMITED"
         low = str(exc).lower()

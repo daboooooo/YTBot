@@ -271,12 +271,12 @@ class TestCliValidation:
                 "--no-merged-pdf", "--merged-pdf", "out.pdf",
             )
 
-    def test_refresh_enum_requires_resume(self):
-        with pytest.raises(SystemExit):
-            self._parse(
-                self._parser(),
-                "--archive-x-user", "bob", "--refresh-enum",
-            )
+    def test_refresh_enum_allowed_without_resume(self):
+        args = self._parse(
+            self._parser(),
+            "--archive-x-user", "bob", "--refresh-enum",
+        )
+        assert args.refresh_enum is True
 
     def test_enum_only_conflicts_with_resume(self):
         with pytest.raises(SystemExit):

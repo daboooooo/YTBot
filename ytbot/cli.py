@@ -487,6 +487,10 @@ X user archive (no Telegram, no process lock):
   ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000
   ytbot --resume <task> --refresh-enum               # force re-enumeration
 
+Cross-task reuse: trustworthy snapshots and saved posts under the same
+--archive-dir are indexed automatically; a new task whose window is fully
+covered skips scrolling, and already-saved posts are referenced zero-copy.
+
 Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
             1 download/enumeration/merged-PDF failure.
         """

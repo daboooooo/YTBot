@@ -111,14 +111,58 @@ class TwitterContentExtractor:
     Extracts content from Twitter/X using Playwright to bypass anti-bot protection
     """
 
+    # Playwright raises this text on every API call once the browser
+    # process crashed/was killed; used to trigger one browser restart.
+    BROWSER_CLOSED_HINT = "target page, context or browser has been closed"
+
     def __init__(self):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self._playwright = None
         self._using_shared_browser = False
+        # True while a one-off standalone browser launched by
+        # _retry_without_cookies is in use; scrape_tweet tears it down in
+        # its finally so it never leaks into the next scrape.
+        self._ephemeral_browser = False
         self._login_checked = False
         self._login_valid = False
         self._http_session: Optional[aiohttp.ClientSession] = None
+
+    def _standalone_alive(self) -> bool:
+        """Whether the standalone browser process is still connected."""
+        if self.browser is None:
+            return False
+        try:
+            return bool(self.browser.is_connected())
+        except Exception:
+            return False
+
+    async def _dispose_standalone(self) -> None:
+        """Close standalone (non-shared) context/browser/playwright.
+
+        Errors from already-dead targets are swallowed: this is also the
+        reset path after a browser crash. Context is closed before the
+        browser (closing the browser already kills its contexts).
+        """
+        if self.context is not None:
+            try:
+                await self.context.close()
+            except Exception as e:
+                logger.debug(f"Error closing standalone context: {e}")
+            self.context = None
+        if self.browser is not None:
+            try:
+                await self.browser.close()
+            except Exception as e:
+                logger.debug(f"Error closing standalone browser: {e}")
+            self.browser = None
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping playwright: {e}")
+            self._playwright = None
+        self._using_shared_browser = False
 
     @staticmethod
     def _clean_tweet_url(url: str) -> str:
@@ -377,6 +421,9 @@ class TwitterContentExtractor:
         try:
             from playwright.async_api import async_playwright
             pw = await async_playwright().start()
+            # Track the driver before launch so a launch failure is cleaned
+            # up by _dispose_standalone().
+            self._playwright = pw
             self.browser = await pw.chromium.launch(
                 headless=True,
                 args=[
@@ -388,6 +435,9 @@ class TwitterContentExtractor:
                     '--disable-gpu',
                 ]
             )
+            # This standalone browser is one-off: scrape_tweet's finally
+            # tears it down so it can never leak into the next scrape.
+            self._ephemeral_browser = True
             user_agent = (
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -417,7 +467,6 @@ class TwitterContentExtractor:
                 };
             """)
             self._using_shared_browser = False
-            self._playwright = pw
 
             new_page = await self.context.new_page()
             await new_page.set_extra_http_headers({
@@ -439,24 +488,34 @@ class TwitterContentExtractor:
                         "cookies were invalid"
                     )
                     return new_page
-                else:
-                    logger.warning(
-                        "Anonymous access returned 200 but no content"
-                    )
+                logger.warning(
+                    "Anonymous access returned 200 but no content"
+                )
             else:
                 logger.warning(
                     f"Anonymous access also failed: {status}"
                 )
 
-            return new_page
+            # Anonymous access unusable: destroy the one-off browser and
+            # let scrape_tweet return a proper failure instead of parsing
+            # an error page.
+            try:
+                await new_page.close()
+            except Exception:
+                pass
+            await self._dispose_standalone()
+            self._ephemeral_browser = False
+            return None
 
         except Exception as e:
             logger.error(f"Error during anonymous retry: {e}")
+            await self._dispose_standalone()
+            self._ephemeral_browser = False
             raise
 
     async def initialize_browser(self, force_new: bool = False):
         """Initialize Playwright browser with anti-detection measures.
-        
+
         Args:
             force_new: If True, always create a new browser instance instead of using shared one
         """
@@ -466,6 +525,19 @@ class TwitterContentExtractor:
                 "Install with: pip install playwright && playwright install chromium"
             )
 
+        # A crashed standalone browser must not be mistaken for a healthy
+        # instance: dispose its zombie objects before choosing a path.
+        if (
+            self.browser is not None
+            and not self._using_shared_browser
+            and not self._standalone_alive()
+        ):
+            logger.warning(
+                "Standalone browser is disconnected; cleaning up before init"
+            )
+            await self._dispose_standalone()
+            self._ephemeral_browser = False
+
         if force_new:
             await self._initialize_new_browser()
             return
@@ -473,7 +545,7 @@ class TwitterContentExtractor:
         try:
             from ytbot.core.browser_manager import get_browser_manager
             manager = await get_browser_manager()
-            
+
             if not manager.is_initialized:
                 initialized = await manager.initialize()
                 if not initialized:
@@ -483,10 +555,17 @@ class TwitterContentExtractor:
                     )
                     await self._initialize_new_browser()
                     return
-            
+
+            # Replace any shared context carried over from enumeration or
+            # a previous scrape instead of accumulating contexts inside
+            # one long-lived browser process.
+            if self.context is not None and self._using_shared_browser:
+                await manager.close_context(self.context)
+                self.context = None
+
             cookies = self._load_twitter_cookies()
             context = await manager.create_context(cookies=cookies)
-            
+
             if context:
                 self.context = context
                 self._using_shared_browser = True
@@ -497,7 +576,7 @@ class TwitterContentExtractor:
                     "falling back to new instance"
                 )
                 await self._initialize_new_browser()
-                
+
         except ImportError:
             logger.warning("Browser manager not available, using standalone browser")
             await self._initialize_new_browser()
@@ -505,127 +584,162 @@ class TwitterContentExtractor:
             logger.warning(f"Error using shared browser: {e}, falling back to new instance")
             await self._initialize_new_browser()
 
+    async def reset_browser(self):
+        """Drop every dead browser/context reference so the next
+        initialize_browser() builds a fresh, connected instance."""
+        if self._using_shared_browser:
+            from ytbot.core.browser_manager import get_browser_manager
+            manager = await get_browser_manager()
+            self.context = None
+            self._using_shared_browser = False
+            await manager.reset_if_disconnected()
+        else:
+            await self._dispose_standalone()
+            self._ephemeral_browser = False
+
     async def _initialize_new_browser(self):
-        """Initialize a new standalone browser instance"""
+        """Initialize a new standalone browser instance.
+
+        Any pre-existing standalone instance (including a crashed one) is
+        fully torn down first — never silently reused.
+        """
         check_and_install_browser()
 
-        if self.browser is None:
-            self._playwright = await async_playwright().start()
+        if (
+            self.browser is not None
+            or self.context is not None
+            or self._playwright is not None
+        ):
+            if self._using_shared_browser:
+                # Only the context belongs to us; the shared browser is
+                # managed by BrowserManager.
+                if self.context is not None:
+                    from ..core.browser_manager import BrowserManager
+                    mgr = await BrowserManager.get_instance()
+                    await mgr.close_context(self.context)
+                self.context = None
+                self._using_shared_browser = False
+            else:
+                await self._dispose_standalone()
 
-            # Launch browser with anti-detection settings
-            self.browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu',
-                    '--disable-web-security',
-                    '--allow-running-insecure-content',
-                    '--disable-features=VizDisplayCompositor',
-                    '--disable-extensions',
-                    '--disable-ipc-flooding-protection',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                ]
-            )
+        self._ephemeral_browser = False
+        self._playwright = await async_playwright().start()
 
-            # Create context with realistic settings
-            user_agent = (
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
-                '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-            )
-            self.context = await self.browser.new_context(
-                user_agent=user_agent,
-                viewport={'width': 1920, 'height': 1080},
-                timezone_id='Asia/Shanghai',
-                locale='zh-CN,zh;q=0.9,en;q=0.8',
-                geolocation={'longitude': 121.4737, 'latitude': 31.2304},
-                permissions=['geolocation']
-            )
+        # Launch browser with anti-detection settings
+        self.browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--allow-running-insecure-content',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-extensions',
+                '--disable-ipc-flooding-protection',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+            ]
+        )
 
-            # 加载并添加 cookies
-            cookies = self._load_twitter_cookies()
-            if cookies:
-                await self.context.add_cookies(cookies)
-                logger.info(f"Added {len(cookies)} cookies to browser context")
+        # Create context with realistic settings
+        user_agent = (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        )
+        self.context = await self.browser.new_context(
+            user_agent=user_agent,
+            viewport={'width': 1920, 'height': 1080},
+            timezone_id='Asia/Shanghai',
+            locale='zh-CN,zh;q=0.9,en;q=0.8',
+            geolocation={'longitude': 121.4737, 'latitude': 31.2304},
+            permissions=['geolocation']
+        )
 
-            # Inject anti-detection scripts
-            await self.context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
+        # 加载并添加 cookies
+        cookies = self._load_twitter_cookies()
+        if cookies:
+            await self.context.add_cookies(cookies)
+            logger.info(f"Added {len(cookies)} cookies to browser context")
 
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => ({
-                        length: 5,
-                        0: { filename: 'internal-pdf-viewer',
-                             name: 'Chrome PDF Plugin',
-                             description: 'Portable Document Format' },
-                        1: { filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-                             name: 'Chrome PDF Viewer',
-                             description: '' },
-                        2: { filename: 'internal-nacl-plugin',
-                             name: 'Native Client',
-                             description: '' },
-                        3: { filename: 'widevinecdmadapter',
-                             name: 'Widevine Content Decryption Module',
-                             description: 'Enables Widevine licenses for DRM content' },
-                        4: { filename: 'oehmokhphbnpkaceddhaklhamklcpgec',
-                             name: 'CryptoTokenExtension',
-                             description: 'CryptoToken Extension' },
-                        refresh: () => {},
-                    }),
-                });
+        # Inject anti-detection scripts
+        await self.context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
 
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['zh-CN', 'zh', 'en-US', 'en'],
-                });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => ({
+                    length: 5,
+                    0: { filename: 'internal-pdf-viewer',
+                         name: 'Chrome PDF Plugin',
+                         description: 'Portable Document Format' },
+                    1: { filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+                         name: 'Chrome PDF Viewer',
+                         description: '' },
+                    2: { filename: 'internal-nacl-plugin',
+                         name: 'Native Client',
+                         description: '' },
+                    3: { filename: 'widevinecdmadapter',
+                         name: 'Widevine Content Decryption Module',
+                         description: 'Enables Widevine licenses for DRM content' },
+                    4: { filename: 'oehmokhphbnpkaceddhaklhamklcpgec',
+                         name: 'CryptoTokenExtension',
+                         description: 'CryptoToken Extension' },
+                    refresh: () => {},
+                }),
+            });
 
-                Object.defineProperty(navigator, 'platform', {
-                    get: () => 'MacIntel',
-                });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['zh-CN', 'zh', 'en-US', 'en'],
+            });
 
-                Object.defineProperty(navigator, 'hardwareConcurrency', {
-                    get: () => 8,
-                });
+            Object.defineProperty(navigator, 'platform', {
+                get: () => 'MacIntel',
+            });
 
-                Object.defineProperty(navigator, 'deviceMemory', {
-                    get: () => 8,
-                });
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8,
+            });
 
-                window.chrome = {
-                    runtime: {},
-                    loadTimes: function() {},
-                    csi: function() {},
-                    app: {},
-                };
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8,
+            });
 
-                Object.defineProperty(navigator, 'connection', {
-                    get: () => ({
-                        effectiveType: '4g',
-                        rtt: 50,
-                        downlink: 10,
-                        saveData: false,
-                    }),
-                });
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {},
+            };
 
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
-            """)
+            Object.defineProperty(navigator, 'connection', {
+                get: () => ({
+                    effectiveType: '4g',
+                    rtt: 50,
+                    downlink: 10,
+                    saveData: false,
+                }),
+            });
+
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
 
     async def close_browser(self):
         """Close the browser instance and cleanup resources"""
         if self._using_shared_browser:
-            # Properly close the shared browser context to prevent memory leak
+            # Return the per-use context to the manager so it does not
+            # accumulate in the shared browser process.
             from ..core.browser_manager import BrowserManager
             browser_mgr = await BrowserManager.get_instance()
             if self.context:
@@ -634,15 +748,8 @@ class TwitterContentExtractor:
             self._using_shared_browser = False
             return
 
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-        if self.context:
-            await self.context.close()
-            self.context = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
+        await self._dispose_standalone()
+        self._ephemeral_browser = False
 
         # Close the shared HTTP session
         await self.close_http_session()
@@ -2437,6 +2544,24 @@ class TwitterContentExtractor:
         return markdown
 
     async def scrape_tweet(self, url: str) -> Dict[str, Any]:
+        """Scrape a tweet, transparently recovering once from a browser
+        crash (TargetClosedError). If the second attempt dies the same
+        way, the failure result is returned for the caller/archiver to
+        classify as a systemic browser error."""
+        result = await self._scrape_tweet_once(url)
+        if result.get("success"):
+            return result
+        error = result.get("error", "") or ""
+        if self.BROWSER_CLOSED_HINT in error.lower():
+            logger.warning(
+                "Browser was closed mid-scrape; resetting browser and "
+                "retrying once"
+            )
+            await self.reset_browser()
+            return await self._scrape_tweet_once(url)
+        return result
+
+    async def _scrape_tweet_once(self, url: str) -> Dict[str, Any]:
         """
         Scrape tweet content from URL
 
@@ -2452,9 +2577,10 @@ class TwitterContentExtractor:
         if clean_url != url:
             logger.info(f"Cleaned URL: {clean_url} (removed tracking params)")
 
-        page = await self.context.new_page()
+        page = None
 
         try:
+            page = await self.context.new_page()
             # Set HTTP headers (简化headers，避免影响页面渲染)
             await page.set_extra_http_headers({
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -2483,6 +2609,15 @@ class TwitterContentExtractor:
                     page = await self._retry_without_cookies(
                         page, clean_url
                     )
+                    if page is None:
+                        return {
+                            'success': False,
+                            'error': (
+                                '匿名访问也未获取到内容，'
+                                'cookies 可能已失效，请更新 cookies'
+                            ),
+                            'url': url,
+                        }
             elif initial_status == 403:
                 # 403 with cookies likely means cookies are invalid
                 # X returns 403 for invalid auth instead of anonymous access
@@ -2493,6 +2628,15 @@ class TwitterContentExtractor:
                 page = await self._retry_without_cookies(
                     page, clean_url
                 )
+                if page is None:
+                    return {
+                        'success': False,
+                        'error': (
+                            '匿名访问也被拒绝 (403)，'
+                            'cookies 可能已失效，请更新 cookies'
+                        ),
+                        'url': url,
+                    }
             else:
                 logger.warning(f"Page returned status {initial_status}")
                 await self._wait_for_content(page)
@@ -2636,17 +2780,34 @@ class TwitterContentExtractor:
                     f"({len(result['content'])} chars, {len(result['images'])} images)"
                 )
 
-            await page.close()
             return result
 
         except Exception as e:
             logger.error(f"Failed to scrape tweet: {e}")
-            await page.close()
             return {
                 'success': False,
                 'error': str(e),
                 'url': url
             }
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            # Resource lifecycle: shared contexts are created per scrape
+            # and must be returned to the manager here (otherwise dozens
+            # accumulate in one browser process); the one-off anonymous
+            # browser is torn down completely.
+            if self._ephemeral_browser:
+                await self._dispose_standalone()
+                self._ephemeral_browser = False
+            elif self._using_shared_browser and self.context is not None:
+                from ytbot.core.browser_manager import get_browser_manager
+                mgr = await get_browser_manager()
+                await mgr.close_context(self.context)
+                self.context = None
+                self._using_shared_browser = False
 
 
 class TwitterHandler(PlatformHandler):
@@ -2664,6 +2825,8 @@ class TwitterHandler(PlatformHandler):
 
     def _parse_twitter_error(self, error_msg: str) -> str:
         error_lower = error_msg.lower()
+        if 'target page, context or browser has been closed' in error_lower:
+            return "ERROR_BROWSER_CLOSED"
         if '登录失败' in error_msg or '重新登录' in error_msg:
             return "ERROR_LOGIN_FAILED"
         if 'rate limit' in error_lower or '速率限制' in error_msg:

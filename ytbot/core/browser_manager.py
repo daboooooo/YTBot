@@ -75,9 +75,17 @@ class BrowserManager:
             
         async with self._lock:
             if self._browser is not None:
-                logger.debug("Browser already initialized")
-                return True
-                
+                if self._is_browser_connected():
+                    logger.debug("Browser already initialized")
+                    return True
+                # Browser object exists but the process crashed/was killed.
+                # Tear the corpse down and fall through to relaunch instead
+                # of pretending the instance is healthy.
+                logger.warning(
+                    "Shared browser is disconnected; rebuilding it"
+                )
+                await self._dispose_locked()
+
             if self._shutdown:
                 logger.error("Browser manager has been shut down")
                 return False
@@ -115,7 +123,10 @@ class BrowserManager:
                 
             except Exception as e:
                 logger.error(f"❌ Failed to initialize browser: {e}")
-                await self._cleanup()
+                # A failed launch is transient (e.g. binary/resource issue):
+                # dispose without setting the one-way shutdown latch so a
+                # later initialize() can retry.
+                await self._dispose_locked()
                 return False
     
     async def create_context(
@@ -136,8 +147,13 @@ class BrowserManager:
             BrowserContext or None if failed
         """
         async with self._lock:
-            if self._browser is None:
-                logger.error("Browser not initialized")
+            if not self._is_browser_connected():
+                logger.error(
+                    "Browser not initialized or has been closed"
+                )
+                # Drop the dead instance so the next initialize() relaunches
+                # a real browser instead of reusing a zombie object.
+                await self._dispose_locked()
                 return None
                 
             try:
@@ -189,6 +205,11 @@ class BrowserManager:
                 
             except Exception as e:
                 logger.error(f"❌ Failed to create browser context: {e}")
+                # If the browser itself died, drop it so initialize()
+                # relaunches; other failures (e.g. bad cookies) keep the
+                # healthy browser alive.
+                if not self._is_browser_connected():
+                    await self._dispose_locked()
                 return None
     
     async def close_context(self, context: BrowserContext):
@@ -236,11 +257,38 @@ class BrowserManager:
         """Force shutdown the browser manager."""
         async with self._lock:
             await self._cleanup()
+
+    async def reset_if_disconnected(self) -> bool:
+        """Dispose the browser if its process has died.
+
+        Unlike shutdown() this does not set the one-way ``_shutdown``
+        latch, so a later initialize() relaunches a fresh browser.
+
+        Returns:
+            bool: True if a connected browser is still available.
+        """
+        async with self._lock:
+            if self._browser is not None and self._is_browser_connected():
+                return True
+            if self._browser is not None:
+                logger.warning(
+                    "Shared browser has been closed; disposing for relaunch"
+                )
+                await self._dispose_locked()
+            return False
     
     async def _cleanup(self):
-        """Internal cleanup method."""
+        """Full teardown after an explicit shutdown (one-way latch)."""
         self._shutdown = True
-        
+        await self._dispose_locked()
+
+    async def _dispose_locked(self):
+        """Close all contexts/browser/playwright and reset instance state.
+
+        Unlike ``_cleanup`` this does NOT set ``_shutdown``, so a crashed
+        browser can be replaced by a later ``initialize()``. Callers must
+        already hold ``self._lock`` (asyncio locks are not reentrant).
+        """
         # Close all contexts
         for context in self._contexts[:]:
             try:
@@ -248,7 +296,7 @@ class BrowserManager:
             except Exception as e:
                 logger.warning(f"⚠️ Error closing context during cleanup: {e}")
         self._contexts.clear()
-        
+
         # Close browser
         if self._browser:
             try:
@@ -257,7 +305,7 @@ class BrowserManager:
             except Exception as e:
                 logger.warning(f"⚠️ Error closing browser: {e}")
             self._browser = None
-        
+
         # Stop playwright
         if self._playwright:
             try:
@@ -266,13 +314,26 @@ class BrowserManager:
             except Exception as e:
                 logger.warning(f"⚠️ Error stopping playwright: {e}")
             self._playwright = None
-        
+
         self._ref_count = 0
-    
+
+    def _is_browser_connected(self) -> bool:
+        """True only when the browser object exists and its process is alive."""
+        if self._browser is None:
+            return False
+        try:
+            return bool(self._browser.is_connected())
+        except Exception:
+            return False
+
     @property
     def is_initialized(self) -> bool:
-        """Check if browser is initialized."""
-        return self._browser is not None and not self._shutdown
+        """Check if browser is initialized AND still connected."""
+        return (
+            self._browser is not None
+            and not self._shutdown
+            and self._is_browser_connected()
+        )
     
     @property
     def reference_count(self) -> int:

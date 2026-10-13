@@ -199,7 +199,7 @@ ytbot --resume ./x_archive/elonmusk/tasks/20261010T153000 --refresh-enum
 | `--dry-run` | off | preview only: enumerate + manifest, report only |
 | `--enum-only` | off | phase 1 only: persist the manifest snapshot, download later via `--resume` |
 | `--resume TASK` | — | resume a task directory/id with its fixed window |
-| `--refresh-enum` | off | with `--resume`, force re-enumeration even when the stored manifest reached the window boundary |
+| `--refresh-enum` | off | force a live re-scroll even when trustworthy snapshots (this task or others) already cover the window |
 | `--include-replies` | off | also scroll `/with_replies` |
 | `--no-reposts` | off | exclude reposts (kept by default) |
 | `--max-posts N` | `1000` | unique-post safety cap (`0` = unlimited); cap hit → `partial` |
@@ -212,6 +212,30 @@ Exit codes: `0` = complete enumeration and all downloads/PDF ok;
 `2` = enumeration `partial` but downloads and merged PDF ok;
 `1` = download/enumeration/merged-PDF failure (including missing
 `pypdf`; install it with `pip install pypdf` and `--resume`).
+
+#### Cross-task reuse (fast small windows)
+
+Historical posts are immutable unless the author deletes them, so every
+run rebuilds an author-level index at
+`<archive-dir>/<handle>/index/post_index.json` from all tasks under that
+handle:
+
+- **Enumeration reuse** — when a new window is fully covered by prior
+  trustworthy snapshots (`complete` / reached the window-start boundary,
+  with matching replies/reposts scope), the timeline is not scrolled at
+  all; the new manifest is derived from the stored ones. Partial overlap
+  still scrolls, pre-seeded with every known tweet id so re-scrolling
+  stays cheap.
+- **Content reuse (zero-copy)** — records already saved by any task are
+  referenced in place (`status=skipped`, `reused_from=<donor task>`,
+  `archive_path` points at the donor directory); no bytes are copied and
+  nothing is downloaded. The merged book PDF reads the donor PDFs
+  directly.
+- If a referenced donor product is gone, `--resume` transparently
+  re-downloads that post into the current task; `--refresh-enum` forces
+  a live enumeration when you suspect deletions.
+- The report records `enum_source` (`live`/`index`/`stored`),
+  `enum_donor_task_ids`, `reused_posts`, and `reused_from_tasks`.
 
 ### Utility commands
 
