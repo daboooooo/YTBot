@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram.error import Conflict, RetryAfter, TelegramError
 from telegram.request import HTTPXRequest
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.enhanced_logger import get_logger, log_function_entry_exit
 
 logger = get_logger(__name__)
@@ -81,7 +81,7 @@ class TelegramService:
 
         self.bot: Optional[Bot] = None
         self.application: Optional[Application] = None
-        self.token = CONFIG['telegram']['token']
+        self.token = get_config().telegram.token
         self._connected = False
         self._handlers_registered = False
         self._command_handlers: List[tuple] = []
@@ -99,6 +99,9 @@ class TelegramService:
         # 全局 flood 熔断（方案A）：monotonic 时间戳，出站消息暂停截止时间。
         # 触发 RetryAfter 后在窗口内丢弃可丢弃消息、等待重要消息，避免封锁续期。
         self._flood_until = 0.0
+        # per-message 锁：防止同一消息被快速连续编辑（如上传进度回调并发场景）
+        self._message_locks: Dict[str, asyncio.Lock] = {}
+        self._message_locks_lock = asyncio.Lock()
         self._initialized = True
         self._external_polling = False  # 标记是否有外部管理polling
 
@@ -430,6 +433,74 @@ class TelegramService:
             await asyncio.sleep(sleep_for)
             waited += sleep_for
 
+    MAX_SEND_RETRIES = 3
+
+    async def _send_with_backoff(
+        self,
+        chat_id: int,
+        text: str,
+        kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """带指数退避的重试循环。
+
+        最多尝试 MAX_SEND_RETRIES 次，每次失败后等待熔断窗口（含退避）。
+        指数退避避免快速重试使封锁续期。
+        """
+        for attempt in range(self.MAX_SEND_RETRIES):
+            if not await self._wait_out_flood():
+                logger.warning(
+                    f"⏭️  Aborted send to chat {chat_id}: "
+                    "shutdown during flood wait"
+                )
+                return None
+
+            try:
+                logger.debug(
+                    f"Calling bot.send_message "
+                    f"with chat_id={chat_id} "
+                    f"(attempt {attempt + 1})"
+                )
+                message = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    **kwargs,
+                )
+
+                if message:
+                    logger.info(
+                        f"✅ Message sent successfully to chat {chat_id}"
+                    )
+                    logger.debug(f"Message ID: {message.message_id}")
+                    return message.to_dict()
+                else:
+                    logger.warning(
+                        f"⚠️  No message returned for chat {chat_id}"
+                    )
+                    return None
+
+            except RetryAfter as e:
+                self._register_flood(e.retry_after)
+                if attempt < self.MAX_SEND_RETRIES - 1:
+                    backoff = min(2 ** attempt, 15)
+                    logger.info(
+                        f"⏳ RetryAfter on send, "
+                        f"backing off {backoff}s before "
+                        f"retry {attempt + 2}/{self.MAX_SEND_RETRIES}"
+                    )
+                    await asyncio.sleep(backoff)
+            except Exception as e:
+                logger.error(
+                    f"❌ Failed to send message to {chat_id}: {e}"
+                )
+                logger.exception("Message sending error details:")
+                return None
+
+        logger.error(
+            f"❌ Failed to send message to {chat_id} "
+            f"after {self.MAX_SEND_RETRIES} retries"
+        )
+        return None
+
     @log_function_entry_exit(logger)
     async def send_message(
         self,
@@ -440,47 +511,106 @@ class TelegramService:
         """Send a message to a chat with detailed logging.
 
         遇到 flood 熔断窗口时等待窗口结束再发送（重要消息不丢弃），
-        最多等待 FLOOD_WAIT_MAX_SECONDS，最多重试一轮。
+        最多重试 MAX_SEND_RETRIES 次，带指数退避。
         """
         logger.info(f"📤 Sending message to chat {chat_id}")
-        logger.debug(f"Message text: {text[:50]}..." if len(text) > 50 else f"Message text: {text}")
+        logger.debug(
+            f"Message text: {text[:50]}..." if len(text) > 50
+            else f"Message text: {text}"
+        )
         logger.debug(f"Additional kwargs: {list(kwargs.keys())}")
 
         if not self.connected:
             logger.error("❌ Not connected to Telegram")
             return None
 
-        for attempt in range(2):
+        return await self._send_with_backoff(chat_id, text, kwargs)
+
+    MAX_EDIT_RETRIES = 3
+
+    async def _edit_with_backoff(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        discardable: bool,
+        kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """带指数退避的消息编辑重试循环。"""
+        for attempt in range(self.MAX_EDIT_RETRIES):
             if not await self._wait_out_flood():
-                logger.warning(f"⏭️  Aborted send to chat {chat_id}: shutdown during flood wait")
+                logger.warning(
+                    f"⏭️  Aborted edit of message {message_id}: "
+                    "shutdown during flood wait"
+                )
                 return None
 
             try:
-                logger.debug(f"Calling bot.send_message with chat_id={chat_id}")
-                message = await self.bot.send_message(
+                logger.debug(
+                    f"Calling bot.edit_message_text "
+                    f"with message_id={message_id} "
+                    f"(attempt {attempt + 1})"
+                )
+                message = await self.bot.edit_message_text(
                     chat_id=chat_id,
+                    message_id=message_id,
                     text=text,
-                    **kwargs
+                    **kwargs,
                 )
 
                 if message:
-                    logger.info(f"✅ Message sent successfully to chat {chat_id}")
-                    logger.debug(f"Message ID: {message.message_id}")
+                    logger.info(
+                        f"✅ Message {message_id} edited "
+                        f"successfully in chat {chat_id}"
+                    )
                     return message.to_dict()
                 else:
-                    logger.warning(f"⚠️  No message returned for chat {chat_id}")
+                    logger.warning(
+                        f"⚠️  No message returned for edit "
+                        f"operation in chat {chat_id}"
+                    )
                     return None
 
             except RetryAfter as e:
-                # 记录熔断窗口后重试一次（等待窗口结束）
                 self._register_flood(e.retry_after)
+                if attempt < self.MAX_EDIT_RETRIES - 1:
+                    backoff = min(2 ** attempt, 15)
+                    logger.info(
+                        f"⏳ RetryAfter on edit, "
+                        f"backing off {backoff}s before "
+                        f"retry {attempt + 2}/{self.MAX_EDIT_RETRIES}"
+                    )
+                    await asyncio.sleep(backoff)
             except Exception as e:
-                logger.error(f"❌ Failed to send message to {chat_id}: {e}")
-                logger.exception("Message sending error details:")
+                error_str = str(e)
+                if "Message is not modified" in error_str:
+                    logger.debug(
+                        f"Message {message_id} content unchanged, skipping"
+                    )
+                    return {
+                        "message_id": message_id,
+                        "unchanged": True,
+                    }
+                logger.error(
+                    f"❌ Failed to edit message {message_id} "
+                    f"in {chat_id}: {e}"
+                )
+                logger.exception("Message editing error details:")
                 return None
 
-        logger.error(f"❌ Failed to send message to {chat_id} after flood wait retries")
+        logger.error(
+            f"❌ Failed to edit message {message_id} in {chat_id} "
+            f"after {self.MAX_EDIT_RETRIES} retries"
+        )
         return None
+
+    async def _get_message_lock(self, chat_id: int, message_id: int) -> asyncio.Lock:
+        """获取或创建 per-message 锁，序列化对同一消息的编辑操作。"""
+        key = f"{chat_id}:{message_id}"
+        async with self._message_locks_lock:
+            if key not in self._message_locks:
+                self._message_locks[key] = asyncio.Lock()
+            return self._message_locks[key]
 
     @log_function_entry_exit(logger)
     async def edit_message(
@@ -498,7 +628,10 @@ class TelegramService:
                          （用于下载进度等高频可丢失更新）；否则等待窗口结束再发送。
         """
         logger.info(f"✏️  Editing message {message_id} in chat {chat_id}")
-        logger.debug(f"New text: {text[:50]}..." if len(text) > 50 else f"New text: {text}")
+        logger.debug(
+            f"New text: {text[:50]}..." if len(text) > 50
+            else f"New text: {text}"
+        )
 
         if not self.connected:
             logger.error("❌ Not connected to Telegram")
@@ -507,47 +640,17 @@ class TelegramService:
         # 熔断窗口内丢弃可丢弃的编辑，避免无意义的 API 调用使封锁续期
         if discardable and time.monotonic() < self._flood_until:
             logger.debug(
-                f"⏭️ Dropping discardable edit for message {message_id} (flood window active)"
+                f"⏭️ Dropping discardable edit for message {message_id} "
+                f"(flood window active)"
             )
             return None
 
-        for attempt in range(2):
-            if not await self._wait_out_flood():
-                logger.warning(
-                    f"⏭️  Aborted edit of message {message_id}: shutdown during flood wait"
-                )
-                return None
-
-            try:
-                logger.debug(f"Calling bot.edit_message_text with message_id={message_id}")
-                message = await self.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    **kwargs
-                )
-
-                if message:
-                    logger.info(f"✅ Message {message_id} edited successfully in chat {chat_id}")
-                    return message.to_dict()
-                else:
-                    logger.warning(f"⚠️  No message returned for edit operation in chat {chat_id}")
-                    return None
-
-            except RetryAfter as e:
-                # 记录熔断窗口后重试一次（等待窗口结束）
-                self._register_flood(e.retry_after)
-            except Exception as e:
-                error_str = str(e)
-                if "Message is not modified" in error_str:
-                    logger.debug(f"Message {message_id} content unchanged, skipping")
-                    return {"message_id": message_id, "unchanged": True}
-                logger.error(f"❌ Failed to edit message {message_id} in {chat_id}: {e}")
-                logger.exception("Message editing error details:")
-                return None
-
-        logger.error(f"❌ Failed to edit message {message_id} in {chat_id} after flood wait retries")
-        return None
+        # 使用 per-message 锁序列化同一消息的编辑，防止并发导致限流
+        lock = await self._get_message_lock(chat_id, message_id)
+        async with lock:
+            return await self._edit_with_backoff(
+                chat_id, message_id, text, discardable, kwargs
+            )
 
     @log_function_entry_exit(logger)
     async def get_bot_info(self) -> Optional[Dict[str, Any]]:
@@ -776,8 +879,8 @@ class TelegramService:
         """Check if user has permission to use the bot with detailed logging"""
         logger.debug(f"🔍 Checking permission for chat ID: {chat_id}")
 
-        allowed_ids = CONFIG['telegram']['allowed_chat_ids']
-        admin_id = CONFIG['telegram'].get('admin_chat_id', '')
+        allowed_ids = get_config().telegram.allowed_chat_ids
+        admin_id = get_config().telegram.admin_chat_id
 
         logger.debug(f"Allowed IDs: {allowed_ids}")
         logger.debug(f"Admin ID: {admin_id}")

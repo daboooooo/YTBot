@@ -9,7 +9,7 @@ import time
 import psutil
 from typing import Dict, Any, Optional
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -21,10 +21,11 @@ class HealthMonitor:
     def __init__(self):
         self.monitoring = False
         self.last_check = 0
-        self.check_interval = CONFIG['monitor']['interval']
-        self.min_disk_space = CONFIG['monitor']['min_disk_space']
-        self.max_cpu_load = CONFIG['monitor']['max_cpu_load']
-        self.memory_threshold = CONFIG['monitor']['memory_threshold']
+        mc = get_config().monitor
+        self.check_interval = mc.interval
+        self.min_disk_space = mc.min_disk_space
+        self.max_cpu_load = mc.max_cpu_load
+        self.memory_threshold = mc.memory_threshold
 
     async def start_monitoring(self):
         """Start health monitoring"""
@@ -116,7 +117,7 @@ class HealthMonitor:
         logger.warning(f"Low disk space: {health_status['disk_space_mb']:.1f}MB available")
 
         # Trigger cleanup if local storage is enabled
-        if CONFIG['local_storage']['enabled']:
+        if get_config().local_storage.enabled:
             try:
                 from ..storage.local_storage import cleanup_local_storage
                 cleanup_result = await cleanup_local_storage()

@@ -19,18 +19,35 @@ from ytbot.storage.nextcloud_storage import NextcloudStorage
 @pytest.fixture
 def storage(monkeypatch):
     """NextcloudStorage without __init__ network connection"""
-    monkeypatch.setattr(
-        nc_module,
-        'CONFIG',
-        {
-            'nextcloud': {
-                'url': 'https://nc.example.com',
-                'username': 'user',
-                'upload_retries': 1,
-                'upload_retry_delay': 0,
-            }
-        },
-    )
+    # Mock get_config to return a minimal config for tests
+    mock_cfg = MagicMock()
+    mock_cfg.nextcloud.url = 'https://nc.example.com'
+    mock_cfg.nextcloud.username = 'user'
+    mock_cfg.nextcloud.upload_retries = 1
+    mock_cfg.nextcloud.upload_retry_delay = 0
+    mock_cfg.nextcloud.password = 'pass'
+    mock_cfg.nextcloud.verify_file_size = True
+    mock_cfg.local_storage.path = './downloads'
+    mock_cfg.local_storage.enabled = True
+    mock_cfg.local_storage.max_size_mb = 10240
+    mock_cfg.local_storage.cleanup_after_days = 7
+    mock_cfg.local_storage.delete_after_upload = False
+    mock_cfg.monitor.interval = 3600
+    mock_cfg.monitor.min_disk_space = 1024.0
+    mock_cfg.monitor.max_cpu_load = 0.8
+    mock_cfg.monitor.memory_threshold = 512
+    mock_cfg.telegram.token = 'test_token'
+    mock_cfg.telegram.admin_chat_id = '12345'
+    mock_cfg.telegram.allowed_chat_ids = ['12345']
+
+    def fake_get_config():
+        return mock_cfg
+
+    monkeypatch.setattr(nc_module, 'get_config', fake_get_config)
+    # Also patch in the storage_service module since it imports get_config too
+    from ytbot.services import storage_service as ss_module
+    monkeypatch.setattr(ss_module, 'get_config', fake_get_config)
+
     s = NextcloudStorage.__new__(NextcloudStorage)
     s.client = MagicMock()
     s._verify_upload = MagicMock(return_value=True)

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.enhanced_logger import get_logger
 
 logger = get_logger(__name__)
@@ -21,10 +21,11 @@ class LocalStorageManager:
     """Local storage manager with space management and automatic cleanup"""
 
     def __init__(self):
-        self.storage_path = Path(CONFIG['local_storage']['path'])
-        self.max_size_mb = CONFIG['local_storage']['max_size_mb']
-        self.cleanup_after_days = CONFIG['local_storage']['cleanup_after_days']
-        self.enabled = CONFIG['local_storage']['enabled']
+        cfg = get_config().local_storage
+        self.storage_path = Path(cfg.path)
+        self.max_size_mb = cfg.max_size_mb
+        self.cleanup_after_days = cfg.cleanup_after_days
+        self.enabled = cfg.enabled
 
         # Ensure storage directory exists
         if self.enabled:

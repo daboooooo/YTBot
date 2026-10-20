@@ -4,22 +4,229 @@ Telegram handler for YTBot
 Handles Telegram bot commands and message processing.
 """
 
+import asyncio
 import os
-import shutil
 import time
-from typing import Dict, Any, Optional, List
+from typing import Any, Awaitable, Callable, Dict, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError, RetryAfter
 from telegram.ext import ContextTypes, filters
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.enhanced_logger import get_logger
 from ..core.user_state import UserStateManager, UserState
 from ..services.telegram_service import TelegramService
 from ..services.storage_service import StorageService
 from ..services.download_service import DownloadService
+from ..services.download_pipeline import (
+    DownloadPipeline,
+    ProgressSink,
+    estimate_format_size,
+    LARGE_FILE_THRESHOLD,
+)
 
 logger = get_logger(__name__)
+
+
+class TelegramProgressSink:
+    """ProgressSink implementation for the Telegram bot flow.
+
+    Delegates to the TelegramHandler's existing progress-edit and
+    success-message methods so that the DownloadPipeline can emit
+    Telegram messages without knowing handler internals.
+    """
+
+    # 阶段消息最小间隔（秒），避免连续 stage 切换时密集编辑触发限流
+    STAGE_THROTTLE_SECONDS = 3.0
+
+    def __init__(
+        self,
+        telegram_service: TelegramService,
+        chat_id: int,
+        message_id: int,
+        is_twitter: bool = False,
+        twitter_result: Optional[Dict[str, Any]] = None,
+        progress_label: Optional[str] = None,
+        *,
+        update_progress_callback: Optional[
+            Callable[[int, int, Dict[str, Any]], Awaitable[None]]
+        ] = None,
+        send_success_callback: Optional[
+            Callable[
+                [int, int, Dict[str, Any], Dict[str, Any], str, bool, bool],
+                Awaitable[None],
+            ]
+        ] = None,
+    ) -> None:
+        self._telegram_service = telegram_service
+        self._chat_id = chat_id
+        self._message_id = message_id
+        self._is_twitter = is_twitter
+        self._twitter_result = twitter_result
+        self._progress_label = progress_label
+        self._update_progress = update_progress_callback
+        self._send_success = send_success_callback
+        # 阶段消息节流：记录上次成功编辑时间
+        self._last_stage_edit_time: float = 0.0
+        # 上传进度编辑合并：任意时刻最多一个编辑任务，同步回调只覆盖最新文案。
+        # Nextcloud 上传在事件循环线程内阻塞执行，旧实现为每次回调都创建
+        # 编辑任务，上传结束瞬间会堆积并连发多条过期编辑；flush 清空任务
+        # 列表后，任务的 done_callback 再执行 remove 还会抛出
+        # ValueError: list.remove(x): x not in list。
+        self._upload_edit_task: Optional[asyncio.Task] = None
+        self._pending_upload_text: Optional[str] = None
+
+    async def on_download_stage(self, text: str) -> None:
+        """下载阶段消息，带节流：避免连续 stage 切换时密集编辑触发限流。
+
+        距上次成功编辑不足 STAGE_THROTTLE_SECONDS 秒时跳过。
+        仅在编辑成功后更新时间戳，熔断期丢弃后能立即恢复。
+        """
+        now = time.monotonic()
+        if (
+            now - self._last_stage_edit_time
+            < self.STAGE_THROTTLE_SECONDS
+        ):
+            logger.debug(
+                f"⏭️ Dropping stage update for message {self._message_id} "
+                f"(throttled, last edit {now - self._last_stage_edit_time:.1f}s ago)"
+            )
+            return
+
+        result = await self._telegram_service.edit_message(
+            chat_id=self._chat_id,
+            message_id=self._message_id,
+            text=text,
+        )
+        if result is not None:
+            self._last_stage_edit_time = now
+
+    async def on_download_progress(
+        self, progress_data: Dict[str, Any]
+    ) -> None:
+        if self._update_progress:
+            await self._update_progress(
+                self._chat_id, self._message_id, progress_data
+            )
+
+    async def on_upload_progress(
+        self,
+    ) -> Callable[[int, int], None]:
+        last_time = [0.0]
+        last_percent = [-100.0]
+
+        def callback(current: int, total: int) -> None:
+            if total <= 0:
+                return
+            percentage = current / total * 100
+            now = time.monotonic()
+            if (
+                current < total
+                and now - last_time[0] < 5.0
+                and abs(percentage - last_percent[0]) < 2.0
+            ):
+                return
+            percentage_display = f"{percentage:.1f}%"
+            current_mb = current / (1024 * 1024)
+            total_mb = total / (1024 * 1024)
+            upload_text = (
+                f"☁️ 上传中 {percentage_display}\n"
+                f"💾 已上传: {current_mb:.1f} MB / {total_mb:.1f} MB"
+            )
+            # 仅覆盖最新文案并确保只有一个合并编辑任务在运行
+            self._pending_upload_text = upload_text
+            self._ensure_upload_edit_task()
+            last_time[0] = now
+            last_percent[0] = percentage
+
+        return callback
+
+    def _ensure_upload_edit_task(self) -> None:
+        """若没有存活的上传编辑任务，则创建一个合并 worker。"""
+        task = self._upload_edit_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # 无运行中的事件循环，丢弃本次更新
+        self._upload_edit_task = loop.create_task(
+            self._run_upload_edit_worker()
+        )
+
+    async def _run_upload_edit_worker(self) -> None:
+        """串行消费最新的上传进度文案，编辑期间到达的更新保留到下一轮。"""
+        try:
+            while True:
+                text = self._pending_upload_text
+                if text is None:
+                    return
+                # 先取走文案再发起编辑，保证更新不会丢失也不会重复发送
+                self._pending_upload_text = None
+                await self._telegram_service.edit_message(
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    text=text,
+                    discardable=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 进度编辑失败不能影响下载/上传主流程
+            logger.debug(f"Upload progress edit error: {e}")
+
+    async def _flush_upload_progress_tasks(self) -> None:
+        """丢弃尚未发出的进度文案，并等待进行中的编辑结束。
+
+        在 on_success/on_error 前调用，防止过期进度覆盖最终消息。
+        """
+        self._pending_upload_text = None
+        task = self._upload_edit_task
+        if task is None or task.done():
+            return
+        logger.debug(
+            f"Flushing pending upload progress edit for message "
+            f"{self._message_id}"
+        )
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def on_success(
+        self,
+        storage_result: Dict[str, Any],
+        download_type: str,
+        is_twitter: bool = False,
+        content_info: Optional[Dict[str, Any]] = None,
+        send_as_new: bool = False,
+    ) -> bool:
+        # 确保所有 upload progress 任务已完成，防止它们覆盖成功消息
+        await self._flush_upload_progress_tasks()
+        # Playlist entries have a progress_label like "3/12" → send_as_new=True
+        effective_send_as_new = send_as_new or bool(self._progress_label)
+        if self._send_success:
+            await self._send_success(
+                self._chat_id,
+                self._message_id,
+                content_info or {},
+                storage_result,
+                download_type,
+                is_twitter=is_twitter,
+                send_as_new=effective_send_as_new,
+            )
+        return True
+
+    async def on_error(
+        self,
+        error_message: str,
+        is_twitter: bool = False,
+        content_info: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        await self._flush_upload_progress_tasks()
+        await self._telegram_service.edit_message(
+            chat_id=self._chat_id,
+            message_id=self._message_id,
+            text=f"❌ {error_message}",
+        )
+        return False
 
 
 class TelegramHandler:
@@ -125,14 +332,12 @@ class TelegramHandler:
         """Handle /status command"""
         chat_id = update.effective_chat.id
 
-        # Get system status
-        from ..cli import YTBot
-        bot = YTBot()
-        status = bot.get_status()
+        # Get system status via singleton factories (fixes reverse dep on YTBot)
+        from ..monitoring.status_provider import build_status_report
+        status = build_status_report()
 
         status_message = (
             "📊 系统状态报告\n\n"
-            f"🤖 Bot状态: {'运行中' if status['running'] else '已停止'}\n"
             f"📱 Telegram: {'已连接' if status['telegram_connected'] else '未连接'}\n"
             f"☁️ Nextcloud: {'可用' if status['nextcloud_available'] else '不可用'}\n"
             f"💾 本地存储: {'已启用' if status['local_storage_enabled'] else '未启用'}\n"
@@ -149,7 +354,7 @@ class TelegramHandler:
         chat_id = update.effective_chat.id
 
         # Check admin permission
-        admin_chat_id = CONFIG['telegram']['admin_chat_id']
+        admin_chat_id = get_config().telegram.admin_chat_id
         if str(chat_id) != str(admin_chat_id):
             await self.telegram_service.send_message(
                 chat_id=chat_id,
@@ -445,12 +650,9 @@ class TelegramHandler:
     async def _save_text_content(self, chat_id: int, text: str):
         """Save text content to HTML file"""
         try:
-            import os
             from datetime import datetime
-            from ..core.config import CONFIG
-
             # Get downloads directory
-            downloads_dir = CONFIG['local_storage']['path']
+            downloads_dir = get_config().local_storage.path
             os.makedirs(downloads_dir, exist_ok=True)
 
             # Generate filename with timestamp
@@ -634,10 +836,7 @@ class TelegramHandler:
         """Save unsupported URL content to JSON file"""
         try:
             import json
-            import os
             from datetime import datetime
-            from ..core.config import CONFIG
-
             # Prepare data to save
             data = {
                 'url': url,
@@ -647,7 +846,7 @@ class TelegramHandler:
             }
 
             # Get downloads directory
-            downloads_dir = CONFIG['local_storage']['path']
+            downloads_dir = get_config().local_storage.path
             os.makedirs(downloads_dir, exist_ok=True)
 
             # Generate filename with timestamp
@@ -1125,34 +1324,22 @@ class TelegramHandler:
         handler=None,
         progress_label: Optional[str] = None,
         skip_large_file_confirmation: bool = False,
-        inherited_format_id: Optional[str] = None
+        inherited_format_id: Optional[str] = None,
+        archive_mode: bool = False
     ) -> bool:
-        """
-        Proceed with the actual download.
+        """Proceed with the actual download.
 
-        Args:
-            chat_id: Telegram chat ID
-            message_id: Message ID to update
-            url: Video URL
-            download_type: "audio" or "video"
-            content_info: Optional content info dictionary (for Twitter, contains scrape result)
-            handler: Optional pre-matched handler to avoid redundant matching
-            progress_label: Optional label like "3/12" shown in progress
-                messages (used when processing playlist entries)
-            skip_large_file_confirmation: Skip the 500MB confirmation prompt
-                (playlist mode processes entries without pauses)
-            inherited_format_id: Playlist-level format selected once from
-                the first entry; skips per-entry format fetching. If the
-                inherited format is unavailable for a video, the entry
-                falls back to the default format
+        Delegates format selection, download, format fallback, store,
+        and success/error messaging to ``DownloadPipeline``.
 
-        Returns:
-            bool: True if the content was downloaded and stored
-            successfully, False otherwise.
+        Keeps Bot-specific interaction logic:
+        - Playlist expansion and recursive processing
+        - Twitter preview messages
+        - Large-file confirmation dialog
+        - Cleanup (throttle state + temp dir)
         """
-        download_result = None
         try:
-            # Use the already-matched handler if provided
+            # Resolve handler
             if handler is None:
                 handler = self.download_service.platform_manager.get_handler(url)
 
@@ -1164,14 +1351,10 @@ class TelegramHandler:
                 )
                 return False
 
-            # Expand YouTube playlists into single-video URLs and process
-            # each one exactly like a normal link: download one, upload one.
-            # Entry URLs are plain watch URLs (no 'list=' param), so
-            # is_playlist() is False for them and no recursion occurs.
+            # ── Playlist expansion (Bot-specific) ──────────────────
             if handler.name == "YouTube" and handler.is_playlist(url):
                 entries = await handler.get_playlist_entries(url)
                 if entries is None:
-                    # Expansion failed: fall back to whole-playlist download
                     logger.warning(
                         f"Failed to expand playlist, falling back to "
                         f"whole-playlist download: {url}"
@@ -1194,19 +1377,22 @@ class TelegramHandler:
                         )
                     )
 
-                    # One-time format selection from the first entry; all
-                    # entries inherit it (YouTube format IDs are site-wide
-                    # stable). Entries that don't have the inherited format
-                    # fall back to the default format.
+                    # One-time format selection; all entries inherit
+                    _, first_formats = await handler.get_format_list(
+                        entries[0]
+                    )
                     shared_format_id = None
-                    _, first_formats = await handler.get_format_list(entries[0])
                     if download_type == "audio":
-                        shared_format_id = handler.select_best_audio_format(
-                            first_formats
+                        shared_format_id = (
+                            handler.select_best_audio_format(first_formats)
                         )
                     else:
-                        vfmt = handler.select_best_video_format(first_formats)
-                        afmt = handler.select_best_audio_format(first_formats)
+                        vfmt = handler.select_best_video_format(
+                            first_formats
+                        )
+                        afmt = handler.select_best_audio_format(
+                            first_formats
+                        )
                         if vfmt and afmt:
                             shared_format_id = f"{vfmt}+{afmt}"
                         elif vfmt:
@@ -1229,7 +1415,8 @@ class TelegramHandler:
                             handler,
                             progress_label=f"{i}/{total}",
                             skip_large_file_confirmation=True,
-                            inherited_format_id=shared_format_id
+                            inherited_format_id=shared_format_id,
+                            archive_mode=archive_mode,
                         )
                         if item_ok:
                             succeeded += 1
@@ -1244,178 +1431,91 @@ class TelegramHandler:
                     )
                     return failed == 0
 
+            # ── Twitter status message ────────────────────────────
             is_twitter = handler.name == "Twitter/X"
             twitter_result = (
                 content_info if is_twitter and content_info
                 and content_info.get('success') else None
             )
-
             if is_twitter:
-                action_text = "正在获取推文"
                 if twitter_result:
-                    message_text = handler.generate_telegram_preview(
-                        twitter_result,
-                        is_processing=True,
-                        processing_state="⬇️ 正在保存到本地..."
+                    await self.telegram_service.edit_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=handler.generate_telegram_preview(
+                            twitter_result,
+                            is_processing=True,
+                            processing_state="⬇️ 正在保存到本地..."
+                        ),
                     )
-                else:
-                    message_text = f"⬇️ {action_text}..."
-            else:
-                label_suffix = f" ({progress_label})" if progress_label else ""
-                if download_type == "audio":
-                    message_text = f"⬇️ 正在下载音频{label_suffix}..."
-                else:
-                    message_text = f"⬇️ 正在下载视频{label_suffix}..."
-
-            await self.telegram_service.edit_message(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=message_text
-            )
-
-            format_id = None
-            file_size_estimate = None
-            if handler.name == "YouTube" and inherited_format_id:
-                # Playlist entry: inherit the playlist-level format
-                # selection (chosen once from the first entry) instead of
-                # fetching formats again for every entry
-                format_id = inherited_format_id
-            elif handler.name == "YouTube":
-                # Get format list
-                video_info, formats = await handler.get_format_list(url)
-
-                if download_type == "audio":
-                    # Select best audio format
-                    audio_format = handler.select_best_audio_format(formats)
-                    if audio_format:
-                        format_id = audio_format
-                    # Get file size estimate
-                    file_size_estimate = self._get_file_size_estimate_from_formats(
-                        formats, audio_format
-                    )
-                else:
-                    # Select best video and audio formats
-                    video_format = handler.select_best_video_format(formats)
-                    audio_format = handler.select_best_audio_format(formats)
-
-                    if video_format and audio_format:
-                        format_id = f"{video_format}+{audio_format}"
-                    elif video_format:
-                        format_id = video_format
-                    # Get file size estimate
-                    file_size_estimate = self._get_file_size_estimate_from_formats(
-                        formats, format_id
-                    )
-
-            # Check if file size exceeds 500MB and needs confirmation
-            LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB in bytes
-            is_large_file = (
-                handler.name == "YouTube"
-                and download_type == "video"
-                and not skip_large_file_confirmation
-                and file_size_estimate is not None
-                and file_size_estimate > LARGE_FILE_THRESHOLD
-            )
-            if is_large_file:
-                size_mb = file_size_estimate / (1024 * 1024)
-                logger.info(f"Large file detected: {size_mb:.1f} MB, requesting confirmation")
-                await self._ask_large_file_confirmation(
-                    chat_id, message_id, url, download_type,
-                    content_info, file_size_estimate, format_id
-                )
-                return False
-
-            # Create progress callback
-            async def progress_callback(progress_data):
-                await self._update_download_progress(
-                    chat_id, message_id, progress_data
-                )
-
-            # Download content, passing handler and pre-scraped result
-            is_twitter = handler.name == "Twitter/X" if handler else False
-            twitter_result = (
-                content_info if is_twitter and content_info
-                and content_info.get('success') else None
-            )
-
-            download_result = await self.download_service.download_content(
-                url=url,
-                content_type=download_type,
-                progress_callback=progress_callback,
-                format_id=format_id,
-                handler=handler,
-                pre_scraped_result=twitter_result
-            )
-
-            # Playlist entry whose inherited format is not available for
-            # this particular video (e.g. max 480p video without the 1080p
-            # stream): retry once with the default format selection
-            if (
-                not download_result.success
-                and inherited_format_id
-                and download_result.error_detail == "ERROR_FORMAT_NOT_AVAILABLE"
-            ):
-                logger.warning(
-                    f"Inherited format {inherited_format_id} not available "
-                    f"for {url}, retrying with default format"
-                )
-                download_result = await self.download_service.download_content(
-                    url=url,
-                    content_type=download_type,
-                    progress_callback=progress_callback,
-                    format_id=None,
-                    handler=handler,
-                    pre_scraped_result=twitter_result
-                )
-
-            if download_result.success:
-                # Get content info from result
-                if download_result.content_info:
-                    title = download_result.content_info.title
-                elif content_info:
-                    title = content_info['title']
-                else:
-                    title = "Unknown"
-
-                # Determine actual content type for storage
-                # For Twitter, download_type is "text" but the actual
-                # content may contain video or images
-                actual_download_type = download_type
-                if download_result.content_info and download_result.content_info.content_type:
-                    actual_download_type = download_result.content_info.content_type.value
-
-                # Store the file
-                storage_result = await self._store_downloaded_file(
-                    download_result.file_path,
-                    title,
-                    actual_download_type
-                )
-
-                if storage_result['success']:
-                    await self._send_success_message(
-                        chat_id,
-                        message_id,
-                        content_info or {},
-                        storage_result,
-                        actual_download_type,
-                        is_twitter=is_twitter,
-                        send_as_new=bool(progress_label)
-                    )
-                    return True
                 else:
                     await self.telegram_service.edit_message(
                         chat_id=chat_id,
                         message_id=message_id,
-                        text="❌ 文件存储失败，请稍后重试。"
+                        text="⬇️ 正在获取推文...",
                     )
-                    return False
             else:
+                suffix = f" ({progress_label})" if progress_label else ""
+                label = ("音频" if download_type == "audio" else "视频")
                 await self.telegram_service.edit_message(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=f"❌ 下载失败: {download_result.error_message}"
+                    text=f"⬇️ 正在下载{label}{suffix}...",
                 )
-                return False
+
+            # ── Large-file confirmation (Bot-only) ────────────────
+            if not skip_large_file_confirmation and not is_twitter:
+                _, formats = await handler.get_format_list(url)
+                file_size_estimate = None
+                if download_type == "audio":
+                    fid = handler.select_best_audio_format(formats)
+                    file_size_estimate = estimate_format_size(
+                        formats, fid
+                    )
+                else:
+                    vf = handler.select_best_video_format(formats)
+                    file_size_estimate = estimate_format_size(
+                        formats, vf
+                    )
+                if (
+                    file_size_estimate is not None
+                    and file_size_estimate > LARGE_FILE_THRESHOLD
+                ):
+                    logger.info(
+                        f"Large file detected: "
+                        f"{file_size_estimate / 1024 / 1024:.1f} MB"
+                    )
+                    await self._ask_large_file_confirmation(
+                        chat_id, message_id, url, download_type,
+                        content_info, file_size_estimate, None
+                    )
+                    return False
+
+            # ── Pipeline: download → store → success/error ────────
+            pipeline = DownloadPipeline(
+                download_service=self.download_service,
+                storage_service=self.storage_service,
+                progress_sink=self._make_progress_sink(
+                    chat_id, message_id,
+                    is_twitter=is_twitter,
+                    twitter_result=twitter_result,
+                    progress_label=progress_label,
+                ),
+                archive_mode=archive_mode,
+            )
+            result = await pipeline.run(
+                url=url,
+                download_type=download_type,
+                handler=handler,
+                content_info=content_info,
+                inherited_format_id=inherited_format_id,
+                progress_label=progress_label,
+            )
+            # Pipeline returns True/False; store result for cleanup
+            if result:
+                # Success: get file_path for cleanup (re-fetch from storage)
+                return True
+            return False
 
         except Exception as e:
             logger.error(f"Download error: {e}")
@@ -1426,18 +1526,9 @@ class TelegramHandler:
             )
             return False
         finally:
-            # 清理进度节流状态
+            # Clean up progress throttle state
             self._progress_last_edit.pop(message_id, None)
             self._progress_last_percent.pop(message_id, None)
-
-            # Clean up temp directory after storage is complete
-            if download_result and download_result.temp_dir:
-                try:
-                    if os.path.exists(download_result.temp_dir):
-                        shutil.rmtree(download_result.temp_dir, ignore_errors=True)
-                        logger.debug(f"Cleaned up temp dir: {download_result.temp_dir}")
-                except Exception as cleanup_err:
-                    logger.warning(f"Failed to clean up temp dir: {cleanup_err}")
 
     async def _update_download_progress(
         self,
@@ -1504,41 +1595,6 @@ class TelegramHandler:
         except Exception as e:
             # Don't fail the download if progress update fails
             logger.debug(f"Progress update error: {e}")
-
-    async def _store_downloaded_file(
-        self,
-        file_path: str,
-        title: str,
-        download_type: str
-    ) -> Dict[str, Any]:
-        """
-        Store the downloaded file.
-
-        Args:
-            file_path: Path to downloaded file or directory
-            title: Content title
-            download_type: "audio" or "video"
-
-        Returns:
-            Storage result dictionary
-        """
-        from ..utils.common import sanitize_filename
-        import os
-
-        if os.path.isdir(file_path):
-            # For directories, use title directly as directory name
-            # (no extension needed - the directory contains all files)
-            safe_filename = sanitize_filename(title)
-        else:
-            _, original_ext = os.path.splitext(file_path)
-            if original_ext:
-                ext = original_ext
-            else:
-                ext = ".mp3" if download_type == "audio" else ".mp4"
-
-            safe_filename = sanitize_filename(f"{title}{ext}")
-
-        return await self.storage_service.store_file(file_path, safe_filename, download_type)
 
     async def _send_success_message(
         self,
@@ -1729,7 +1785,7 @@ class TelegramHandler:
     async def _proceed_with_large_file_download(
         self, chat_id: int, state_data: Dict[str, Any]
     ):
-        """Proceed with large file download after confirmation"""
+        """Proceed with large file download after user confirmation."""
         url = state_data['url']
         download_type = state_data['download_type']
         content_info = state_data['content_info']
@@ -1737,7 +1793,6 @@ class TelegramHandler:
         message_id = state_data['message_id']
 
         handler = self.download_service.platform_manager.get_handler(url)
-
         if not handler:
             await self.telegram_service.edit_message(
                 chat_id=chat_id,
@@ -1749,131 +1804,24 @@ class TelegramHandler:
         await self.telegram_service.edit_message(
             chat_id=chat_id,
             message_id=message_id,
-            text="⬇️ 正在下载大文件..."
+            text="⬇️ 正在下载大文件...",
         )
 
-        async def progress_callback(progress_data):
-            await self._update_download_progress(
-                chat_id, message_id, progress_data
-            )
-
-        download_result = None
-        try:
-            download_result = await self.download_service.download_content(
-                url=url,
-                content_type=download_type,
-                progress_callback=progress_callback,
-                format_id=format_id
-            )
-
-            if download_result.success:
-                if download_result.content_info:
-                    title = download_result.content_info.title
-                elif content_info:
-                    title = content_info.get('title', 'Unknown')
-                else:
-                    title = "Unknown"
-
-                storage_result = await self._store_downloaded_file(
-                    download_result.file_path,
-                    title,
-                    download_type
-                )
-
-                if storage_result['success']:
-                    await self._send_success_message(
-                        chat_id,
-                        message_id,
-                        content_info or {},
-                        storage_result,
-                        download_type
-                    )
-                else:
-                    await self.telegram_service.edit_message(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text="❌ 文件存储失败，请稍后重试。"
-                    )
-            else:
-                await self.telegram_service.edit_message(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=f"❌ 下载失败: {download_result.error_message}"
-                )
-        finally:
-            # 清理进度节流状态
-            self._progress_last_edit.pop(message_id, None)
-            self._progress_last_percent.pop(message_id, None)
-
-            # Clean up temp directory after storage is complete
-            if download_result and download_result.temp_dir:
-                try:
-                    if os.path.exists(download_result.temp_dir):
-                        shutil.rmtree(download_result.temp_dir, ignore_errors=True)
-                        logger.debug(f"Cleaned up temp dir: {download_result.temp_dir}")
-                except Exception as cleanup_err:
-                    logger.warning(f"Failed to clean up temp dir: {cleanup_err}")
-
-    def _get_file_size_estimate_from_formats(
-        self, formats: List[Dict[str, Any]], format_id: Optional[str]
-    ) -> Optional[int]:
-        """Get file size estimate from formats list"""
-        if not formats:
-            return None
-
-        size = None
-
-        if format_id:
-            format_id_str = str(format_id)
-
-            if '+' in format_id_str:
-                video_id, audio_id = format_id_str.split('+')
-                video_size = None
-                audio_size = None
-
-                for fmt in formats:
-                    fmt_id = str(fmt.get('format_id', ''))
-                    if fmt_id == video_id:
-                        video_size = (
-                            fmt.get('filesize')
-                            or fmt.get('filesize_estimate')
-                            or fmt.get('filesize_approx')
-                        )
-                    elif fmt_id == audio_id:
-                        audio_size = (
-                            fmt.get('filesize')
-                            or fmt.get('filesize_estimate')
-                            or fmt.get('filesize_approx')
-                        )
-
-                if video_size and audio_size:
-                    size = video_size + audio_size
-                elif video_size:
-                    size = video_size
-                else:
-                    size = audio_size
-            else:
-                for fmt in formats:
-                    if str(fmt.get('format_id', '')) == format_id_str:
-                        size = (
-                            fmt.get('filesize')
-                            or fmt.get('filesize_estimate')
-                            or fmt.get('filesize_approx')
-                        )
-                        break
-
-        if size is None:
-            for fmt in formats:
-                if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
-                    size = (
-                        fmt.get('filesize')
-                        or fmt.get('filesize_estimate')
-                        or fmt.get('filesize_approx')
-                    )
-                    if size:
-                        break
-
-        return size
+        pipeline = DownloadPipeline(
+            download_service=self.download_service,
+            storage_service=self.storage_service,
+            progress_sink=self._make_progress_sink(
+                chat_id, message_id,
+                progress_label="大文件",
+            ),
+        )
+        await pipeline.run(
+            url=url,
+            download_type=download_type,
+            handler=handler,
+            content_info=content_info,
+            inherited_format_id=format_id,
+        )
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
@@ -1893,3 +1841,31 @@ class TelegramHandler:
                 chat_id=update.effective_chat.id,
                 text="抱歉，处理您的请求时发生错误。请稍后重试。"
             )
+
+    # ------------------------------------------------------------------
+    # Download pipeline integration
+    # ------------------------------------------------------------------
+
+    def _make_progress_sink(
+        self,
+        chat_id: int,
+        message_id: int,
+        is_twitter: bool = False,
+        twitter_result: Optional[Dict[str, Any]] = None,
+        progress_label: Optional[str] = None,
+    ) -> ProgressSink:
+        """Create a ProgressSink that emits Telegram messages.
+
+        This lets ``DownloadPipeline.run()`` delegate to this handler's
+        existing progress-edit and success-message logic.
+        """
+        return TelegramProgressSink(
+            telegram_service=self.telegram_service,
+            chat_id=chat_id,
+            message_id=message_id,
+            is_twitter=is_twitter,
+            twitter_result=twitter_result,
+            progress_label=progress_label,
+            update_progress_callback=self._update_download_progress,
+            send_success_callback=self._send_success_message,
+        )

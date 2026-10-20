@@ -352,3 +352,24 @@ def log_function_entry_exit(logger: YTBotLogger = None):
 
     return decorator
 
+
+def set_log_level(level: str) -> None:
+    """Change the effective log level for all ytbot loggers at runtime.
+
+    This mutates the root ``'ytbot'`` logger, all its child loggers,
+    and all handlers so that ``--log-level`` CLI flag actually takes
+    effect after startup.
+    """
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    root = logging.getLogger('ytbot')
+    root.setLevel(lvl)
+    for handler in root.handlers:
+        handler.setLevel(lvl)
+    # Also fix child loggers that were explicitly set to a non-NOTSET level
+    # during YTBotLogger.__init__ (e.g. set to INFO). Without this, they
+    # won't inherit the root logger's new level.
+    for logger_name in list(logging.Logger.manager.loggerDict.keys()):
+        if logger_name == 'ytbot' or logger_name.startswith('ytbot.'):
+            child = logging.getLogger(logger_name)
+            child.setLevel(lvl)
+

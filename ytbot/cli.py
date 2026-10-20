@@ -11,14 +11,14 @@ from typing import Dict, Any, Optional
 
 # Use new config system
 import ytbot
-from ytbot.core.config import get_config, reload_config, validate_config
-from ytbot.core.enhanced_logger import get_logger, setup_exception_handler, log_function_entry_exit
+from ytbot.core.config import get_config, validate_config
+from ytbot.core.enhanced_logger import get_logger, setup_exception_handler, log_function_entry_exit, set_log_level
 from ytbot.core.startup_manager import StartupManager
 from ytbot.core.user_state import UserStateManager
 from ytbot.core.process_lock import acquire_lock, release_lock, is_another_instance_running
 from ytbot.services.telegram_service import TelegramService
-from ytbot.services.storage_service import StorageService
-from ytbot.services.download_service import DownloadService
+from ytbot.services.storage_service import get_storage_service
+from ytbot.services.download_service import get_download_service
 from ytbot.services.one_shot_download import OneShotDownloader
 from ytbot.monitoring.health_monitor import HealthMonitor
 from ytbot.monitoring.connection_monitor import ConnectionMonitor
@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 class YTBot:
     """Main YTBot application class with improved lifecycle management"""
 
-    def __init__(self):
+    def __init__(self, user_state_timeout: Optional[int] = None):
         self.startup_manager: Optional[StartupManager] = None
         self.telegram_service: Optional[TelegramService] = None
         self.storage_service: Optional[StorageService] = None
@@ -45,6 +45,7 @@ class YTBot:
 
         # Get config instance
         self.config = get_config()
+        self._user_state_timeout = user_state_timeout
 
     @log_function_entry_exit(logger)
     async def start(self):
@@ -72,13 +73,14 @@ class YTBot:
         # Initialize additional services not managed by StartupManager
         logger.info("🔄 Initializing additional services...")
 
-        # Initialize DownloadService
-        self.download_service = DownloadService()
+        # Initialize DownloadService (singleton via factory)
+        self.download_service = get_download_service()
         logger.info("✅ DownloadService initialized")
 
         # Initialize UserStateManager
+        timeout = self._user_state_timeout if self._user_state_timeout is not None else self.config.monitor.user_state_timeout
         self.user_state_manager = UserStateManager(
-            timeout=self.config.monitor.user_state_timeout,
+            timeout=timeout,
             persistence_file=None,  # Can be configured for persistence
             cleanup_interval=60
         )
@@ -413,9 +415,9 @@ class YTBot:
         return status
 
 
-async def main():
+async def main(user_state_timeout: Optional[int] = None):
     """Main async function with improved lifecycle management"""
-    bot = YTBot()
+    bot = YTBot(user_state_timeout=user_state_timeout)
 
     # Set up signal handlers for graceful shutdown
     def signal_handler(signum, frame):
@@ -582,14 +584,13 @@ Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
 
     # Set up logging
     if args.log_level:
-        # Note: For runtime log level changes, we'd need to update the logger
-        # This is a limitation of the current implementation
+        set_log_level(args.log_level)
         logger.info(f"Log level set to: {args.log_level}")
 
     # Override user state timeout if provided
+    user_state_timeout = None
     if args.user_state_timeout:
-        # Note: Config is frozen, so we can't modify it directly
-        # We'd need to use a mutable config or reload with new values
+        user_state_timeout = args.user_state_timeout
         logger.info(f"User state timeout override: {args.user_state_timeout}")
 
     # Set up exception handling
@@ -623,9 +624,7 @@ Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
         print("==================")
 
         try:
-            from ytbot.services.storage_service import StorageService
-
-            storage_service = StorageService()
+            storage_service = get_storage_service()
             cache_status = storage_service.get_cache_status()
 
             print(f"Cache Enabled: {cache_status.get('cache_enabled', False)}")
@@ -652,10 +651,8 @@ Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
         print("=================")
 
         try:
-            from ytbot.services.storage_service import StorageService
-
             async def retry_cache():
-                storage_service = StorageService()
+                storage_service = get_storage_service()
                 result = await storage_service.retry_cached_files()
 
                 print(f"Nextcloud Available: {result.get('nextcloud_available', False)}")
@@ -678,12 +675,8 @@ Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
     # Handle one-shot download mode: no Telegram, no process lock,
     # download and exit
     if args.download:
-        # StorageService 在本函数其它分支中存在局部导入（函数级遮蔽），
-        # 此处需先局部导入再使用
-        from ytbot.services.storage_service import StorageService
-
         downloader = OneShotDownloader(
-            DownloadService(), StorageService()
+            get_download_service(), get_storage_service()
         )
         return asyncio.run(downloader.run(args.download, args.type))
 
@@ -710,7 +703,7 @@ Exit codes: 0 ok; 2 enumeration partial but downloads/merged PDF ok;
 
     try:
         # Run the bot
-        exit_code = asyncio.run(main())
+        exit_code = asyncio.run(main(user_state_timeout))
         return exit_code
     finally:
         # Always release the lock on exit

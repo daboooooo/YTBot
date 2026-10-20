@@ -59,7 +59,8 @@ class PlatformHandler(ABC):
         content_type: ContentType,
         progress_callback: Optional[Any] = None,
         format_id: Optional[str] = None,
-        pre_scraped_result: Optional[Any] = None
+        pre_scraped_result: Optional[Any] = None,
+        archive_mode: bool = False
     ) -> DownloadResult:
         """
         Download content from the platform
@@ -71,6 +72,7 @@ class PlatformHandler(ABC):
             format_id: Optional specific format ID to download
             pre_scraped_result: Optional pre-scraped result to avoid
                 redundant data fetching
+            archive_mode: If True, save only text and images (no video/audio)
 
         Returns:
             DownloadResult: Result of the download operation

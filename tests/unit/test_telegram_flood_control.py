@@ -207,7 +207,7 @@ class TestFloodCircuitBreaker:
         result = await service.edit_message(1, 55, "text")
 
         assert result is None
-        assert service.bot.edit_message_text.call_count == 2
+        assert service.bot.edit_message_text.call_count == 3
 
     async def test_edit_message_not_modified_still_handled(self, service):
         service.bot.edit_message_text = AsyncMock(

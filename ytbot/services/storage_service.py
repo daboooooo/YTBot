@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 from datetime import datetime
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.enhanced_logger import get_logger, log_function_entry_exit
 from ..storage.local_storage import LocalStorageManager, get_local_storage_info
 from ..storage.nextcloud_storage import NextcloudStorage
@@ -77,7 +77,7 @@ class StorageService:
         result = {"ok": True, "message": "", "available_space": 0}
 
         # Check local storage quota
-        if CONFIG['local_storage']['enabled']:
+        if get_config().local_storage.enabled:
             try:
                 local_info = get_local_storage_info()
                 available_bytes = local_info.get('available_space_bytes', 0)
@@ -216,7 +216,7 @@ class StorageService:
             logger.info("☁️  Attempting Nextcloud storage...")
             try:
                 # Build remote path with content type organization
-                remote_dir = CONFIG['nextcloud']['upload_dir']
+                remote_dir = get_config().nextcloud.upload_dir
                 if not remote_dir.startswith('/'):
                     remote_dir = f'/{remote_dir}'
 
@@ -251,9 +251,7 @@ class StorageService:
                         })
 
                         # Delete local source after successful upload
-                        if CONFIG.get('local_storage', {}).get(
-                            'delete_after_upload', False
-                        ):
+                        if get_config().local_storage.delete_after_upload:
                             self._cleanup_source(source_path)
 
                         return result
@@ -286,9 +284,7 @@ class StorageService:
                         })
 
                         # Delete local source after successful upload
-                        if CONFIG.get('local_storage', {}).get(
-                            'delete_after_upload', False
-                        ):
+                        if get_config().local_storage.delete_after_upload:
                             self._cleanup_source(source_path)
 
                         return result
@@ -305,7 +301,7 @@ class StorageService:
             logger.info("☁️  Nextcloud not available, skipping to local storage")
 
         # Fallback to local storage
-        if CONFIG['local_storage']['enabled']:
+        if get_config().local_storage.enabled:
             logger.info("💾 Attempting local storage...")
             try:
                 logger.debug("Saving file locally...")
@@ -325,7 +321,7 @@ class StorageService:
                     }
 
                     # Pre-compute remote path for retry consistency
-                    remote_dir = CONFIG['nextcloud']['upload_dir']
+                    remote_dir = get_config().nextcloud.upload_dir
                     if not remote_dir.startswith('/'):
                         remote_dir = f'/{remote_dir}'
 
@@ -392,7 +388,7 @@ class StorageService:
         info = {
             "nextcloud": {
                 "available": self.nextcloud_available,
-                "url": CONFIG['nextcloud']['url'] if CONFIG['nextcloud']['url'] else None
+                "url": get_config().nextcloud.url if get_config().nextcloud.url else None
             },
             "local_storage": get_local_storage_info()
         }
@@ -418,7 +414,7 @@ class StorageService:
         """Clean up expired files from local storage with detailed logging"""
         logger.info("🧹 Starting cleanup of expired files...")
 
-        if CONFIG['local_storage']['enabled']:
+        if get_config().local_storage.enabled:
             logger.debug("Local storage is enabled, proceeding with cleanup...")
             result = self.local_storage.cleanup_old_files()
 
@@ -552,7 +548,7 @@ class StorageService:
                     remote_path = f"{remote_dir_cached}/{filename}"
                 else:
                     # Fallback: compute remote path (for legacy cache entries)
-                    remote_dir = CONFIG['nextcloud']['upload_dir']
+                    remote_dir = get_config().nextcloud.upload_dir
                     if not remote_dir.startswith('/'):
                         remote_dir = f'/{remote_dir}'
                     if is_directory:
@@ -579,9 +575,7 @@ class StorageService:
                         self.cache_manager.remove_from_cache(file_path)
 
                         # Optionally delete local directory after upload
-                        if CONFIG.get('local_storage', {}).get(
-                            'delete_after_upload', False
-                        ):
+                        if get_config().local_storage.delete_after_upload:
                             try:
                                 shutil.rmtree(file_path)
                                 logger.debug(
@@ -618,9 +612,7 @@ class StorageService:
                         self.cache_manager.remove_from_cache(file_path)
 
                         # Optionally delete local file after upload
-                        if CONFIG.get('local_storage', {}).get(
-                            'delete_after_upload', False
-                        ):
+                        if get_config().local_storage.delete_after_upload:
                             try:
                                 os.remove(file_path)
                                 logger.debug(
@@ -784,14 +776,14 @@ class StorageService:
                 "connected": self.nextcloud_storage.is_connected()
             },
             "local_storage": {
-                "enabled": CONFIG['local_storage']['enabled'],
+                "enabled": get_config().local_storage.enabled,
                 "available_space_mb": (
                     self.local_storage.get_available_space_mb()
-                    if CONFIG['local_storage']['enabled'] else 0
+                    if get_config().local_storage.enabled else 0
                 ),
                 "usage_mb": (
                     self.local_storage.get_storage_usage_mb()
-                    if CONFIG['local_storage']['enabled'] else 0
+                    if get_config().local_storage.enabled else 0
                 )
             },
             "cache": self.get_cache_status()
@@ -820,3 +812,22 @@ class StorageService:
             logger.info("✅ Storage health: All systems operational")
 
         return health
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton factory
+# ---------------------------------------------------------------------------
+
+_storage_service_instance: Optional["StorageService"] = None
+
+
+def get_storage_service() -> "StorageService":
+    """进程内共享的 StorageService（Nextcloud 状态与缓存队列必须全局唯一）。
+
+    沿用项目既有约定（参照 get_config()、get_cache_manager()），不引入 DI 容器。
+    测试可直接构造 StorageService 传入假对象。
+    """
+    global _storage_service_instance
+    if _storage_service_instance is None:
+        _storage_service_instance = StorageService()
+    return _storage_service_instance

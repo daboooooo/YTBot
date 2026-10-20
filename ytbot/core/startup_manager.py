@@ -19,6 +19,7 @@ import requests
 
 from .config import get_config, validate_config
 from .enhanced_logger import get_logger, log_function_entry_exit
+from ..services.storage_service import get_storage_service
 
 logger = get_logger(__name__)
 config = get_config()
@@ -523,10 +524,8 @@ class StartupManager:
                 logger.info("⏭️  Nextcloud not configured, skipping")
                 return True, "Nextcloud not configured (optional)", None
 
-            from ..services.storage_service import StorageService
-
-            # Create storage service
-            storage_service = StorageService()
+            # Use singleton factory to share storage state with bot/CLI
+            storage_service = get_storage_service()
             self.services['storage'] = storage_service
 
             # Check Nextcloud availability

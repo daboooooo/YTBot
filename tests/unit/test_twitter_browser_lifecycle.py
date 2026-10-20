@@ -12,7 +12,10 @@ import asyncio
 import pytest
 
 from ytbot.core import browser_manager as bm_module
-from ytbot.platforms import twitter as twitter_module
+# Browser globals (async_playwright, check_and_install_browser) are looked
+# up in extractor/browser.py's namespace, so monkeypatch must target that
+# module rather than the package re-export.
+from ytbot.platforms.twitter.extractor import browser as twitter_module
 from ytbot.platforms.twitter import TwitterContentExtractor
 
 CLOSED_ERROR = "Target page, context or browser has been closed"

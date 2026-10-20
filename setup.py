@@ -4,7 +4,7 @@ Setup script for YTBot
 
 from setuptools import setup, find_packages
 from pathlib import Path
-import os, re
+import re
 
 # Read the README file
 this_directory = Path(__file__).parent
@@ -77,7 +77,6 @@ setup(
     entry_points={
         "console_scripts": [
             "ytbot=ytbot.cli:cli",
-            "ytbot-demo=ytbot.demo:main",
         ],
     },
     include_package_data=True,

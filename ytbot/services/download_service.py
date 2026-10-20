@@ -6,9 +6,7 @@ Handles content downloading from various platforms through the platform manager.
 
 import asyncio
 from typing import Optional, Dict, Any, Callable
-from pathlib import Path
 
-from ..core.config import CONFIG
 from ..core.logger import get_logger
 from ..platforms.base import PlatformManager, ContentType, DownloadResult
 
@@ -90,7 +88,8 @@ class DownloadService:
         download_id: Optional[str] = None,
         format_id: Optional[str] = None,
         handler=None,
-        pre_scraped_result: Optional[Dict[str, Any]] = None
+        pre_scraped_result: Optional[Dict[str, Any]] = None,
+        archive_mode: bool = False
     ) -> DownloadResult:
         """
         Download content from URL
@@ -104,6 +103,7 @@ class DownloadService:
             handler: Optional pre-matched handler to avoid redundant matching
             pre_scraped_result: Optional pre-scraped result to avoid
                 redundant browser access (for Twitter)
+            archive_mode: If True, save only text and images (no video/audio)
 
         Returns:
             DownloadResult: Result of the download operation
@@ -138,7 +138,8 @@ class DownloadService:
                 content_type=content_type_enum,
                 progress_callback=progress_callback,
                 format_id=format_id,
-                pre_scraped_result=pre_scraped_result
+                pre_scraped_result=pre_scraped_result,
+                archive_mode=archive_mode
             )
 
             if result.success:
@@ -194,3 +195,22 @@ class DownloadService:
         except Exception as e:
             logger.error(f"Failed to get formats for {url}: {e}")
             return []
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton factory
+# ---------------------------------------------------------------------------
+
+_download_service_instance: Optional["DownloadService"] = None
+
+
+def get_download_service() -> "DownloadService":
+    """进程内共享的 DownloadService。
+
+    沿用项目既有约定（参照 get_config()、get_cache_manager()），不引入 DI 容器。
+    测试可直接构造 DownloadService 传入假对象。
+    """
+    global _download_service_instance
+    if _download_service_instance is None:
+        _download_service_instance = DownloadService()
+    return _download_service_instance

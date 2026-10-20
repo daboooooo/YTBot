@@ -107,6 +107,7 @@ venv/
 #exceptions
 !*.gitkeep
 
+*.pdf
 *.csv
 *.log
 *.mp3

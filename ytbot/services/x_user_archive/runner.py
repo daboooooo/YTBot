@@ -47,6 +47,7 @@ from .models import (
     parse_iso_utc,
     resolve_time_window,
 )
+from ..download_service import get_download_service
 from .pdf_merger import generate_merged_pdf
 from .timeline import (
     EnumerateOptions,
@@ -929,15 +930,8 @@ class XUserArchiveRunner:
 # Default production collaborators
 # ---------------------------------------------------------------------------
 
-_download_service_singleton = None
-
-
-def _default_download_service():
-    global _download_service_singleton
-    if _download_service_singleton is None:
-        from ..download_service import DownloadService
-        _download_service_singleton = DownloadService()
-    return _download_service_singleton
+# Reuse the process-wide singleton from the services layer
+_default_download_service = get_download_service
 
 
 async def _default_scrape_status(url: str):

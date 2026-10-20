@@ -9,7 +9,7 @@ import time
 from webdav3.client import Client as NextcloudClient
 from typing import Optional, Dict, Any
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.enhanced_logger import get_logger
 from ..utils.common import sanitize_filename
 
@@ -26,7 +26,7 @@ class NextcloudStorage:
     def _connect(self):
         """Initialize Nextcloud client connection"""
         try:
-            nextcloud_url = CONFIG['nextcloud']['url']
+            nextcloud_url = get_config().nextcloud.url
             if not nextcloud_url.startswith('http'):
                 nextcloud_url = f'http://{nextcloud_url}'
 
@@ -35,8 +35,8 @@ class NextcloudStorage:
 
             options = {
                 'webdav_hostname': nextcloud_url + 'remote.php/webdav/',
-                'webdav_login': CONFIG['nextcloud']['username'],
-                'webdav_password': CONFIG['nextcloud']['password'],
+                'webdav_login': get_config().nextcloud.username,
+                'webdav_password': get_config().nextcloud.password,
                 'webdav_timeout': 5,
             }
 
@@ -106,8 +106,8 @@ class NextcloudStorage:
             )
         remote_path = f"{remote_dir}/{sanitized_name}"
 
-        max_retries = CONFIG['nextcloud']['upload_retries']
-        retry_delay = CONFIG['nextcloud']['upload_retry_delay']
+        max_retries = get_config().nextcloud.upload_retries
+        retry_delay = get_config().nextcloud.upload_retry_delay
 
         for attempt in range(max_retries):
             try:
@@ -144,10 +144,10 @@ class NextcloudStorage:
                 # Verify upload
                 if self._verify_upload(remote_path, local_path):
                     # Build file URL
-                    base_url = CONFIG['nextcloud']['url'].rstrip('/')
+                    base_url = get_config().nextcloud.url.rstrip('/')
                     file_url = (
                         f"{base_url}/remote.php/dav/files/"
-                        f"{CONFIG['nextcloud']['username']}{remote_path}"
+                        f"{get_config().nextcloud.username}{remote_path}"
                     )
                     logger.info(f"File uploaded successfully: {file_url}")
                     return file_url
@@ -290,7 +290,7 @@ class NextcloudStorage:
                         completed_bytes += file_size
 
             # Build file URL - use Nextcloud web UI browse URL
-            base_url = CONFIG['nextcloud']['url'].rstrip('/')
+            base_url = get_config().nextcloud.url.rstrip('/')
             file_url = (
                 f"{base_url}/apps/files/?dir="
                 f"{remote_dir}"
@@ -379,7 +379,7 @@ class NextcloudStorage:
                 return False
 
             # Optionally verify file size
-            if CONFIG['nextcloud']['verify_file_size']:
+            if get_config().nextcloud.verify_file_size:
                 local_size = os.path.getsize(local_path)
                 logger.debug(
                     f"Upload verification passed: {remote_path}, "

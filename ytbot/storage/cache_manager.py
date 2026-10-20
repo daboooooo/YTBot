@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from ..core.config import CONFIG
+from ..core.config import get_config
 from ..core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,7 +38,7 @@ class CacheManager:
         """
         # Use local storage path as default cache directory
         if cache_dir is None:
-            cache_dir = CONFIG['local_storage']['path']
+            cache_dir = get_config().local_storage.path
 
         self.cache_dir = Path(cache_dir)
         self.queue_file = self.cache_dir / "cache_queue.json"

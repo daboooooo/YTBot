@@ -81,11 +81,20 @@ def _display_title(record) -> str:
     return f"{prefix}_{record.tweet_id}"
 
 
-def _bookmark_title(record) -> str:
-    return (
+def _bookmark_title(record, seen=None) -> str:
+    """Generate a unique PDF outline title, appending tweet_id on collision."""
+    base = (
         f"{record.published_at.strftime('%Y-%m-%d')} "
         f"{_display_title(record)}"
     )
+    if seen is None:
+        return base
+    key = base
+    count = seen.get(key, 0)
+    seen[key] = count + 1
+    if count > 0:
+        return f"{base} ({record.tweet_id[-7:]})"
+    return base
 
 
 def build_front_matter_html(
@@ -310,10 +319,11 @@ async def generate_merged_pdf(
             }
         )
 
+        seen_titles: dict = {}
         for rec, pdf in valid_pairs:
             offset = len(writer.pages)
             writer.append(str(pdf))
-            writer.add_outline_item(_bookmark_title(rec), offset)
+            writer.add_outline_item(_bookmark_title(rec, seen_titles), offset)
 
         fd2, tmp_out = tempfile.mkstemp(
             prefix=".xmerge-", suffix=".pdf", dir=str(work_dir)

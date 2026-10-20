@@ -183,7 +183,9 @@ class YouTubeHandler(PlatformHandler):
                     host_only = cookie.get('hostOnly', False)
                     path = cookie.get('path', '/')
                     secure = cookie.get('secure', False)
-                    expires = cookie.get('expirationDate', 0)
+                    expiration_date = cookie.get('expirationDate')
+                    # Session cookies have null expirationDate; use 0 for Netscape format
+                    expires = int(expiration_date) if expiration_date is not None else 0
                     name = cookie.get('name', '')
                     value = cookie.get('value', '')
 
@@ -192,7 +194,7 @@ class YouTubeHandler(PlatformHandler):
 
                     cookie_line = (
                         f"{domain}\t{domain_flag}\t{path}\t"
-                        f"{secure_flag}\t{int(expires)}\t{name}\t{value}\n"
+                        f"{secure_flag}\t{expires}\t{name}\t{value}\n"
                     )
                     f.write(cookie_line)
 
@@ -428,7 +430,8 @@ class YouTubeHandler(PlatformHandler):
         content_type: ContentType,
         progress_callback: Optional[Any] = None,
         format_id: Optional[str] = None,
-        pre_scraped_result: Optional[Any] = None
+        pre_scraped_result: Optional[Any] = None,
+        archive_mode: bool = False
     ) -> DownloadResult:
         """
         Download content from YouTube.
@@ -438,6 +441,8 @@ class YouTubeHandler(PlatformHandler):
             content_type: Type of content (VIDEO or AUDIO)
             progress_callback: Optional progress callback function
             format_id: Optional specific format ID to download
+            archive_mode: If True, save only text (transcript/subtitles)
+                and images (thumbnail) without downloading video/audio
 
         Returns:
             DownloadResult with download status and file path
@@ -447,6 +452,11 @@ class YouTubeHandler(PlatformHandler):
         try:
             temp_dir = tempfile.mkdtemp()
             logger.info(f"Created temp directory: {temp_dir}")
+
+            if archive_mode:
+                return await self._download_archive_content(
+                    url, temp_dir, progress_callback
+                )
 
             ydl_opts = self._setup_download_options(
                 temp_dir, content_type, progress_callback, format_id
@@ -529,6 +539,113 @@ class YouTubeHandler(PlatformHandler):
             # Note: We don't clean up temp_dir here as the file needs to be available
             # for upload/storage. Cleanup should be handled by the caller.
             pass
+
+    async def _download_archive_content(
+        self,
+        url: str,
+        temp_dir: str,
+        progress_callback: Optional[Any] = None
+    ) -> DownloadResult:
+        """
+        Download only text (transcript/subtitles) and images (thumbnail).
+
+        In archive mode, video and audio files are skipped. Instead, we
+        save:
+        - Video metadata as JSON
+        - Transcript/subtitles as text files
+        - Thumbnail image (if available)
+
+        Args:
+            url: YouTube video URL
+            temp_dir: Directory to save archive files
+            progress_callback: Optional progress callback
+
+        Returns:
+            DownloadResult with archive directory path
+        """
+        # Write directly to temp_dir (not a subdirectory) to avoid
+        # duplication with the parent caller's own image downloads
+        outtmpl = os.path.join(temp_dir, '%(title).50s.%(ext)s')
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'outtmpl': outtmpl,
+            'writethumbnail': True,
+            'writeinfojson': True,
+            'writethumbnailstamp': True,
+        }
+
+        self._apply_youtube_cookies(ydl_opts)
+        self._apply_solver_opts(ydl_opts)
+
+        # Write subtitle/transcript if available
+        subtitle_formats = ['json', 'vtt', 'srt', 'txt']
+        for fmt in subtitle_formats:
+            ydl_opts['writesub'] = True
+            ydl_opts['writesubtitles'] = True
+            ydl_opts['subtitleslangs'] = ['zh-Hans', 'zh-Hant', 'zh', 'en']
+            ydl_opts['subtitlesformat'] = fmt
+            break  # Just use the first format for efficiency
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+
+            if not info:
+                return DownloadResult(
+                    success=False,
+                    error_message="Failed to extract video information"
+                )
+
+            # Collect saved files for verification
+            saved_files = []
+            if os.path.isdir(temp_dir):
+                for f in os.listdir(temp_dir):
+                    filepath = os.path.join(temp_dir, f)
+                    if os.path.isfile(filepath):
+                        saved_files.append(f)
+
+            logger.info(
+                f"Archive mode: downloaded {len(saved_files)} files for "
+                f"{info.get('title', 'Unknown')}: {saved_files}"
+            )
+
+            # Build content info
+            content_info = ContentInfo(
+                url=url,
+                title=info.get('title', 'Unknown'),
+                description=info.get('description'),
+                duration=info.get('duration'),
+                content_type=ContentType.TEXT,
+                thumbnail_url=info.get('thumbnail'),
+                uploader=info.get('uploader'),
+                upload_date=info.get('upload_date'),
+                metadata=info
+            )
+
+            # If we have subtitle files, mark content as having text
+            subtitle_files = [
+                f for f in saved_files
+                if f.endswith(('.vtt', '.srt', '.txt', '.json'))
+            ]
+            if subtitle_files:
+                content_info.content_type = ContentType.TEXT
+
+            return DownloadResult(
+                success=True,
+                file_path=temp_dir,
+                content_info=content_info,
+                temp_dir=temp_dir
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to download archive content: {e}")
+            return DownloadResult(
+                success=False,
+                error_message=str(e)
+            )
 
     async def get_supported_formats(self, url: str) -> List[JSONDict]:
         """Get available download formats for the content"""
@@ -809,10 +926,7 @@ class YouTubeHandler(PlatformHandler):
             'prefer_ffmpeg': download_config.prefer_ffmpeg,
         }
 
-        cookies_path = self._load_youtube_cookies()
-        if cookies_path:
-            base_opts['cookiefile'] = cookies_path
-            logger.info(f"Using cookies file for download: {cookies_path}")
+        self._apply_youtube_cookies(base_opts)
 
         self._apply_solver_opts(base_opts)
 

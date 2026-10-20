@@ -131,7 +131,8 @@ class PlatformHandlerProtocol(Protocol):
         url: str,
         content_type: ContentType,
         progress_callback: Optional[ProgressCallback] = None,
-        format_id: Optional[str] = None
+        format_id: Optional[str] = None,
+        archive_mode: bool = False
     ) -> DownloadResult: ...
     def get_supported_formats(self, url: str) -> List[JSONDict]: ...
 

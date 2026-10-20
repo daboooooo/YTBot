@@ -202,7 +202,7 @@ class PostArchiver:
     async def _download_one(self, url: str) -> dict:
         try:
             result = await self.handler.download_content(
-                url, ContentType.TEXT
+                url, ContentType.TEXT, archive_mode=True
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("download raised for %s: %s", url, exc)

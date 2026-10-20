@@ -320,11 +320,11 @@ def format_timestamp(timestamp: Optional[float] = None, fmt: str = "%Y-%m-%d %H:
 def parse_timestamp(timestamp_str: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> Optional[datetime]:
     """
     Parse timestamp string to datetime object.
-    
+
     Args:
         timestamp_str: Timestamp string
         fmt: Format string
-        
+
     Returns:
         Datetime object or None if parsing fails
     """
@@ -332,6 +332,40 @@ def parse_timestamp(timestamp_str: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> Optio
         return datetime.strptime(timestamp_str, fmt)
     except ValueError:
         return None
+
+
+def format_iso_timestamp(
+    value: Optional[str],
+    fmt: str = "%Y-%m-%d %H:%M:%S",
+    default: str = "",
+) -> str:
+    """
+    Format an ISO-8601 timestamp string for display.
+
+    Twitter/X ``time[datetime]`` values are ISO-8601 UTC (e.g.
+    ``2024-06-15T12:34:56.000Z``). The wall-clock components are printed
+    as-is (UTC, matching the rest of tweet rendering) without timezone
+    conversion. Non-ISO values such as relative DOM text (``"2h"``,
+    ``"Jun 15"``) are returned unchanged so real data is preserved;
+    empty input returns ``default`` instead of fabricating the current
+    time.
+
+    Args:
+        value: ISO-8601 timestamp string, or None/empty
+        fmt: Output ``strftime`` format
+        default: Value returned when ``value`` is empty
+
+    Returns:
+        Formatted timestamp, the original text, or ``default``
+    """
+    if not value:
+        return default
+    try:
+        return datetime.fromisoformat(
+            value.replace('Z', '+00:00')
+        ).strftime(fmt)
+    except (ValueError, TypeError, AttributeError):
+        return str(value)
 
 
 def chunk_list(lst: List[T], chunk_size: int) -> List[List[T]]:
